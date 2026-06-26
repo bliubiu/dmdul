@@ -1,0 +1,21 @@
+bin/
+.agents/
+.tmp/
+*.exe
+*.test
+*.out
+coverage.out
+*.log
+*.trc
+*.sql
+
+# Local database samples can be large and sensitive.
+*.DBF
+*.dbf
+*.BAK
+*.bak
+testdata/private/
+oldpro/
+windowdameng/
+*.ctl
+dm.ini
