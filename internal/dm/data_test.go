@@ -2,6 +2,8 @@ package dm
 
 import (
 	"encoding/binary"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -98,6 +100,49 @@ func TestDecodeDMDate(t *testing.T) {
 	}
 	if got != "2000-10-06" {
 		t.Fatalf("decodeDMDate = %q, want %q", got, "2000-10-06")
+	}
+}
+
+func TestDataFileKeyFromPageHeader(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "MAIN.DBF")
+	head := make([]byte, 16)
+	binary.LittleEndian.PutUint16(head[0:], 4)
+	binary.LittleEndian.PutUint16(head[2:], 0)
+	binary.LittleEndian.PutUint32(head[4:], 0)
+	if err := os.WriteFile(path, head, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, ok := dataFileKeyFromPageHeader(path)
+	if !ok {
+		t.Fatal("dataFileKeyFromPageHeader returned !ok")
+	}
+	if got.groupID != 4 || got.fileID != 0 {
+		t.Fatalf("dataFileKeyFromPageHeader = %+v", got)
+	}
+}
+
+func TestResolveDataFilesWithoutControlFileUsesPageHeaders(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "MAIN.DBF")
+	head := make([]byte, 16)
+	binary.LittleEndian.PutUint16(head[0:], 4)
+	binary.LittleEndian.PutUint16(head[2:], 0)
+	binary.LittleEndian.PutUint32(head[4:], 0)
+	if err := os.WriteFile(path, head, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	files, err := resolveDataFiles("", dir)
+	if err != nil {
+		t.Fatalf("resolveDataFiles returned error: %v", err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("resolveDataFiles returned %d files, want 1", len(files))
+	}
+	if files[0].key.groupID != 4 || files[0].key.fileID != 0 || files[0].path != path {
+		t.Fatalf("unexpected data file ref: %+v", files[0])
 	}
 }
 
@@ -354,6 +399,58 @@ func TestRenderInsertForHeapRowWithLongVarchar(t *testing.T) {
 	}
 	if !strings.Contains(sql, "VALUES (1, DATETIME '2026-06-24 13:07:28.000000'") || !strings.Contains(sql, text) {
 		t.Fatalf("unexpected insert sql: %s", sql)
+	}
+}
+
+func TestRenderInsertForIOTRowWithNullableFixedSentinel(t *testing.T) {
+	row := []byte{
+		0x00, 0x8D, 0x00, 0x03, 0x00,
+		0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x32, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x01,
+		0xEA, 0x07, 0xD3, 0xEA, 0xCE, 0x72, 0x4B, 0x0A,
+		0x00, 0x00, 0x3B, 0x02, 0x00, 0x00, 0x73, 0x7F,
+		0x86, 'u', 's', 'e', 'r', '_', '1',
+		0xA0, 'e', '1', '0', 'a', 'd', 'c', '3', '9', '4', '9', 'b', 'a', '5', '9', 'a', 'b', 'b', 'e', '5', '6', 'e', '0', '5', '7', 'f', '2', '0', 'f', '8', '8', '3', 'e',
+		0x89, 0xB2, 0xE2, 0xCA, 0xD4, 0xD3, 0xC3, 0xBB, 0xA7, 0x31,
+		0x8B, '1', '3', '8', '6', '.', '0', '5', '7', '1', '3', '6',
+		0x8B, 'u', '1', '@', 't', 'e', 's', 't', '.', 'c', 'o', 'm',
+		0x89, 0xB2, 0xE2, 0xCA, 0xD4, 0xCA, 0xFD, 0xBE, 0xDD, 0x31,
+		0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF,
+		0xFF, 0xFF, 0x7F, 0xFF, 0xFF, 0x50, 0x09, 0x04, 0x00, 0x00, 0x00,
+	}
+	info := dataTableInfo{
+		table: dictionaryObject{Owner: "SYSDBA", Name: "SYS_USER"},
+		columns: []columnDef{
+			{ColID: 1, Name: "ID", DataType: "BIGINT", Nullable: "N"},
+			{ColID: 2, Name: "USERNAME", DataType: "VARCHAR", Nullable: "N"},
+			{ColID: 3, Name: "PASSWORD", DataType: "VARCHAR", Nullable: "N"},
+			{ColID: 4, Name: "REAL_NAME", DataType: "VARCHAR", Nullable: "Y"},
+			{ColID: 5, Name: "PHONE", DataType: "VARCHAR", Nullable: "Y"},
+			{ColID: 6, Name: "EMAIL", DataType: "VARCHAR", Nullable: "Y"},
+			{ColID: 7, Name: "DEPT_ID", DataType: "BIGINT", Nullable: "Y"},
+			{ColID: 8, Name: "STATUS", DataType: "TINYINT", Nullable: "Y"},
+			{ColID: 9, Name: "CREATE_TIME", DataType: "DATETIME", Nullable: "Y"},
+			{ColID: 10, Name: "UPDATE_TIME", DataType: "DATETIME", Nullable: "Y"},
+			{ColID: 11, Name: "REMARK", DataType: "VARCHAR", Nullable: "Y"},
+		},
+	}
+	sql, start, _, err := renderInsertForDataRow(info, row, textDecoder{preferred: "gb18030"})
+	if err != nil {
+		t.Fatalf("renderInsertForDataRow returned error: %v", err)
+	}
+	if start != 5 {
+		t.Fatalf("data start = %d, want 5", start)
+	}
+	for _, want := range []string{
+		"SYSDBA.SYS_USER",
+		"VALUES (1, 'user_1'",
+		"DATETIME '2026-06-26 10:55:25.337337'",
+		"NULL, '测试数据1'",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("insert sql missing %q: %s", want, sql)
+		}
 	}
 }
 

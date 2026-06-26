@@ -49,7 +49,6 @@ oldpro/
 ```powershell
 .\bin\dmdul.exe export-ddl `
   -file oldpro\SYSTEM.DBF `
-  -ctl oldpro\dm.ctl `
   -out oldpro\dm_offline_all.sql
 ```
 
@@ -58,8 +57,6 @@ oldpro/
 ```powershell
 .\bin\dmdul.exe export-data `
   -file oldpro\SYSTEM.DBF `
-  -ctl oldpro\dm.ctl `
-  -data-dir oldpro `
   -out oldpro\dm_offline_data.sql
 ```
 
@@ -110,6 +107,6 @@ go build -o .\bin\dmdul.exe .\cmd\dmdul
 如果有样例文件，再执行：
 
 ```powershell
-.\bin\dmdul.exe export-ddl -file oldpro\SYSTEM.DBF -ctl oldpro\dm.ctl -out oldpro\dm_offline_all.sql
-.\bin\dmdul.exe export-data -file oldpro\SYSTEM.DBF -ctl oldpro\dm.ctl -data-dir oldpro -out oldpro\dm_offline_data.sql
+.\bin\dmdul.exe export-ddl -file oldpro\SYSTEM.DBF -out oldpro\dm_offline_all.sql
+.\bin\dmdul.exe export-data -file oldpro\SYSTEM.DBF -out oldpro\dm_offline_data.sql
 ```

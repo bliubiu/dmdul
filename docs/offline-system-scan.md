@@ -5,8 +5,8 @@ under `oldpro/`.
 
 The goal is not to complete the final extractor yet. The goal is to make the
 bootstrap facts repeatable: identify database basics, locate the most important
-dictionary objects in `SYSTEM.DBF`, and record where `dm.ctl` supplies
-tablespace/file information that is not available from `SYSTEM.DBF` alone.
+dictionary objects in `SYSTEM.DBF`, and record how DBF page headers and
+`dm.ctl` together supply tablespace/file information.
 
 ## Sample Files
 
@@ -27,6 +27,26 @@ Observed from `SYSTEM.DBF`:
 | Page size | `0x84` | little-endian `u32` | `8192` | Bytes `00 20 00 00`; old parser succeeds with 8192-byte pages |
 | Page count | `0x8C` | little-endian `u32` | `9472` | `9472 * 8192 = 77594624` |
 | Character set flag | `4 * page_size + 0x2D` | `u8` | sample-dependent | `0=GB18030`, `1=UTF-8`, `2=EUC-KR`; matches online `UNICODE()` / `SF_GET_UNICODE_FLAG()` |
+
+Every DBF page also starts with its physical page address:
+
+| Page offset | Length | Meaning |
+| --- | --- | --- |
+| `+0x00` | `u16` little-endian | Tablespace / group id |
+| `+0x02` | `u16` little-endian | File id inside the tablespace |
+| `+0x04` | `u32` little-endian | Page number inside the file |
+
+Examples from the GXS sample:
+
+- `SYSTEM.DBF` page `1`: `00 00 00 00 01 00 00 00` -> group `0`,
+  file `0`, page `1`.
+- `MAIN.DBF` page `2272`: `04 00 00 00 E0 08 00 00` -> group `4`,
+  file `0`, page `2272`.
+
+This page header is useful as a fallback to identify local DBF files by
+`(group_id, file_id)` when `dm.ctl` paths do not resolve. It does not by itself
+store the full tablespace name or datafile path list; `dm.ctl` remains the
+richer source for configured names and paths.
 
 Observed from `dm.ctl`:
 
@@ -247,22 +267,27 @@ control file.
 The Go CLI now has repeatable research commands:
 
 ```powershell
-.\bin\dmdul.exe scan-system -file .\oldpro\SYSTEM.DBF -ctl .\oldpro\dm.ctl
+.\bin\dmdul.exe scan-system -file .\oldpro\SYSTEM.DBF
 .\bin\dmdul.exe inspect-ctl -ctl .\oldpro\dm.ctl
-.\bin\dmdul.exe export-ddl -file .\oldpro\SYSTEM.DBF -ctl .\oldpro\dm.ctl -out .\oldpro\dm_offline_all.sql -owner all
-.\bin\dmdul.exe export-data -file .\oldpro\SYSTEM.DBF -ctl .\oldpro\dm.ctl -data-dir .\oldpro -out .\oldpro\dm_offline_data.sql -owner all -table all
-.\bin\dmdul.exe export-data -file .\oldpro\SYSTEM.DBF -ctl .\oldpro\dm.ctl -data-dir .\oldpro -out .\oldpro\dm_offline_bin_test.sql -table SYSDBA.BIN_TEST2,SYSDBA.BIN_TEST2_CHILD
+.\bin\dmdul.exe export-ddl -file .\oldpro\SYSTEM.DBF -out .\oldpro\dm_offline_all.sql -owner all
+.\bin\dmdul.exe export-data -file .\oldpro\SYSTEM.DBF -out .\oldpro\dm_offline_data.sql -owner all -table all
+.\bin\dmdul.exe export-data -file .\oldpro\SYSTEM.DBF -out .\oldpro\dm_offline_bin_test.sql -table SYSDBA.BIN_TEST2,SYSDBA.BIN_TEST2_CHILD
 .\bin\dmdul.exe scan-partitions -file .\oldpro\SYSTEM.DBF -ctl .\oldpro\dm.ctl -owner all
 ```
 
 `export-ddl` is the main offline extractor and now includes partition DDL from
-`SYSHPARTTABLEINFO` plus `SYSOBJINFOS.TABPART`. `scan-partitions` is retained as
-a focused diagnostic view over the same parser.
+`SYSHPARTTABLEINFO` plus `SYSOBJINFOS.TABPART`. It can run with only
+`SYSTEM.DBF`; when `dm.ctl` exists beside `SYSTEM.DBF` or is passed explicitly,
+it is used to enrich database and tablespace names. `scan-partitions` is
+retained as a focused diagnostic view over the same parser.
 
 `export-data` is the first offline row extractor. It reads table/column/storage
-metadata from `SYSTEM.DBF`, maps tablespace ids and DBF filenames through
-`dm.ctl`, then scans the matching data files under `-data-dir`. The current row
-locator follows the verified ordinary data-page layout:
+metadata from `SYSTEM.DBF`. When `dm.ctl` is available it is used for database
+name, tablespace names, and configured datafile paths. When `dm.ctl` is absent,
+`export-data` scans DBF files under `-data-dir` and identifies `(group_id,
+file_id)` from each DBF page header. `-data-dir` defaults to the directory that
+contains `SYSTEM.DBF`. The current row locator follows the verified ordinary
+data-page layout:
 
 `-table` defaults to `all`. When narrowing the export, prefer fully qualified
 `OWNER.TABLE_NAME` values, for example `SYSDBA.BIN_TEST2`. Quoted qualified

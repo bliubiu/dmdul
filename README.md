@@ -1,13 +1,13 @@
 # dmdul
 
-`dmdul` 是一个使用 Go 编写的达梦数据库离线抽取工具。它面向数据库实例无法正常启动、但还能拿到 `SYSTEM.DBF`、`dm.ctl` 和用户表空间 DBF 文件的场景，离线解析系统字典、生成建表 DDL，并尽量从数据文件中恢复用户表数据。
+`dmdul` 是一个使用 Go 编写的达梦数据库离线抽取工具。它面向数据库实例无法正常启动、但还能拿到 `SYSTEM.DBF` 和用户表空间 DBF 文件的场景，离线解析系统字典、生成建表 DDL，并尽量从数据文件中恢复用户表数据；如果同时能拿到 `dm.ctl`，会补充数据库名、表空间名和数据文件路径信息。
 
 > 当前项目仍处于逆向验证和早期可用阶段。请先在测试环境验证导出的 SQL，再用于正式恢复流程。
 
 ## 当前能力
 
 - 读取 `SYSTEM.DBF` 基础信息：页大小、簇大小、页数、字符集标记。
-- 解析 `dm.ctl` 中的数据库名、表空间名和数据文件路径。
+- 可选解析 `dm.ctl` 中的数据库名、表空间名和数据文件路径。
 - 离线导出用户表 DDL：
   - 普通用户 `CREATE USER` 和角色授权 `GRANT role TO user`。
   - 表、字段、字段类型、默认值。
@@ -38,7 +38,6 @@ go build -o .\bin\dmdul.exe .\cmd\dmdul
 ```powershell
 .\bin\dmdul.exe export-ddl `
   -file oldpro\SYSTEM.DBF `
-  -ctl oldpro\dm.ctl `
   -out oldpro\dm_offline_schema.sql `
   -owner all
 ```
@@ -48,10 +47,12 @@ go build -o .\bin\dmdul.exe .\cmd\dmdul
 ```powershell
 .\bin\dmdul.exe export-data `
   -file oldpro\SYSTEM.DBF `
-  -ctl oldpro\dm.ctl `
-  -data-dir oldpro `
   -out oldpro\dm_offline_data.sql
 ```
+
+`scan-system`、`export-ddl` 和 `export-data` 的 `-ctl` 都是可选参数；未提供时会在
+`SYSTEM.DBF` 同目录存在 `dm.ctl` 时自动使用。`export-data` 没有 `dm.ctl` 时会根据
+DBF 页头识别 `(表空间号, 文件号)`；`-data-dir` 默认也是 `SYSTEM.DBF` 所在目录。
 
 更多示例见 [使用示例](docs/usage.md)。
 

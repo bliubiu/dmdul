@@ -35,13 +35,13 @@ Commands:
 Examples:
   dmdul inspect -file SYSTEM.DBF
   dmdul inspect -file MAIN.DBF -sample 256
-  dmdul scan-system -file oldpro\SYSTEM.DBF -ctl oldpro\dm.ctl
+  dmdul scan-system -file oldpro\SYSTEM.DBF
   dmdul inspect-ctl -ctl oldpro\dm.ctl
   dmdul export-ddl
-  dmdul export-ddl -file oldpro\SYSTEM.DBF -ctl oldpro\dm.ctl -out oldpro\dm_offline_schema.sql
-  dmdul export-ddl -file SYSTEM.DBF -ctl dm.ctl -out schema.sql -owner HR_TEST,SYSDBA -charset gb18030
-  dmdul export-data -file oldpro\SYSTEM.DBF -ctl oldpro\dm.ctl -data-dir oldpro -out oldpro\dm_offline_data.sql
-  dmdul export-data -file SYSTEM.DBF -ctl dm.ctl -table SYSDBA.BIN_TEST2,SYSDBA.BIN_TEST2_CHILD
+  dmdul export-ddl -file oldpro\SYSTEM.DBF -out oldpro\dm_offline_schema.sql
+  dmdul export-ddl -file SYSTEM.DBF -out schema.sql -owner HR_TEST,SYSDBA -charset gb18030
+  dmdul export-data -file oldpro\SYSTEM.DBF -out oldpro\dm_offline_data.sql
+  dmdul export-data -file SYSTEM.DBF -table SYSDBA.BIN_TEST2,SYSDBA.BIN_TEST2_CHILD
   dmdul scan-partitions -file SYSTEM.DBF -ctl dm.ctl -owner all
 `
 
@@ -118,14 +118,19 @@ func runScanSystem(args []string, stdout io.Writer, stderr io.Writer) error {
 	var ctlPath string
 	var ignoredIniPath string
 	fs.StringVar(&systemPath, "file", "", "SYSTEM.DBF path")
-	fs.StringVar(&ctlPath, "ctl", "", "optional dm.ctl path")
+	fs.StringVar(&ctlPath, "ctl", "", "deprecated optional dm.ctl path")
 	fs.StringVar(&ignoredIniPath, "ini", "", "deprecated; ignored")
 
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	ctlProvided := flagWasProvided(fs, "ctl")
 	if systemPath == "" {
 		return fmt.Errorf("scan-system requires -file")
+	}
+	ctlPath, ctlProvided = optionalControlPathForSystem(systemPath, ctlPath, ctlProvided)
+	if err := validateOptionalControlInputFiles("scan-system", systemPath, ctlPath, ctlProvided); err != nil {
+		return err
 	}
 
 	meta := dm.InspectDatabaseMetadata(systemPath, ctlPath, "", "auto")
@@ -217,7 +222,7 @@ func runExportDDL(args []string, stdout io.Writer, stderr io.Writer) error {
 	var ownerFilter string
 	var charset string
 	fs.StringVar(&systemPath, "file", defaultExportSystemPath, "SYSTEM.DBF path")
-	fs.StringVar(&ctlPath, "ctl", "", "dm.ctl path for tablespace names; defaults to SYSTEM.DBF directory")
+	fs.StringVar(&ctlPath, "ctl", "", "optional dm.ctl path; uses SYSTEM.DBF directory default only when present")
 	fs.StringVar(&ignoredIniPath, "ini", "", "deprecated; ignored")
 	fs.StringVar(&outPath, "out", defaultExportOutputPath, "output SQL script path")
 	fs.StringVar(&ownerFilter, "owner", "all", "owner filter: all, SYSDBA, or comma-separated owners")
@@ -226,13 +231,12 @@ func runExportDDL(args []string, stdout io.Writer, stderr io.Writer) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	ctlProvided := flagWasProvided(fs, "ctl")
 	systemPath = defaultIfBlank(systemPath, defaultExportSystemPath)
-	if strings.TrimSpace(ctlPath) == "" {
-		ctlPath = dm.DefaultControlPathForSystem(systemPath)
-	}
+	ctlPath, ctlProvided = optionalControlPathForSystem(systemPath, ctlPath, ctlProvided)
 	outPath = defaultIfBlank(outPath, defaultExportOutputPath)
 
-	if err := validateOfflineInputFiles("export-ddl", systemPath, ctlPath); err != nil {
+	if err := validateOptionalControlInputFiles("export-ddl", systemPath, ctlPath, ctlProvided); err != nil {
 		return err
 	}
 	meta := dm.InspectDatabaseMetadata(systemPath, ctlPath, "", charset)
@@ -280,7 +284,7 @@ func runExportData(args []string, stdout io.Writer, stderr io.Writer) error {
 	var maxRows int
 	var failedComments bool
 	fs.StringVar(&systemPath, "file", defaultExportSystemPath, "SYSTEM.DBF path")
-	fs.StringVar(&ctlPath, "ctl", "", "dm.ctl path; defaults to SYSTEM.DBF directory")
+	fs.StringVar(&ctlPath, "ctl", "", "optional dm.ctl path; uses SYSTEM.DBF directory default only when present")
 	fs.StringVar(&ignoredIniPath, "ini", "", "deprecated; ignored")
 	fs.StringVar(&dataDir, "data-dir", "", "directory containing MAIN.DBF and other data DBF files; defaults to SYSTEM.DBF directory")
 	fs.StringVar(&outPath, "out", defaultDataOutputPath, "output INSERT SQL script path")
@@ -295,13 +299,12 @@ func runExportData(args []string, stdout io.Writer, stderr io.Writer) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	ctlProvided := flagWasProvided(fs, "ctl")
 	systemPath = defaultIfBlank(systemPath, defaultExportSystemPath)
-	if strings.TrimSpace(ctlPath) == "" {
-		ctlPath = dm.DefaultControlPathForSystem(systemPath)
-	}
+	ctlPath, ctlProvided = optionalControlPathForSystem(systemPath, ctlPath, ctlProvided)
 	outPath = defaultIfBlank(outPath, defaultDataOutputPath)
 
-	if err := validateOfflineInputFiles("export-data", systemPath, ctlPath); err != nil {
+	if err := validateOptionalControlInputFiles("export-data", systemPath, ctlPath, ctlProvided); err != nil {
 		return err
 	}
 	meta := dm.InspectDatabaseMetadata(systemPath, ctlPath, "", charset)
@@ -442,8 +445,50 @@ func defaultIfBlank(value string, fallback string) string {
 	return value
 }
 
-func validateExportInputFiles(systemPath string, ctlPath string) error {
-	return validateOfflineInputFiles("export-ddl", systemPath, ctlPath)
+func flagWasProvided(fs *flag.FlagSet, name string) bool {
+	provided := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			provided = true
+		}
+	})
+	return provided
+}
+
+func optionalControlPathForSystem(systemPath string, ctlPath string, ctlProvided bool) (string, bool) {
+	if strings.TrimSpace(ctlPath) != "" {
+		return ctlPath, ctlProvided
+	}
+	if ctlProvided {
+		return "", true
+	}
+	defaultCtlPath := dm.DefaultControlPathForSystem(systemPath)
+	if err := validateRegularFile(defaultCtlPath); err == nil {
+		return defaultCtlPath, false
+	}
+	return "", false
+}
+
+func validateOptionalControlInputFiles(command string, systemPath string, ctlPath string, ctlProvided bool) error {
+	if err := validateRegularFile(systemPath); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("%s requires -file; default input file not found: -file %s", command, systemPath)
+		}
+		return fmt.Errorf("%s cannot access -file %q: %w", command, systemPath, err)
+	}
+	if strings.TrimSpace(ctlPath) == "" {
+		return nil
+	}
+	if err := validateRegularFile(ctlPath); err != nil {
+		if os.IsNotExist(err) && !ctlProvided {
+			return nil
+		}
+		if os.IsNotExist(err) {
+			return fmt.Errorf("%s cannot access -ctl %q: file does not exist", command, ctlPath)
+		}
+		return fmt.Errorf("%s cannot access -ctl %q: %w", command, ctlPath, err)
+	}
+	return nil
 }
 
 func validateOfflineInputFiles(command string, systemPath string, ctlPath string) error {

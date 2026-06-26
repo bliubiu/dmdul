@@ -48,7 +48,19 @@ func TestInspectCtlRequiresCtl(t *testing.T) {
 	}
 }
 
-func TestExportDDLDefaultsRequireFileAndCtl(t *testing.T) {
+func TestScanSystemDoesNotRequireControlFile(t *testing.T) {
+	dir := t.TempDir()
+	systemPath := dir + string(os.PathSeparator) + "SYSTEM.DBF"
+	if err := os.WriteFile(systemPath, []byte{0}, 0644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	if err := validateOptionalControlInputFiles("scan-system", systemPath, "", false); err != nil {
+		t.Fatalf("scan-system should not require dm.ctl, got %v", err)
+	}
+}
+
+func TestExportDDLDefaultsRequireOnlySystemFile(t *testing.T) {
 	previousDir, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("Getwd failed: %v", err)
@@ -69,14 +81,17 @@ func TestExportDDLDefaultsRequireFileAndCtl(t *testing.T) {
 	if err == nil {
 		t.Fatal("Run should fail when default export input files are absent")
 	}
-	for _, want := range []string{"requires -file and -ctl", "SYSTEM.DBF", "dm.ctl"} {
+	for _, want := range []string{"requires -file", "SYSTEM.DBF"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("expected error to contain %q, got %v", want, err)
 		}
 	}
+	if strings.Contains(err.Error(), "dm.ctl") {
+		t.Fatalf("export-ddl should not require dm.ctl, got %v", err)
+	}
 }
 
-func TestExportDataDefaultsRequireFileAndCtl(t *testing.T) {
+func TestExportDataDefaultsRequireOnlySystemFile(t *testing.T) {
 	previousDir, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("Getwd failed: %v", err)
@@ -97,9 +112,12 @@ func TestExportDataDefaultsRequireFileAndCtl(t *testing.T) {
 	if err == nil {
 		t.Fatal("Run should fail when default export-data input files are absent")
 	}
-	for _, want := range []string{"requires -file and -ctl", "SYSTEM.DBF", "dm.ctl"} {
+	for _, want := range []string{"requires -file", "SYSTEM.DBF"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("expected error to contain %q, got %v", want, err)
 		}
+	}
+	if strings.Contains(err.Error(), "dm.ctl") {
+		t.Fatalf("export-data should not require dm.ctl, got %v", err)
 	}
 }

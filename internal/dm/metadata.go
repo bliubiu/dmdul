@@ -50,7 +50,10 @@ func InspectDatabaseMetadata(systemPath string, controlPath string, iniPath stri
 	}
 
 	if controlPath == "" {
-		controlPath = DefaultControlPathForSystem(systemPath)
+		defaultControlPath := DefaultControlPathForSystem(systemPath)
+		if info, err := os.Stat(defaultControlPath); err == nil && !info.IsDir() {
+			controlPath = defaultControlPath
+		}
 	}
 	meta.ControlPath = controlPath
 	meta.IniPath = iniPath

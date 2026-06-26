@@ -24,12 +24,12 @@
 ## 扫描 SYSTEM.DBF 核心字典对象
 
 ```powershell
-.\bin\dmdul.exe scan-system -file oldpro\SYSTEM.DBF -ctl oldpro\dm.ctl
+.\bin\dmdul.exe scan-system -file oldpro\SYSTEM.DBF
 ```
 
 ## 导出建表 DDL
 
-默认从当前目录读取 `SYSTEM.DBF` 和 `dm.ctl`，输出到 `dm_offline_default_all.sql`：
+默认从当前目录读取 `SYSTEM.DBF`，如果同目录存在 `dm.ctl` 会自动补充数据库名和表空间信息，输出到 `dm_offline_default_all.sql`：
 
 ```powershell
 .\bin\dmdul.exe export-ddl
@@ -40,7 +40,6 @@
 ```powershell
 .\bin\dmdul.exe export-ddl `
   -file oldpro\SYSTEM.DBF `
-  -ctl oldpro\dm.ctl `
   -out oldpro\dm_offline_schema.sql
 ```
 
@@ -49,10 +48,12 @@
 ```powershell
 .\bin\dmdul.exe export-ddl `
   -file oldpro\SYSTEM.DBF `
-  -ctl oldpro\dm.ctl `
   -out oldpro\dm_offline_all.sql `
   -owner all
 ```
+
+`scan-system`、`export-ddl` 和 `export-data` 的 `-ctl` 都是可选参数；显式提供时会使用
+指定的控制文件，未提供时只在 `SYSTEM.DBF` 同目录存在 `dm.ctl` 时自动使用。
 
 `export-ddl` 会在表 DDL 前输出可恢复的普通用户和角色授权，例如：
 
@@ -71,7 +72,6 @@ GRANT RESOURCE TO HR_TEST;
 ```powershell
 .\bin\dmdul.exe export-ddl `
   -file oldpro\SYSTEM.DBF `
-  -ctl oldpro\dm.ctl `
   -out oldpro\hr_test_schema.sql `
   -owner HR_TEST
 ```
@@ -81,7 +81,6 @@ GRANT RESOURCE TO HR_TEST;
 ```powershell
 .\bin\dmdul.exe export-ddl `
   -file oldpro\SYSTEM.DBF `
-  -ctl oldpro\dm.ctl `
   -out oldpro\some_users_schema.sql `
   -owner HR_TEST,SYSDBA
 ```
@@ -91,7 +90,6 @@ GRANT RESOURCE TO HR_TEST;
 ```powershell
 .\bin\dmdul.exe export-ddl `
   -file oldpro\SYSTEM.DBF `
-  -ctl oldpro\dm.ctl `
   -out oldpro\schema_gb18030.sql `
   -charset gb18030
 ```
@@ -103,18 +101,17 @@ GRANT RESOURCE TO HR_TEST;
 ```powershell
 .\bin\dmdul.exe export-data `
   -file oldpro\SYSTEM.DBF `
-  -ctl oldpro\dm.ctl `
-  -data-dir oldpro `
   -out oldpro\dm_offline_data.sql
 ```
+
+没有 `dm.ctl` 时，`export-data` 会根据 DBF 页头识别数据文件的
+`(表空间号, 文件号)`；`-data-dir` 默认是 `SYSTEM.DBF` 所在目录。
 
 只导出一张表，推荐使用 `OWNER.TABLE_NAME`：
 
 ```powershell
 .\bin\dmdul.exe export-data `
   -file oldpro\SYSTEM.DBF `
-  -ctl oldpro\dm.ctl `
-  -data-dir oldpro `
   -out oldpro\t_log_heap_data.sql `
   -table HR_TEST.T_LOG_HEAP
 ```
@@ -124,8 +121,6 @@ GRANT RESOURCE TO HR_TEST;
 ```powershell
 .\bin\dmdul.exe export-data `
   -file oldpro\SYSTEM.DBF `
-  -ctl oldpro\dm.ctl `
-  -data-dir oldpro `
   -out oldpro\bin_test_data.sql `
   -table SYSDBA.BIN_TEST2,SYSDBA.BIN_TEST2_CHILD
 ```
@@ -135,8 +130,6 @@ GRANT RESOURCE TO HR_TEST;
 ```powershell
 .\bin\dmdul.exe export-data `
   -file oldpro\SYSTEM.DBF `
-  -ctl oldpro\dm.ctl `
-  -data-dir oldpro `
   -out oldpro\t_lob_test_data.sql `
   -table SYSDBA.T_LOB_TEST
 ```
@@ -149,8 +142,6 @@ GRANT RESOURCE TO HR_TEST;
 ```powershell
 .\bin\dmdul.exe export-data `
   -file oldpro\SYSTEM.DBF `
-  -ctl oldpro\dm.ctl `
-  -data-dir oldpro `
   -out oldpro\dm_offline_data.sql `
   -table all `
   -exclude SYSDBA.T1
@@ -161,8 +152,6 @@ GRANT RESOURCE TO HR_TEST;
 ```powershell
 .\bin\dmdul.exe export-data `
   -file oldpro\SYSTEM.DBF `
-  -ctl oldpro\dm.ctl `
-  -data-dir oldpro `
   -out oldpro\sample_data.sql `
   -max-rows 100
 ```
@@ -172,8 +161,6 @@ GRANT RESOURCE TO HR_TEST;
 ```powershell
 .\bin\dmdul.exe export-data `
   -file oldpro\SYSTEM.DBF `
-  -ctl oldpro\dm.ctl `
-  -data-dir oldpro `
   -out oldpro\debug_data.sql `
   -table HR_TEST.T_LOG_HEAP `
   -failed-comments
