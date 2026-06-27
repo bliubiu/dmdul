@@ -64,11 +64,13 @@ var reservedIdentifierNames = map[string]bool{
 }
 
 type DDLExportOptions struct {
-	SystemPath  string
-	ControlPath string
-	OutputPath  string
-	OwnerFilter string
-	Charset     string
+	SystemPath     string
+	ControlPath    string
+	ControlDULPath string
+	OutputPath     string
+	OwnerFilter    string
+	TableFilter    string
+	Charset        string
 }
 
 type DDLExportResult struct {
@@ -240,7 +242,12 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 	}
 	decoder := textDecoder{preferred: preferredCharset}
 	ownerMatcher := newOwnerMatcher(opts.OwnerFilter)
-	tablespaces := loadTablespaceNames(opts.ControlPath)
+	tableFilter := strings.TrimSpace(opts.TableFilter)
+	if tableFilter == "" {
+		tableFilter = "all"
+	}
+	tableMatcher := newTableNameMatcher(tableFilter)
+	tablespaces := loadTablespaceNames(opts.ControlPath, opts.ControlDULPath)
 
 	objects := scanDictionaryObjects(data, pageSize, decoder)
 	schemaNames := schemaNamesFromDictionaryObjects(objects)
@@ -284,8 +291,11 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 		if !ok || !ownerMatcher.allowed(table.Owner) {
 			return
 		}
-		columnsByTable[col.TableID] = append(columnsByTable[col.TableID], col)
 		columnsByTableColID[tableColKey{tableID: col.TableID, colID: col.ColID}] = col
+		if !tableMatcher.allowed(table.Owner, table.Name) {
+			return
+		}
+		columnsByTable[col.TableID] = append(columnsByTable[col.TableID], col)
 		columnCount++
 	})
 	for tableID := range columnsByTable {
@@ -311,7 +321,7 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 			return
 		}
 		table, ok := tables[cons.TableID]
-		if !ok || !ownerMatcher.allowed(table.Owner) {
+		if !ok || !ownerMatcher.allowed(table.Owner) || !tableMatcher.allowed(table.Owner, table.Name) {
 			return
 		}
 		if _, ok := constraintObjects[cons.ID]; !ok {
@@ -330,6 +340,9 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 		if !ok || tableID == 0 {
 			return
 		}
+		if !tableMatcher.allowed(comment.Owner, comment.TableName) {
+			return
+		}
 		tableComments[ownerTableKey{owner: comment.Owner, table: comment.TableName}] = comment
 	})
 
@@ -341,6 +354,9 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 		}
 		tableID, ok := tableIDByOwnerName(tables, columnsByTable, ownerMatcher, comment.Owner, comment.TableName)
 		if !ok {
+			return
+		}
+		if !tableMatcher.allowed(comment.Owner, comment.TableName) {
 			return
 		}
 		for _, col := range columnsByTable[tableID] {
@@ -371,7 +387,7 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 		roleGrants = append(roleGrants, grant)
 	})
 
-	sql := renderDDL(objects, users, roles, roleGrants, tables, columnsByTable, columnsByTableColID, indexObjects, indexes, tableStorage, partitionsByTable, partitionKeysByTable, constraintObjects, constraints, tableComments, columnComments, ownerMatcher, tablespaces)
+	sql := renderDDL(objects, users, roles, roleGrants, tables, columnsByTable, columnsByTableColID, indexObjects, indexes, tableStorage, partitionsByTable, partitionKeysByTable, constraintObjects, constraints, tableComments, columnComments, ownerMatcher, tableMatcher, tablespaces)
 	if err := os.WriteFile(opts.OutputPath, []byte(sql), 0644); err != nil {
 		return nil, fmt.Errorf("write ddl output: %w", err)
 	}
@@ -386,9 +402,9 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 		PageSize:           pageSize,
 		PageCount:          pageCount,
 		ObjectCount:        len(objects),
-		TableCount:         countAllowedTables(tables, columnsByTable, ownerMatcher),
+		TableCount:         countAllowedTables(tables, columnsByTable, ownerMatcher, tableMatcher),
 		ColumnCount:        columnCount,
-		IndexCount:         countDDLIndexes(tables, indexObjects, indexes, ownerMatcher),
+		IndexCount:         countDDLIndexes(tables, indexObjects, indexes, ownerMatcher, tableMatcher),
 		ConstraintCount:    len(constraints),
 		TableCommentCount:  len(tableComments),
 		ColumnCommentCount: len(columnComments),
@@ -953,8 +969,9 @@ func isSafeShortText(value string) bool {
 	return !containsBadControl(value)
 }
 
-func loadTablespaceNames(controlPath string) map[uint32]string {
-	result := map[uint32]string{3: "TEMP"}
+func loadTablespaceNames(controlPath string, controlDULPath string) map[uint32]string {
+	result := defaultTablespaceNames()
+	mergeControlDULTablespaceNames(result, controlDULPath)
 	if controlPath == "" {
 		return result
 	}
@@ -966,6 +983,15 @@ func loadTablespaceNames(controlPath string) map[uint32]string {
 		result[entry.ID] = entry.Name
 	}
 	return result
+}
+
+func defaultTablespaceNames() map[uint32]string {
+	return map[uint32]string{
+		0: "SYSTEM",
+		1: "ROLL",
+		3: "TEMP",
+		4: "MAIN",
+	}
 }
 
 func tableStorageByID(tables map[uint32]dictionaryObject, indexObjects map[uint32]dictionaryObject, indexes map[uint32]indexDef, tablespaces map[uint32]string) map[uint32]indexDef {
@@ -982,9 +1008,7 @@ func tableStorageByID(tables map[uint32]dictionaryObject, indexObjects map[uint3
 		if idx.Flag&1 == 0 || idx.KeyNum != 0 {
 			continue
 		}
-		if _, ok := tablespaces[uint32(idx.GroupID)]; ok {
-			result[tableID] = idx
-		}
+		result[tableID] = idx
 	}
 	return result
 }
@@ -1010,21 +1034,21 @@ func tableIDByOwnerName(tables map[uint32]dictionaryObject, columnsByTable map[u
 	return candidates[0], true
 }
 
-func countAllowedTables(tables map[uint32]dictionaryObject, columnsByTable map[uint32][]columnDef, matcher ownerMatcher) int {
+func countAllowedTables(tables map[uint32]dictionaryObject, columnsByTable map[uint32][]columnDef, matcher ownerMatcher, tableMatcher tableNameMatcher) int {
 	count := 0
 	for id, table := range tables {
-		if matcher.allowed(table.Owner) && len(columnsByTable[id]) > 0 {
+		if matcher.allowed(table.Owner) && tableMatcher.allowed(table.Owner, table.Name) && len(columnsByTable[id]) > 0 {
 			count++
 		}
 	}
 	return count
 }
 
-func countDDLIndexes(tables map[uint32]dictionaryObject, indexObjects map[uint32]dictionaryObject, indexes map[uint32]indexDef, matcher ownerMatcher) int {
+func countDDLIndexes(tables map[uint32]dictionaryObject, indexObjects map[uint32]dictionaryObject, indexes map[uint32]indexDef, matcher ownerMatcher, tableMatcher tableNameMatcher) int {
 	count := 0
 	for indexID, obj := range indexObjects {
 		table, ok := tables[uint32(obj.ParentID)]
-		if !ok || !matcher.allowed(table.Owner) {
+		if !ok || !matcher.allowed(table.Owner) || !tableMatcher.allowed(table.Owner, table.Name) {
 			continue
 		}
 		idx, ok := indexes[indexID]
@@ -1135,14 +1159,14 @@ func userDefaultTablespaceName(user dictionaryObject, tablespaces map[uint32]str
 	return tablespaces[groupID]
 }
 
-func renderDDL(objects map[uint32]dictionaryObject, users map[uint32]dictionaryObject, roles map[uint32]dictionaryObject, roleGrants []roleGrantDef, tables map[uint32]dictionaryObject, columnsByTable map[uint32][]columnDef, columnsByTableColID map[tableColKey]columnDef, indexObjects map[uint32]dictionaryObject, indexes map[uint32]indexDef, tableStorage map[uint32]indexDef, partitionsByTable map[uint32][]PartitionInfo, partitionKeysByTable map[uint32][]uint16, constraintObjects map[uint32]dictionaryObject, constraints []constraintDef, tableComments map[ownerTableKey]tableComment, columnComments map[ownerTableColumnKey]columnComment, matcher ownerMatcher, tablespaces map[uint32]string) string {
+func renderDDL(objects map[uint32]dictionaryObject, users map[uint32]dictionaryObject, roles map[uint32]dictionaryObject, roleGrants []roleGrantDef, tables map[uint32]dictionaryObject, columnsByTable map[uint32][]columnDef, columnsByTableColID map[tableColKey]columnDef, indexObjects map[uint32]dictionaryObject, indexes map[uint32]indexDef, tableStorage map[uint32]indexDef, partitionsByTable map[uint32][]PartitionInfo, partitionKeysByTable map[uint32][]uint16, constraintObjects map[uint32]dictionaryObject, constraints []constraintDef, tableComments map[ownerTableKey]tableComment, columnComments map[ownerTableColumnKey]columnComment, matcher ownerMatcher, tableMatcher tableNameMatcher, tablespaces map[uint32]string) string {
 	var out strings.Builder
 	out.WriteString("-- Generated by dmdul export-ddl. Review before running.\n\n")
 	renderUsersAndRoles(&out, users, roles, roleGrants, matcher, tablespaces)
-	renderCreateTables(&out, tables, columnsByTable, columnsByTableColID, tableStorage, partitionsByTable, partitionKeysByTable, matcher, tablespaces)
-	renderIndexes(&out, tables, columnsByTableColID, indexObjects, indexes, matcher, tablespaces)
-	renderConstraints(&out, objects, tables, columnsByTableColID, constraintObjects, indexes, constraints, matcher)
-	renderComments(&out, tables, columnsByTable, tableComments, columnComments, matcher)
+	renderCreateTables(&out, tables, columnsByTable, columnsByTableColID, tableStorage, partitionsByTable, partitionKeysByTable, matcher, tableMatcher, tablespaces)
+	renderIndexes(&out, tables, columnsByTableColID, indexObjects, indexes, matcher, tableMatcher, tablespaces)
+	renderConstraints(&out, objects, tables, columnsByTableColID, constraintObjects, indexes, constraints, matcher, tableMatcher)
+	renderComments(&out, tables, columnsByTable, tableComments, columnComments, matcher, tableMatcher)
 	return out.String()
 }
 
@@ -1236,12 +1260,12 @@ func renderRoleGrantLines(roleGrants []roleGrantDef, users map[uint32]dictionary
 	return lines
 }
 
-func renderCreateTables(out *strings.Builder, tables map[uint32]dictionaryObject, columnsByTable map[uint32][]columnDef, columnsByTableColID map[tableColKey]columnDef, tableStorage map[uint32]indexDef, partitionsByTable map[uint32][]PartitionInfo, partitionKeysByTable map[uint32][]uint16, matcher ownerMatcher, tablespaces map[uint32]string) {
+func renderCreateTables(out *strings.Builder, tables map[uint32]dictionaryObject, columnsByTable map[uint32][]columnDef, columnsByTableColID map[tableColKey]columnDef, tableStorage map[uint32]indexDef, partitionsByTable map[uint32][]PartitionInfo, partitionKeysByTable map[uint32][]uint16, matcher ownerMatcher, tableMatcher tableNameMatcher, tablespaces map[uint32]string) {
 	out.WriteString("-- Tables\n")
 	tableIDs := sortedTableIDs(tables)
 	for _, tableID := range tableIDs {
 		table := tables[tableID]
-		if !matcher.allowed(table.Owner) || len(columnsByTable[tableID]) == 0 {
+		if !matcher.allowed(table.Owner) || !tableMatcher.allowed(table.Owner, table.Name) || len(columnsByTable[tableID]) == 0 {
 			continue
 		}
 		createKind := "CREATE TABLE"
@@ -1433,7 +1457,7 @@ func partitionTypeSummary(parts []PartitionInfo) string {
 	return strings.Join(types, ",")
 }
 
-func renderIndexes(out *strings.Builder, tables map[uint32]dictionaryObject, columnsByTableColID map[tableColKey]columnDef, indexObjects map[uint32]dictionaryObject, indexes map[uint32]indexDef, matcher ownerMatcher, tablespaces map[uint32]string) {
+func renderIndexes(out *strings.Builder, tables map[uint32]dictionaryObject, columnsByTableColID map[tableColKey]columnDef, indexObjects map[uint32]dictionaryObject, indexes map[uint32]indexDef, matcher ownerMatcher, tableMatcher tableNameMatcher, tablespaces map[uint32]string) {
 	out.WriteString("-- Indexes\n")
 	var indexIDs []uint32
 	for id := range indexObjects {
@@ -1450,7 +1474,7 @@ func renderIndexes(out *strings.Builder, tables map[uint32]dictionaryObject, col
 	for _, indexID := range indexIDs {
 		obj := indexObjects[indexID]
 		table, ok := tables[uint32(obj.ParentID)]
-		if !ok || !matcher.allowed(table.Owner) {
+		if !ok || !matcher.allowed(table.Owner) || !tableMatcher.allowed(table.Owner, table.Name) {
 			continue
 		}
 		idx, ok := indexes[indexID]
@@ -1477,7 +1501,7 @@ func renderIndexes(out *strings.Builder, tables map[uint32]dictionaryObject, col
 	out.WriteString("\n")
 }
 
-func renderConstraints(out *strings.Builder, objects map[uint32]dictionaryObject, tables map[uint32]dictionaryObject, columnsByTableColID map[tableColKey]columnDef, constraintObjects map[uint32]dictionaryObject, indexes map[uint32]indexDef, constraints []constraintDef, matcher ownerMatcher) {
+func renderConstraints(out *strings.Builder, objects map[uint32]dictionaryObject, tables map[uint32]dictionaryObject, columnsByTableColID map[tableColKey]columnDef, constraintObjects map[uint32]dictionaryObject, indexes map[uint32]indexDef, constraints []constraintDef, matcher ownerMatcher, tableMatcher tableNameMatcher) {
 	out.WriteString("-- Constraints\n")
 	ddlOrder := map[string]int{"P": 1, "U": 2, "C": 3, "F": 4, "R": 5}
 	sort.Slice(constraints, func(i, j int) bool {
@@ -1501,7 +1525,7 @@ func renderConstraints(out *strings.Builder, objects map[uint32]dictionaryObject
 			continue
 		}
 		table, ok := tables[cons.TableID]
-		if !ok || !matcher.allowed(table.Owner) {
+		if !ok || !matcher.allowed(table.Owner) || !tableMatcher.allowed(table.Owner, table.Name) {
 			continue
 		}
 		consObj, ok := constraintObjects[cons.ID]
@@ -1548,13 +1572,13 @@ func renderConstraints(out *strings.Builder, objects map[uint32]dictionaryObject
 	out.WriteString("\n")
 }
 
-func renderComments(out *strings.Builder, tables map[uint32]dictionaryObject, columnsByTable map[uint32][]columnDef, tableComments map[ownerTableKey]tableComment, columnComments map[ownerTableColumnKey]columnComment, matcher ownerMatcher) {
+func renderComments(out *strings.Builder, tables map[uint32]dictionaryObject, columnsByTable map[uint32][]columnDef, tableComments map[ownerTableKey]tableComment, columnComments map[ownerTableColumnKey]columnComment, matcher ownerMatcher, tableMatcher tableNameMatcher) {
 	out.WriteString("-- Comments\n")
 	tableIDs := sortedTableIDs(tables)
 	wroteTableComment := false
 	for _, tableID := range tableIDs {
 		table := tables[tableID]
-		if !matcher.allowed(table.Owner) || len(columnsByTable[tableID]) == 0 {
+		if !matcher.allowed(table.Owner) || !tableMatcher.allowed(table.Owner, table.Name) || len(columnsByTable[tableID]) == 0 {
 			continue
 		}
 		key := ownerTableKey{owner: table.Owner, table: table.Name}
@@ -1572,7 +1596,7 @@ func renderComments(out *strings.Builder, tables map[uint32]dictionaryObject, co
 
 	for _, tableID := range tableIDs {
 		table := tables[tableID]
-		if !matcher.allowed(table.Owner) || len(columnsByTable[tableID]) == 0 {
+		if !matcher.allowed(table.Owner) || !tableMatcher.allowed(table.Owner, table.Name) || len(columnsByTable[tableID]) == 0 {
 			continue
 		}
 		for _, col := range columnsByTable[tableID] {

@@ -15,9 +15,12 @@ import (
 const usageText = `dmdul - offline Dameng database extraction helper
 
 Usage:
+  dmdul
   dmdul <command> [options]
 
 Commands:
+  interactive
+            Start DMDUL interactive shell
   inspect   Inspect a database file and print a small binary sample
   scan-system
             Scan SYSTEM.DBF bootstrap metadata and important SYS object rows
@@ -33,32 +36,33 @@ Commands:
   help      Print this help
 
 Examples:
+  dmdul
+  DMDUL> bootstrap;
+  DMDUL> list user;
+  DMDUL> list table HR_TEST;
+  DMDUL> unload table HR_TEST.EMP_INFO;
+  DMDUL> unload user HR_TEST;
   dmdul inspect -file SYSTEM.DBF
-  dmdul inspect -file MAIN.DBF -sample 256
   dmdul scan-system -file oldpro\SYSTEM.DBF
-  dmdul inspect-ctl -ctl oldpro\dm.ctl
-  dmdul export-ddl
-  dmdul export-ddl -file oldpro\SYSTEM.DBF -out oldpro\dm_offline_schema.sql
-  dmdul export-ddl -file SYSTEM.DBF -out schema.sql -owner HR_TEST,SYSDBA -charset gb18030
-  dmdul export-data -file oldpro\SYSTEM.DBF -out oldpro\dm_offline_data.sql
-  dmdul export-data -file SYSTEM.DBF -table SYSDBA.BIN_TEST2,SYSDBA.BIN_TEST2_CHILD
   dmdul scan-partitions -file SYSTEM.DBF -ctl dm.ctl -owner all
 `
 
 const (
 	defaultExportSystemPath  = "SYSTEM.DBF"
 	defaultExportControlPath = "dm.ctl"
+	defaultControlDULPath    = "control.dul"
 	defaultExportOutputPath  = "dm_offline_default_all.sql"
 	defaultDataOutputPath    = "dm_offline_default_data.sql"
 )
 
 func Run(args []string, stdout io.Writer, stderr io.Writer) error {
 	if len(args) == 0 {
-		fmt.Fprint(stdout, usageText)
-		return nil
+		return RunInteractive(os.Stdin, stdout, stderr)
 	}
 
 	switch args[0] {
+	case "interactive", "shell":
+		return RunInteractive(os.Stdin, stdout, stderr)
 	case "help", "-h", "--help":
 		fmt.Fprint(stdout, usageText)
 		return nil
@@ -220,12 +224,14 @@ func runExportDDL(args []string, stdout io.Writer, stderr io.Writer) error {
 	var ignoredIniPath string
 	var outPath string
 	var ownerFilter string
+	var tableFilter string
 	var charset string
 	fs.StringVar(&systemPath, "file", defaultExportSystemPath, "SYSTEM.DBF path")
 	fs.StringVar(&ctlPath, "ctl", "", "optional dm.ctl path; uses SYSTEM.DBF directory default only when present")
 	fs.StringVar(&ignoredIniPath, "ini", "", "deprecated; ignored")
 	fs.StringVar(&outPath, "out", defaultExportOutputPath, "output SQL script path")
 	fs.StringVar(&ownerFilter, "owner", "all", "owner filter: all, SYSDBA, or comma-separated owners")
+	fs.StringVar(&tableFilter, "table", "all", "table filter: all or comma-separated OWNER.TABLE_NAME values")
 	fs.StringVar(&charset, "charset", "auto", "dictionary text charset: auto, utf-8, gb18030, gbk, euc-kr")
 
 	if err := fs.Parse(args); err != nil {
@@ -242,11 +248,13 @@ func runExportDDL(args []string, stdout io.Writer, stderr io.Writer) error {
 	meta := dm.InspectDatabaseMetadata(systemPath, ctlPath, "", charset)
 
 	result, err := dm.ExportDDL(dm.DDLExportOptions{
-		SystemPath:  systemPath,
-		ControlPath: ctlPath,
-		OutputPath:  outPath,
-		OwnerFilter: ownerFilter,
-		Charset:     charset,
+		SystemPath:     systemPath,
+		ControlPath:    ctlPath,
+		ControlDULPath: defaultControlDULPath,
+		OutputPath:     outPath,
+		OwnerFilter:    ownerFilter,
+		TableFilter:    tableFilter,
+		Charset:        charset,
 	})
 	if err != nil {
 		return err
@@ -312,6 +320,7 @@ func runExportData(args []string, stdout io.Writer, stderr io.Writer) error {
 	result, err := dm.ExportData(dm.DataExportOptions{
 		SystemPath:          systemPath,
 		ControlPath:         ctlPath,
+		ControlDULPath:      defaultControlDULPath,
 		DataDir:             dataDir,
 		OutputPath:          outPath,
 		OwnerFilter:         ownerFilter,

@@ -134,7 +134,7 @@ func TestResolveDataFilesWithoutControlFileUsesPageHeaders(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	files, err := resolveDataFiles("", dir)
+	files, err := resolveDataFiles("", "", dir)
 	if err != nil {
 		t.Fatalf("resolveDataFiles returned error: %v", err)
 	}

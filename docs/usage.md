@@ -1,190 +1,189 @@
 # 使用示例
 
-以下示例假设在项目根目录执行，程序位于 `.\bin\dmdul.exe`。
+以下示例假设程序位于 `.\bin\dmdul.exe`。当前推荐使用交互式入口，旧的
+`export-ddl`、`export-data` 一次性命令仍保留用于调试和兼容，但不再作为主要操作方式。
 
-## 查看帮助
+## 准备目录
 
-```powershell
-.\bin\dmdul.exe help
+建议把可执行文件、参数文件和离线数据库文件放在同一个工作目录，或者在交互界面中用
+`set` 命令指定路径：
+
+```text
+dmdul.exe
+init.dul
+control.dul
+dul.log
+SYSTEM.DBF
+MAIN.DBF
+TBS_*.DBF
 ```
 
-## 检查文件头
+`dm.ctl` 是可选增强文件。有它时可以补充数据库名、表空间名和数据文件路径；没有它时，
+数据抽取会根据 DBF 页头识别 `(表空间号, 文件号)`。
+
+## 启动 DMDUL
+
+```powershell
+.\bin\dmdul.exe
+```
+
+进入交互界面后会看到提示符：
+
+```text
+DMDUL>
+```
+
+查看帮助：
+
+```text
+DMDUL> help;
+```
+
+## 设置参数
+
+如果当前目录下就有 `SYSTEM.DBF`，可以直接执行 `bootstrap;`。否则先设置路径：
+
+```text
+DMDUL> set system D:\temp\oldpro\SYSTEM.DBF;
+DMDUL> set data_dir D:\temp\oldpro;
+DMDUL> set control D:\temp\oldpro\dm.ctl;
+DMDUL> set output_dir D:\temp\oldpro\out;
+DMDUL> set data_format sql;
+DMDUL> set charset auto;
+```
+
+查看当前参数：
+
+```text
+DMDUL> show parameter;
+```
+
+## 加载字典
+
+```text
+DMDUL> bootstrap;
+```
+
+`bootstrap` 会读取 `SYSTEM.DBF`，识别页大小、簇大小、页数、字符集，并加载用户、表、字段等字典信息。
+同时会扫描 `data_dir` 下的 DBF 页头，生成 `control.dul` 数据文件清单。成功后才能继续执行
+`list` 和 `unload`。
+
+## 查看用户和表
+
+列出用户/owner：
+
+```text
+DMDUL> list user;
+```
+
+列出某个用户下的表：
+
+```text
+DMDUL> list table HR_TEST;
+```
+
+输出中会显示表名、table id、字段数、表空间、存储组织和是否分区。
+
+## 恢复单表
+
+```text
+DMDUL> unload table HR_TEST.EMP_INFO;
+```
+
+默认会生成两个文件。未设置 `output_dir` 时，如果设置过 `data_dir`，文件会输出到
+`data_dir`；如果也没有设置 `data_dir`，文件会输出到当前目录。`control.dul` 和
+`dul.log` 也遵循同样的目录规则。
+
+```text
+HR_TEST_EMP_INFO_ddl.sql
+HR_TEST_EMP_INFO_data.sql
+```
+
+也可以指定输出前缀：
+
+```text
+DMDUL> unload table HR_TEST.EMP_INFO to emp_info;
+```
+
+生成：
+
+```text
+emp_info_ddl.sql
+emp_info_data.sql
+```
+
+导出 CSV 数据：
+
+```text
+DMDUL> set data_format csv;
+DMDUL> unload table HR_TEST.EMP_INFO;
+```
+
+生成：
+
+```text
+HR_TEST_EMP_INFO_ddl.sql
+HR_TEST_EMP_INFO_data.csv
+```
+
+## 恢复一个用户
+
+```text
+DMDUL> unload user HR_TEST;
+```
+
+默认生成：
+
+```text
+HR_TEST_ddl.sql
+HR_TEST_data.sql
+```
+
+如果 `data_format=csv`，`unload user` 会生成一个用户级 DDL 文件，并按表分别生成
+CSV 文件，例如：
+
+```text
+HR_TEST_ddl.sql
+HR_TEST_EMP_INFO_data.csv
+HR_TEST_T_LOG_HEAP_data.csv
+```
+
+也可以指定输出前缀：
+
+```text
+DMDUL> unload user HR_TEST to hr_test_all;
+```
+
+## init.dul 示例
+
+如果工作目录下存在 `init.dul`，DMDUL 启动时会自动读取：
+
+```text
+system=D:\temp\oldpro\SYSTEM.DBF
+control=D:\temp\oldpro\dm.ctl
+data_dir=D:\temp\oldpro
+output_dir=D:\temp\oldpro\out
+data_format=sql
+charset=auto
+log=dul.log
+```
+
+## 退出
+
+```text
+DMDUL> exit;
+```
+
+## 研究辅助命令
+
+以下一次性命令仍可用于排查文件和验证底层解析：
 
 ```powershell
 .\bin\dmdul.exe inspect -file oldpro\SYSTEM.DBF
-.\bin\dmdul.exe inspect -file oldpro\MAIN.DBF -sample 256
-```
-
-## 检查 dm.ctl
-
-```powershell
 .\bin\dmdul.exe inspect-ctl -ctl oldpro\dm.ctl
-```
-
-## 扫描 SYSTEM.DBF 核心字典对象
-
-```powershell
 .\bin\dmdul.exe scan-system -file oldpro\SYSTEM.DBF
+.\bin\dmdul.exe scan-partitions -file oldpro\SYSTEM.DBF -ctl oldpro\dm.ctl -owner all
 ```
-
-## 导出建表 DDL
-
-默认从当前目录读取 `SYSTEM.DBF`，如果同目录存在 `dm.ctl` 会自动补充数据库名和表空间信息，输出到 `dm_offline_default_all.sql`：
-
-```powershell
-.\bin\dmdul.exe export-ddl
-```
-
-指定输入和输出：
-
-```powershell
-.\bin\dmdul.exe export-ddl `
-  -file oldpro\SYSTEM.DBF `
-  -out oldpro\dm_offline_schema.sql
-```
-
-导出所有用户对象：
-
-```powershell
-.\bin\dmdul.exe export-ddl `
-  -file oldpro\SYSTEM.DBF `
-  -out oldpro\dm_offline_all.sql `
-  -owner all
-```
-
-`scan-system`、`export-ddl` 和 `export-data` 的 `-ctl` 都是可选参数；显式提供时会使用
-指定的控制文件，未提供时只在 `SYSTEM.DBF` 同目录存在 `dm.ctl` 时自动使用。
-
-`export-ddl` 会在表 DDL 前输出可恢复的普通用户和角色授权，例如：
-
-```sql
-CREATE USER HR_TEST IDENTIFIED BY "dmdul_default_password" DEFAULT TABLESPACE "MAIN" TEMPORARY TABLESPACE "TEMP";
-GRANT PUBLIC TO HR_TEST;
-GRANT RESOURCE TO HR_TEST;
-```
-
-密码哈希默认不会从 `SYSUSERS` 导出，生成脚本使用占位密码，恢复后需要人工修改。
-当前版本已恢复角色授权；对象权限授权仍需要继续校验 `SYSGRANTS.PRIVID`
-到权限名称的映射。
-
-只导出指定用户：
-
-```powershell
-.\bin\dmdul.exe export-ddl `
-  -file oldpro\SYSTEM.DBF `
-  -out oldpro\hr_test_schema.sql `
-  -owner HR_TEST
-```
-
-导出多个用户：
-
-```powershell
-.\bin\dmdul.exe export-ddl `
-  -file oldpro\SYSTEM.DBF `
-  -out oldpro\some_users_schema.sql `
-  -owner HR_TEST,SYSDBA
-```
-
-手工指定字符集：
-
-```powershell
-.\bin\dmdul.exe export-ddl `
-  -file oldpro\SYSTEM.DBF `
-  -out oldpro\schema_gb18030.sql `
-  -charset gb18030
-```
-
-## 导出表数据 INSERT
-
-导出所有可识别用户表数据：
-
-```powershell
-.\bin\dmdul.exe export-data `
-  -file oldpro\SYSTEM.DBF `
-  -out oldpro\dm_offline_data.sql
-```
-
-没有 `dm.ctl` 时，`export-data` 会根据 DBF 页头识别数据文件的
-`(表空间号, 文件号)`；`-data-dir` 默认是 `SYSTEM.DBF` 所在目录。
-
-只导出一张表，推荐使用 `OWNER.TABLE_NAME`：
-
-```powershell
-.\bin\dmdul.exe export-data `
-  -file oldpro\SYSTEM.DBF `
-  -out oldpro\t_log_heap_data.sql `
-  -table HR_TEST.T_LOG_HEAP
-```
-
-导出多张表：
-
-```powershell
-.\bin\dmdul.exe export-data `
-  -file oldpro\SYSTEM.DBF `
-  -out oldpro\bin_test_data.sql `
-  -table SYSDBA.BIN_TEST2,SYSDBA.BIN_TEST2_CHILD
-```
-
-导出包含行内 LOB 字段的表：
-
-```powershell
-.\bin\dmdul.exe export-data `
-  -file oldpro\SYSTEM.DBF `
-  -out oldpro\t_lob_test_data.sql `
-  -table SYSDBA.T_LOB_TEST
-```
-
-当前版本支持行内小 `CLOB`/`TEXT` 和行内小 `BLOB`/`IMAGE`；行外大 LOB
-仍需要继续验证 LOB 定位符和 LOB 段页格式。
-
-导出全部表，但排除指定表：
-
-```powershell
-.\bin\dmdul.exe export-data `
-  -file oldpro\SYSTEM.DBF `
-  -out oldpro\dm_offline_data.sql `
-  -table all `
-  -exclude SYSDBA.T1
-```
-
-限制最多处理行数：
-
-```powershell
-.\bin\dmdul.exe export-data `
-  -file oldpro\SYSTEM.DBF `
-  -out oldpro\sample_data.sql `
-  -max-rows 100
-```
-
-输出失败行诊断注释：
-
-```powershell
-.\bin\dmdul.exe export-data `
-  -file oldpro\SYSTEM.DBF `
-  -out oldpro\debug_data.sql `
-  -table HR_TEST.T_LOG_HEAP `
-  -failed-comments
-```
-
-默认不会在 INSERT 前写入页号、slot、原始数据等调试注释。
-
-## 扫描分区元数据
-
-```powershell
-.\bin\dmdul.exe scan-partitions `
-  -file oldpro\SYSTEM.DBF `
-  -ctl oldpro\dm.ctl `
-  -owner all
-```
-
-`export-ddl` 已经会合并分区表 DDL，`scan-partitions` 主要用于研究和诊断。
-
-## 常见文件关系
-
-- `SYSTEM.DBF`：系统字典，负责恢复表、字段、索引、约束、注释、存储信息。
-- `dm.ctl`：控制文件，负责恢复数据库名、表空间名、数据文件路径信息。
-- `MAIN.DBF` / `TBS_*.DBF`：用户表空间数据文件，负责恢复表数据。
-- `-data-dir`：这些 DBF 文件所在目录。
 
 ## 输出结果建议
 

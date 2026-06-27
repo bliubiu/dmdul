@@ -2,7 +2,7 @@ package version
 
 var (
 	Name    = "dmdul"
-	Version = "0.1.0-dev"
+	Version = "v0.1.2"
 	Commit  = "unknown"
 )
 

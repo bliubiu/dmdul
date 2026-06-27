@@ -61,7 +61,8 @@ Remove-Item Env:\GOARCH
 
 ```powershell
 $commit = git rev-parse --short HEAD
-go build -trimpath -ldflags "-s -w -X dmdul/internal/version.Version=v0.1.0 -X dmdul/internal/version.Commit=$commit" -o .\bin\dmdul.exe .\cmd\dmdul
+$tag = git describe --tags --abbrev=0
+go build -trimpath -ldflags "-s -w -X dmdul/internal/version.Version=$tag -X dmdul/internal/version.Commit=$commit" -o .\bin\dmdul.exe .\cmd\dmdul
 ```
 
 ## 安全建议

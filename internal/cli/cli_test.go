@@ -22,6 +22,51 @@ func TestRunHelp(t *testing.T) {
 	}
 }
 
+func TestRunInteractiveHelpAndExit(t *testing.T) {
+	previousDir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd failed: %v", err)
+	}
+	if err := os.Chdir(t.TempDir()); err != nil {
+		t.Fatalf("Chdir failed: %v", err)
+	}
+	defer func() {
+		if err := os.Chdir(previousDir); err != nil {
+			t.Fatalf("restore Chdir failed: %v", err)
+		}
+	}()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	if err := RunInteractive(strings.NewReader("help;\nexit;\n"), &stdout, &stderr); err != nil {
+		t.Fatalf("RunInteractive returned error: %v", err)
+	}
+	output := stdout.String()
+	for _, want := range []string{"dmdul: Release v0.1.2", "Copyright (c) 2026 greatfinish", "https://github.com/greatfinish/dmdul", "DMDUL>", "bootstrap;", "list user;", "unload table", "bye"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("interactive output should contain %q, got %q", want, output)
+		}
+	}
+}
+
+func TestInteractiveOutputDirDefaultsToDataDirWhenSet(t *testing.T) {
+	session := newInteractiveSession()
+	if got := session.outputPath("HR_TEST_data.sql"); got != "HR_TEST_data.sql" {
+		t.Fatalf("default outputPath = %q", got)
+	}
+	session.dataDir = `D:\temp\oldpro`
+	session.dataDirSet = true
+	if got := session.outputPath("HR_TEST_data.sql"); got != `D:\temp\oldpro\HR_TEST_data.sql` {
+		t.Fatalf("data_dir outputPath = %q", got)
+	}
+	session.outputDir = `D:\out`
+	session.outputDirSet = true
+	if got := session.outputPath("HR_TEST_data.sql"); got != `D:\out\HR_TEST_data.sql` {
+		t.Fatalf("explicit output_dir outputPath = %q", got)
+	}
+}
+
 func TestInspectRequiresFile(t *testing.T) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer

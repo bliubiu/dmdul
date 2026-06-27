@@ -32,6 +32,12 @@ go build -o .\bin\dmdul.exe .\cmd\dmdul
 .\bin\dmdul.exe help
 ```
 
+启动交互式界面：
+
+```powershell
+.\bin\dmdul.exe
+```
+
 ## 本地验证建议
 
 建议准备一个不提交到 Git 的样例目录，例如：
@@ -44,17 +50,26 @@ oldpro/
   TBS_BIN_TEST01.DBF
 ```
 
-执行 DDL 导出：
+执行交互式验证：
+
+```text
+DMDUL> set system oldpro\SYSTEM.DBF;
+DMDUL> set data_dir oldpro;
+DMDUL> bootstrap;
+DMDUL> list user;
+DMDUL> list table SYSDBA;
+DMDUL> unload table SYSDBA.T;
+```
+
+如果样例表名不同，可以先用 `list table <owner>;` 找到实际表名，再执行 `unload table`。
+
+一次性命令仍可作为底层调试入口：
 
 ```powershell
 .\bin\dmdul.exe export-ddl `
   -file oldpro\SYSTEM.DBF `
   -out oldpro\dm_offline_all.sql
-```
 
-执行数据导出：
-
-```powershell
 .\bin\dmdul.exe export-data `
   -file oldpro\SYSTEM.DBF `
   -out oldpro\dm_offline_data.sql
@@ -65,14 +80,15 @@ oldpro/
 默认版本在 `internal/version/version.go` 中：
 
 ```text
-0.1.0-dev
+v0.1.2
 ```
 
 发布构建可以写入版本号和提交号：
 
 ```powershell
 $commit = git rev-parse --short HEAD
-go build -trimpath -ldflags "-s -w -X dmdul/internal/version.Version=v0.1.0 -X dmdul/internal/version.Commit=$commit" -o .\bin\dmdul.exe .\cmd\dmdul
+$tag = git describe --tags --abbrev=0
+go build -trimpath -ldflags "-s -w -X dmdul/internal/version.Version=$tag -X dmdul/internal/version.Commit=$commit" -o .\bin\dmdul.exe .\cmd\dmdul
 ```
 
 ## 测试覆盖方向
@@ -106,7 +122,10 @@ go build -o .\bin\dmdul.exe .\cmd\dmdul
 
 如果有样例文件，再执行：
 
-```powershell
-.\bin\dmdul.exe export-ddl -file oldpro\SYSTEM.DBF -out oldpro\dm_offline_all.sql
-.\bin\dmdul.exe export-data -file oldpro\SYSTEM.DBF -out oldpro\dm_offline_data.sql
+```text
+DMDUL> set system oldpro\SYSTEM.DBF;
+DMDUL> set data_dir oldpro;
+DMDUL> bootstrap;
+DMDUL> list user;
+DMDUL> unload user SYSDBA;
 ```
