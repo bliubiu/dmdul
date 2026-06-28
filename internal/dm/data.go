@@ -253,15 +253,23 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create data output: %w", err)
 	}
-	defer out.Close()
 	writer := bufio.NewWriter(out)
-	defer writer.Flush()
 
 	var csvWriter *csv.Writer
 	var csvTable dataTableInfo
+	defer func() {
+		if csvWriter != nil {
+			csvWriter.Flush()
+		}
+		_ = writer.Flush()
+		_ = out.Close()
+		if outputFormat == "csv" && result != nil && result.RowsExported == 0 {
+			_ = os.Remove(opts.OutputPath)
+			result.OutputPath = ""
+		}
+	}()
 	if outputFormat == "csv" {
 		csvWriter = csv.NewWriter(writer)
-		defer csvWriter.Flush()
 		if table, ok := singleSelectedDataTable(selectedTables); ok {
 			csvTable = table
 			if err := csvWriter.Write(csvHeaderForDataTable(table)); err != nil {

@@ -67,6 +67,8 @@
   - 表空间名
   - 数据文件路径
 - 扫描 `data_dir` 下 DBF 页头，辅助生成 `control.dul`。
+- `bootstrap` 会把字典摘要写入 `dmdul_dict` 文本目录，便于再次启动快速加载和人工修正。
+- `bootstrap` 会把识别到的数据库字符集回写到 `init.dul` 的 `charset` 参数。
 
 ### DDL 导出
 
@@ -110,6 +112,7 @@
 
 ```text
 bootstrap;
+load dictionary;
 list user;
 list table <owner>;
 unload table <owner.table_name>;
@@ -209,10 +212,15 @@ DMDUL> exit;
 - 未显式指定 `dm.ctl` 时，如果 `SYSTEM.DBF` 同目录存在 `dm.ctl`，工具会自动尝试使用。
 - `bootstrap` 会扫描 `data_dir` 下的 DBF 页头，并生成 `control.dul`。
 - `control.dul` 用于记录表空间号、文件号、表空间名和数据文件路径。
+- `bootstrap` 会生成 `dmdul_dict\meta.tsv`、`users.tsv`、`tables.tsv`、`columns.tsv`。
+- 再次启动后可以用 `load dictionary;` 从文本字典恢复，`list user;` 也会显示字典来源和统计。
+- 交互模式会自动生成 `init.dul` 参数文件；未设置 `data_dir` 时写在当前目录，
+  设置 `data_dir` 后写到 `data_dir` 目录。
+- `init.dul` 可以人工修改，交互界面中执行 `load init;` 可重新加载参数。
 - `unload table` 用于抽取单表。
 - `unload user` 用于抽取指定用户下的表。
 - 数据默认导出为 INSERT SQL。
-- 可通过 `set data_format csv;` 导出 CSV。
+- 可通过 `set data_format csv;` 导出 CSV；空表不会生成空 CSV 文件。
 
 ### 方式二：命令行直接导出 DDL
 
@@ -309,6 +317,7 @@ dm.ini
 *.log
 *.sql
 *.csv
+dmdul_dict/
 真实生产数据
 导出的业务数据
 ```
@@ -323,6 +332,7 @@ dm.ini
 *.log
 *.sql
 *.csv
+dmdul_dict/
 bin/
 dist/
 tmp/

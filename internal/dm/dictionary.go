@@ -18,6 +18,8 @@ type DictionaryOptions struct {
 type DictionaryInfo struct {
 	SystemPath       string
 	ControlPath      string
+	Source           string
+	DictionaryDir    string
 	ExtentSize       uint32
 	ExtentSizeSource string
 	PageSize         uint32
@@ -30,6 +32,7 @@ type DictionaryInfo struct {
 	ColumnCount      int
 	Users            []DictionaryUser
 	Tables           []DictionaryTable
+	Columns          []DictionaryColumn
 }
 
 type DictionaryUser struct {
@@ -47,6 +50,19 @@ type DictionaryTable struct {
 	Temporary   bool
 	Storage     string
 	Partitioned bool
+}
+
+type DictionaryColumn struct {
+	TableID    uint32
+	TableOwner string
+	TableName  string
+	ColID      uint16
+	Name       string
+	DataType   string
+	Length     uint32
+	Scale      int16
+	Nullable   string
+	Default    string
 }
 
 func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
@@ -104,6 +120,7 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 	}
 
 	columnsByTable := make(map[uint32]int)
+	var columnList []DictionaryColumn
 	columnCount := 0
 	iterDictionaryRows(data, pageSize, func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16) {
 		col, ok := parseDDLColumnRow(page, int(slotOff), pageNo, slotNo, slotOff, pageSize, decoder)
@@ -115,6 +132,18 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 			return
 		}
 		columnsByTable[col.TableID]++
+		columnList = append(columnList, DictionaryColumn{
+			TableID:    col.TableID,
+			TableOwner: table.Owner,
+			TableName:  table.Name,
+			ColID:      col.ColID,
+			Name:       col.Name,
+			DataType:   col.DataType,
+			Length:     col.Length,
+			Scale:      col.Scale,
+			Nullable:   col.Nullable,
+			Default:    col.Default,
+		})
 		columnCount++
 	})
 
@@ -176,10 +205,23 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 		}
 		return tableList[i].Owner < tableList[j].Owner
 	})
+	sort.Slice(columnList, func(i, j int) bool {
+		if columnList[i].TableOwner != columnList[j].TableOwner {
+			return columnList[i].TableOwner < columnList[j].TableOwner
+		}
+		if columnList[i].TableName != columnList[j].TableName {
+			return columnList[i].TableName < columnList[j].TableName
+		}
+		if columnList[i].ColID != columnList[j].ColID {
+			return columnList[i].ColID < columnList[j].ColID
+		}
+		return columnList[i].Name < columnList[j].Name
+	})
 
 	return &DictionaryInfo{
 		SystemPath:       opts.SystemPath,
 		ControlPath:      opts.ControlPath,
+		Source:           "SYSTEM.DBF",
 		ExtentSize:       extentSize,
 		ExtentSizeSource: extentSizeSource,
 		PageSize:         pageSize,
@@ -192,5 +234,6 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 		ColumnCount:      columnCount,
 		Users:            userList,
 		Tables:           tableList,
+		Columns:          columnList,
 	}, nil
 }

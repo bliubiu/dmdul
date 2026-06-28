@@ -8,6 +8,7 @@ coverage.out
 *.log
 *.trc
 *.sql
+*.csv
 
 # Local database samples can be large and sensitive.
 *.DBF
@@ -21,3 +22,4 @@ windowdameng/
 dm.ini
 init.dul
 control.dul
+dmdul_dict/

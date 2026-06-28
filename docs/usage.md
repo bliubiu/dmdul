@@ -12,6 +12,7 @@
 dmdul.exe
 init.dul
 control.dul
+dmdul_dict/
 dul.log
 SYSTEM.DBF
 MAIN.DBF
@@ -65,8 +66,27 @@ DMDUL> bootstrap;
 ```
 
 `bootstrap` 会读取 `SYSTEM.DBF`，识别页大小、簇大小、页数、字符集，并加载用户、表、字段等字典信息。
-同时会扫描 `data_dir` 下的 DBF 页头，生成 `control.dul` 数据文件清单。成功后才能继续执行
-`list` 和 `unload`。
+同时会扫描 `data_dir` 下的 DBF 页头，生成 `control.dul` 数据文件清单，并把字典摘要写入
+`dmdul_dict` 文本目录。成功后还会把识别到的数据库字符集回写到 `init.dul`
+的 `charset` 参数。成功后才能继续执行 `list` 和 `unload`。
+
+`dmdul_dict` 目录当前包含：
+
+```text
+meta.tsv
+users.tsv
+tables.tsv
+columns.tsv
+```
+
+这些文件可以人工审查和修正。再次进入 DMDUL 后，可以不重扫 `SYSTEM.DBF`，直接加载文本字典：
+
+```text
+DMDUL> load dictionary;
+```
+
+如果内存中还没有字典，执行 `list user`、`list table`、`unload table`、`unload user` 前也会尝试自动从
+`dmdul_dict` 加载。
 
 ## 查看用户和表
 
@@ -75,6 +95,8 @@ DMDUL> bootstrap;
 ```text
 DMDUL> list user;
 ```
+
+`list user` 会先显示当前字典来源、字典目录和字典行数统计，再列出用户/owner。
 
 列出某个用户下的表：
 
@@ -92,7 +114,8 @@ DMDUL> unload table HR_TEST.EMP_INFO;
 
 默认会生成两个文件。未设置 `output_dir` 时，如果设置过 `data_dir`，文件会输出到
 `data_dir`；如果也没有设置 `data_dir`，文件会输出到当前目录。`control.dul` 和
-`dul.log` 也遵循同样的目录规则。
+`dul.log` 也遵循同样的目录规则。交互模式还会自动生成 `init.dul`：
+未设置 `data_dir` 时写到当前目录，设置 `data_dir` 后写到 `data_dir`。
 
 ```text
 HR_TEST_EMP_INFO_ddl.sql
@@ -140,7 +163,7 @@ HR_TEST_data.sql
 ```
 
 如果 `data_format=csv`，`unload user` 会生成一个用户级 DDL 文件，并按表分别生成
-CSV 文件，例如：
+CSV 文件；没有数据的表不会生成空 CSV。例如：
 
 ```text
 HR_TEST_ddl.sql
@@ -156,16 +179,24 @@ DMDUL> unload user HR_TEST to hr_test_all;
 
 ## init.dul 示例
 
-如果工作目录下存在 `init.dul`，DMDUL 启动时会自动读取：
+如果工作目录下存在 `init.dul`，DMDUL 启动时会自动读取；每次执行 `set`
+命令后会同步写入：
 
 ```text
 system=D:\temp\oldpro\SYSTEM.DBF
 control=D:\temp\oldpro\dm.ctl
 data_dir=D:\temp\oldpro
-output_dir=D:\temp\oldpro\out
+output_dir=
 data_format=sql
 charset=auto
-log=dul.log
+log=
+```
+
+如果运行过程中手工修改了 `init.dul`，可以重新加载：
+
+```text
+DMDUL> load init;
+DMDUL> show parameter;
 ```
 
 ## 退出

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 	"unicode"
 
 	"dmdul/internal/dm"
@@ -28,6 +29,7 @@ type interactiveSession struct {
 	logPath         string
 	logPathSet      bool
 	logOpenPath     string
+	initSource      string
 	dictionary      *dm.DictionaryInfo
 	logFile         *os.File
 	stderr          io.Writer
@@ -36,7 +38,10 @@ type interactiveSession struct {
 func RunInteractive(input io.Reader, stdout io.Writer, stderr io.Writer) error {
 	session := newInteractiveSession()
 	session.stderr = stderr
-	session.loadInitFile(stderr)
+	session.loadConfigFile(stderr)
+	if err := session.writeInitDUL(); err != nil {
+		fmt.Fprintf(stderr, "warning: write init.dul: %v\n", err)
+	}
 	defer session.closeLog()
 
 	fmt.Fprintf(stdout, "dmdul: Release %s - Dameng Data Unloader Tool\n", version.Version)
@@ -62,6 +67,9 @@ func RunInteractive(input io.Reader, stdout io.Writer, stderr io.Writer) error {
 				continue
 			}
 			session.log(replPrompt + command)
+			if err := session.writeInitDUL(); err != nil {
+				fmt.Fprintf(stderr, "warning: write init.dul: %v\n", err)
+			}
 			if exit {
 				return nil
 			}
@@ -100,6 +108,8 @@ func (s *interactiveSession) execute(command string, stdout io.Writer) (bool, er
 		return false, s.executeShow(fields[1:], stdout)
 	case "bootstrap":
 		return false, s.bootstrap(stdout)
+	case "load":
+		return false, s.executeLoad(fields[1:], stdout)
 	case "list":
 		return false, s.executeList(fields[1:], stdout)
 	case "unload":
@@ -113,9 +123,13 @@ func (s *interactiveSession) execute(command string, stdout io.Writer) (bool, er
 func printInteractiveHelp(stdout io.Writer) {
 	fmt.Fprintln(stdout, "Commands:")
 	fmt.Fprintln(stdout, "  bootstrap;")
-	fmt.Fprintln(stdout, "      Load dictionary metadata from SYSTEM.DBF.")
+	fmt.Fprintln(stdout, "      Load dictionary metadata from SYSTEM.DBF and write text dictionary files.")
+	fmt.Fprintln(stdout, "  load dictionary;")
+	fmt.Fprintln(stdout, "      Load dictionary metadata from dmdul_dict text files.")
+	fmt.Fprintln(stdout, "  load init;")
+	fmt.Fprintln(stdout, "      Reload parameters from the effective init.dul file.")
 	fmt.Fprintln(stdout, "  list user;")
-	fmt.Fprintln(stdout, "      List recovered users/owners.")
+	fmt.Fprintln(stdout, "      List recovered users/owners and dictionary cache status.")
 	fmt.Fprintln(stdout, "  list table <owner>;")
 	fmt.Fprintln(stdout, "      List tables owned by one user.")
 	fmt.Fprintln(stdout, "  unload table <owner.table_name>;")
@@ -184,8 +198,8 @@ func (s *interactiveSession) executeList(args []string, stdout io.Writer) error 
 	if len(args) == 0 {
 		return fmt.Errorf("usage: list user | list table <owner>")
 	}
-	if s.dictionary == nil {
-		return fmt.Errorf("dictionary not loaded, run bootstrap first")
+	if err := s.ensureDictionaryLoaded(); err != nil {
+		return err
 	}
 	switch strings.ToLower(args[0]) {
 	case "user", "users":
@@ -201,12 +215,26 @@ func (s *interactiveSession) executeList(args []string, stdout io.Writer) error 
 	return nil
 }
 
+func (s *interactiveSession) executeLoad(args []string, stdout io.Writer) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: load dictionary | load init")
+	}
+	switch strings.ToLower(args[0]) {
+	case "dictionary":
+		return s.loadDictionaryFiles(stdout)
+	case "init":
+		return s.loadInitDULCommand(stdout)
+	default:
+		return fmt.Errorf("usage: load dictionary | load init")
+	}
+}
+
 func (s *interactiveSession) executeUnload(args []string, stdout io.Writer) error {
 	if len(args) < 2 {
 		return fmt.Errorf("usage: unload table <owner.table_name> | unload user <owner>")
 	}
-	if s.dictionary == nil {
-		return fmt.Errorf("dictionary not loaded, run bootstrap first")
+	if err := s.ensureDictionaryLoaded(); err != nil {
+		return err
 	}
 	switch strings.ToLower(args[0]) {
 	case "table":
@@ -243,10 +271,20 @@ func (s *interactiveSession) bootstrap(stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
+	dictDir := s.effectiveDictionaryDir()
+	dict.Source = "SYSTEM.DBF"
+	dict.DictionaryDir = dictDir
+	dictFiles, err := dm.WriteDictionaryFiles(dictDir, dict)
+	if err != nil {
+		return fmt.Errorf("write dictionary files: %w", err)
+	}
 	s.systemPath = systemPath
 	s.controlPath = ctlPath
 	s.controlProvided = ctlProvided
 	s.dictionary = dict
+	if detectedCharset, ok := charsetParameterFromDictionary(dict.Charset); ok {
+		s.charset = detectedCharset
+	}
 
 	fmt.Fprintln(stdout, "bootstrap completed")
 	fmt.Fprintf(stdout, "system file: %s\n", dict.SystemPath)
@@ -254,10 +292,13 @@ func (s *interactiveSession) bootstrap(stdout io.Writer) error {
 		fmt.Fprintf(stdout, "control file: %s\n", dict.ControlPath)
 	}
 	fmt.Fprintf(stdout, "control.dul: %s (data files: %d)\n", controlDULPath, len(dataFiles))
+	fmt.Fprintf(stdout, "dictionary dir: %s (users=%d tables=%d columns=%d)\n",
+		dictFiles.Dir, dictFiles.UserCount, dictFiles.TableCount, dictFiles.ColumnCount)
 	fmt.Fprintf(stdout, "page size: %d bytes\n", dict.PageSize)
 	fmt.Fprintf(stdout, "extent size: %d pages (%s)\n", dict.ExtentSize, dict.ExtentSizeSource)
 	fmt.Fprintf(stdout, "page count: %d\n", dict.PageCount)
 	fmt.Fprintf(stdout, "charset: %s (%s)\n", dict.Charset, dict.CharsetSource)
+	fmt.Fprintf(stdout, "charset parameter: %s\n", s.charset)
 	fmt.Fprintf(stdout, "objects loaded: %d\n", dict.ObjectCount)
 	fmt.Fprintf(stdout, "users loaded: %d\n", dict.UserCount)
 	fmt.Fprintf(stdout, "tables loaded: %d\n", dict.TableCount)
@@ -269,19 +310,23 @@ func (s *interactiveSession) printParameters(stdout io.Writer) {
 	fmt.Fprintf(stdout, "system     = %s\n", s.systemPath)
 	fmt.Fprintf(stdout, "control    = %s\n", defaultIfBlank(s.controlPath, "(auto)"))
 	fmt.Fprintf(stdout, "control_dul= %s\n", s.effectiveControlDULPath())
+	fmt.Fprintf(stdout, "init_dul   = %s\n", s.effectiveInitDULPath())
+	fmt.Fprintf(stdout, "init_load  = %s\n", defaultIfBlank(s.initSource, "(not loaded)"))
+	fmt.Fprintf(stdout, "dict_dir   = %s\n", s.effectiveDictionaryDir())
 	fmt.Fprintf(stdout, "data_dir   = %s\n", defaultIfBlank(s.dataDir, "(SYSTEM.DBF directory)"))
 	fmt.Fprintf(stdout, "output_dir = %s\n", s.effectiveOutputDir())
 	fmt.Fprintf(stdout, "data_format= %s\n", s.dataFormat)
 	fmt.Fprintf(stdout, "charset    = %s\n", s.charset)
 	fmt.Fprintf(stdout, "log        = %s\n", s.effectiveLogPath())
 	if s.dictionary != nil {
-		fmt.Fprintln(stdout, "dictionary = loaded")
+		fmt.Fprintf(stdout, "dictionary = loaded (%s)\n", defaultIfBlank(s.dictionary.Source, "memory"))
 	} else {
 		fmt.Fprintln(stdout, "dictionary = not loaded")
 	}
 }
 
 func (s *interactiveSession) printUsers(stdout io.Writer) {
+	s.printDictionarySummary(stdout)
 	counts := make(map[string]int)
 	for _, table := range s.dictionary.Tables {
 		counts[strings.ToUpper(table.Owner)]++
@@ -290,6 +335,18 @@ func (s *interactiveSession) printUsers(stdout io.Writer) {
 	for _, user := range s.dictionary.Users {
 		fmt.Fprintf(stdout, "%-22s %-10d\n", user.Name, counts[strings.ToUpper(user.Name)])
 	}
+}
+
+func (s *interactiveSession) printDictionarySummary(stdout io.Writer) {
+	if s.dictionary == nil {
+		return
+	}
+	source := defaultIfBlank(s.dictionary.Source, "memory")
+	dir := defaultIfBlank(s.dictionary.DictionaryDir, s.effectiveDictionaryDir())
+	fmt.Fprintf(stdout, "dictionary source: %s\n", source)
+	fmt.Fprintf(stdout, "dictionary dir: %s\n", dir)
+	fmt.Fprintf(stdout, "dictionary rows: users=%d tables=%d columns=%d objects=%d\n\n",
+		len(s.dictionary.Users), len(s.dictionary.Tables), len(s.dictionary.Columns), s.dictionary.ObjectCount)
 }
 
 func (s *interactiveSession) printTables(stdout io.Writer, owner string) {
@@ -374,7 +431,11 @@ func (s *interactiveSession) unloadTable(args []string, stdout io.Writer) error 
 		return err
 	}
 	fmt.Fprintf(stdout, "ddl output: %s\n", ddl.OutputPath)
-	fmt.Fprintf(stdout, "data output: %s\n", data.OutputPath)
+	if s.dataFormat == "csv" && data.OutputPath == "" {
+		fmt.Fprintln(stdout, "data output: skipped (no rows)")
+	} else {
+		fmt.Fprintf(stdout, "data output: %s\n", data.OutputPath)
+	}
 	fmt.Fprintf(stdout, "tables exported: %d\n", ddl.TableCount)
 	fmt.Fprintf(stdout, "rows exported: %d\n", data.RowsExported)
 	fmt.Fprintf(stdout, "rows failed: %d\n", data.RowsFailed)
@@ -466,9 +527,13 @@ func (s *interactiveSession) unloadUserCSV(prefix string, owner string, stdout i
 		if err != nil {
 			return files, rowsExported, rowsFailed, err
 		}
-		files++
 		rowsExported += data.RowsExported
 		rowsFailed += data.RowsFailed
+		if data.OutputPath == "" {
+			fmt.Fprintf(stdout, "csv skipped: %s.%s (no rows)\n", table.Owner, table.Name)
+			continue
+		}
+		files++
 		fmt.Fprintf(stdout, "csv output: %s\n", data.OutputPath)
 	}
 	return files, rowsExported, rowsFailed, nil
@@ -493,6 +558,36 @@ func (s *interactiveSession) hasOwner(owner string) bool {
 		}
 	}
 	return false
+}
+
+func (s *interactiveSession) ensureDictionaryLoaded() error {
+	if s.dictionary != nil {
+		return nil
+	}
+	if err := s.loadDictionaryFiles(io.Discard); err != nil {
+		return fmt.Errorf("dictionary not loaded, run bootstrap first or load dictionary files from %s: %w", s.effectiveDictionaryDir(), err)
+	}
+	return nil
+}
+
+func (s *interactiveSession) loadDictionaryFiles(stdout io.Writer) error {
+	dict, files, err := dm.LoadDictionaryFiles(s.effectiveDictionaryDir())
+	if err != nil {
+		return err
+	}
+	s.dictionary = dict
+	if strings.TrimSpace(dict.SystemPath) != "" {
+		s.systemPath = dict.SystemPath
+	}
+	if strings.TrimSpace(dict.ControlPath) != "" {
+		s.controlPath = dict.ControlPath
+		s.controlProvided = true
+	}
+	if stdout != io.Discard {
+		fmt.Fprintf(stdout, "dictionary loaded: %s\n", files.Dir)
+		fmt.Fprintf(stdout, "users=%d tables=%d columns=%d\n", files.UserCount, files.TableCount, files.ColumnCount)
+	}
+	return nil
 }
 
 func (s *interactiveSession) outputPath(name string) string {
@@ -527,6 +622,17 @@ func (s *interactiveSession) effectiveControlDULPath() string {
 	return filepath.Join(s.effectiveOutputDir(), defaultControlDULPath)
 }
 
+func (s *interactiveSession) effectiveDictionaryDir() string {
+	return filepath.Join(s.effectiveOutputDir(), dm.DefaultDictionaryDirName)
+}
+
+func (s *interactiveSession) effectiveInitDULPath() string {
+	if s.dataDirSet && strings.TrimSpace(s.dataDir) != "" {
+		return filepath.Join(s.dataDir, defaultInitDULPath)
+	}
+	return defaultInitDULPath
+}
+
 func (s *interactiveSession) effectiveLogPath() string {
 	if s.logPathSet {
 		if filepath.IsAbs(s.logPath) {
@@ -541,16 +647,35 @@ func (s *interactiveSession) ensureOutputDir() error {
 	return os.MkdirAll(s.effectiveOutputDir(), 0755)
 }
 
-func (s *interactiveSession) loadInitFile(stderr io.Writer) {
-	file, err := os.Open("init.dul")
+func (s *interactiveSession) loadConfigFile(stderr io.Writer) {
+	path := defaultInitDULPath
+	if err := s.loadInitDUL(path); err != nil {
+		if !os.IsNotExist(err) {
+			fmt.Fprintf(stderr, "warning: read %s: %v\n", path, err)
+		}
+	}
+}
+
+func (s *interactiveSession) loadInitDULCommand(stdout io.Writer) error {
+	path := s.effectiveInitDULPath()
+	if err := s.loadInitDUL(path); err != nil {
+		return err
+	}
+	s.dictionary = nil
+	fmt.Fprintf(stdout, "init loaded: %s\n", path)
+	return nil
+}
+
+func (s *interactiveSession) loadInitDUL(path string) error {
+	file, err := os.Open(path)
 	if err != nil {
-		return
+		return err
 	}
 	defer file.Close()
-
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
+		line = strings.TrimPrefix(line, "\ufeff")
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "--") {
 			continue
 		}
@@ -578,15 +703,62 @@ func (s *interactiveSession) loadInitFile(stderr io.Writer) {
 			s.charset = value
 		case "output_dir", "outdir":
 			s.outputDir = value
-			s.outputDirSet = true
+			s.outputDirSet = value != ""
 		case "log":
 			s.logPath = value
 			s.logPathSet = value != ""
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		fmt.Fprintf(stderr, "warning: read init.dul: %v\n", err)
+		return err
 	}
+	s.initSource = path
+	return nil
+}
+
+func (s *interactiveSession) writeInitDUL() error {
+	path := s.effectiveInitDULPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte(s.initDULContent()), 0644)
+}
+
+func (s *interactiveSession) initDULContent() string {
+	var out strings.Builder
+	out.WriteString("# Generated by dmdul interactive shell.\n")
+	out.WriteString("# This file mirrors show parameter; blank values keep automatic defaults.\n")
+	out.WriteString(fmt.Sprintf("# effective_control_dul=%s\n", s.effectiveControlDULPath()))
+	out.WriteString(fmt.Sprintf("# effective_dict_dir=%s\n", s.effectiveDictionaryDir()))
+	out.WriteString(fmt.Sprintf("# effective_init_dul=%s\n", s.effectiveInitDULPath()))
+	out.WriteString(fmt.Sprintf("# effective_output_dir=%s\n", s.effectiveOutputDir()))
+	out.WriteString(fmt.Sprintf("# effective_log=%s\n", s.effectiveLogPath()))
+	out.WriteString(fmt.Sprintf("# init_load=%s\n", defaultIfBlank(s.initSource, "(not loaded)")))
+	if s.dictionary != nil {
+		out.WriteString(fmt.Sprintf("# dictionary=%s\n", defaultIfBlank(s.dictionary.Source, "memory")))
+	} else {
+		out.WriteString("# dictionary=not loaded\n")
+	}
+	out.WriteString(fmt.Sprintf("system=%s\n", s.systemPath))
+	out.WriteString(fmt.Sprintf("control=%s\n", s.controlPath))
+	if s.dataDirSet {
+		out.WriteString(fmt.Sprintf("data_dir=%s\n", s.dataDir))
+	} else {
+		out.WriteString("data_dir=\n")
+	}
+	if s.outputDirSet {
+		out.WriteString(fmt.Sprintf("output_dir=%s\n", s.outputDir))
+	} else {
+		out.WriteString("output_dir=\n")
+	}
+	out.WriteString(fmt.Sprintf("data_format=%s\n", s.dataFormat))
+	out.WriteString(fmt.Sprintf("charset=%s\n", s.charset))
+	if s.logPathSet {
+		out.WriteString(fmt.Sprintf("log=%s\n", s.logPath))
+	} else {
+		out.WriteString("log=\n")
+	}
+	return out.String()
 }
 
 func (s *interactiveSession) openLog() {
@@ -628,7 +800,11 @@ func (s *interactiveSession) log(line string) {
 	if s.logFile == nil {
 		return
 	}
-	fmt.Fprintln(s.logFile, line)
+	fmt.Fprintln(s.logFile, timestampedLogLine(line, time.Now()))
+}
+
+func timestampedLogLine(line string, at time.Time) string {
+	return fmt.Sprintf("%s %s", at.Format("2006-01-02 15:04:05"), line)
 }
 
 func splitInteractiveCommands(line string) []string {
@@ -739,4 +915,18 @@ func sanitizedFilePrefix(value string) string {
 
 func normalizeParameterName(value string) string {
 	return strings.ReplaceAll(strings.ToLower(strings.TrimSpace(value)), "-", "_")
+}
+
+func charsetParameterFromDictionary(value string) (string, bool) {
+	value = strings.ToUpper(strings.TrimSpace(value))
+	switch {
+	case strings.Contains(value, "GB18030") || strings.Contains(value, "GBK") || strings.Contains(value, "UNICODE_FLAG=0"):
+		return "gb18030", true
+	case strings.Contains(value, "UTF-8") || strings.Contains(value, "UTF8") || strings.Contains(value, "UNICODE_FLAG=1"):
+		return "utf-8", true
+	case strings.Contains(value, "EUC-KR") || strings.Contains(value, "EUCKR") || strings.Contains(value, "UNICODE_FLAG=2"):
+		return "euc-kr", true
+	default:
+		return "", false
+	}
 }

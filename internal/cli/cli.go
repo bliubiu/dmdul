@@ -51,6 +51,7 @@ const (
 	defaultExportSystemPath  = "SYSTEM.DBF"
 	defaultExportControlPath = "dm.ctl"
 	defaultControlDULPath    = "control.dul"
+	defaultInitDULPath       = "init.dul"
 	defaultExportOutputPath  = "dm_offline_default_all.sql"
 	defaultDataOutputPath    = "dm_offline_default_data.sql"
 )
