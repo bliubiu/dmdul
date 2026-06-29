@@ -32,11 +32,18 @@ func TestWriteAndLoadDictionaryFiles(t *testing.T) {
 		Views: []DictionaryView{
 			{ID: 2001, Owner: "SYSDBA", Name: "V_EMP", Valid: "Y", SQL: "CREATE OR REPLACE VIEW SYSDBA.V_EMP AS SELECT 1 AS ID"},
 		},
+		Sequences: []DictionarySequence{
+			{ID: 2101, Owner: "SYSDBA", Name: "SEQ_EMP", Valid: "Y", StartWith: 1, MinValue: 1, MaxValue: 999999999999, IncrementBy: 1, CycleFlag: "N", OrderFlag: "N", CacheSize: 20},
+		},
+		Triggers: []DictionaryTrigger{
+			{ID: 2201, Owner: "SYSDBA", Name: "TRG_EMP", TableOwner: "HR_TEST", TableName: "EMP_INFO", Valid: "Y", SQL: "CREATE OR REPLACE TRIGGER SYSDBA.TRG_EMP BEFORE INSERT ON HR_TEST.EMP_INFO BEGIN NULL; END;"},
+		},
 		Synonyms: []DictionarySynonym{
 			{ID: 3001, Owner: "HR_TEST", Name: "SYN_V_EMP", TableOwner: "SYSDBA", TableName: "V_EMP"},
 		},
 		TabPrivileges: []DictionaryTabPrivilege{
 			{Grantee: "HR_TEST", Owner: "SYSDBA", ObjectName: "V_EMP", ObjectType: "VIEW", Privilege: "SELECT", Grantable: "N"},
+			{Grantee: "HR_TEST", Owner: "SYSDBA", ObjectName: "SEQ_EMP", ObjectType: "SEQUENCE", Privilege: "SELECT", Grantable: "N"},
 		},
 	}
 
@@ -44,7 +51,7 @@ func TestWriteAndLoadDictionaryFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WriteDictionaryFiles returned error: %v", err)
 	}
-	if written.UserCount != 1 || written.TableCount != 1 || written.ColumnCount != 2 || written.ViewCount != 1 || written.SynonymCount != 1 || written.TabPrivilegeCount != 1 {
+	if written.UserCount != 1 || written.TableCount != 1 || written.ColumnCount != 2 || written.ViewCount != 1 || written.SequenceCount != 1 || written.TriggerCount != 1 || written.SynonymCount != 1 || written.TabPrivilegeCount != 2 {
 		t.Fatalf("unexpected written counts: %+v", written)
 	}
 
@@ -52,7 +59,7 @@ func TestWriteAndLoadDictionaryFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadDictionaryFiles returned error: %v", err)
 	}
-	if files.Dir != dir || files.ColumnCount != 2 || files.ViewCount != 1 || files.SynonymCount != 1 || files.TabPrivilegeCount != 1 {
+	if files.Dir != dir || files.ColumnCount != 2 || files.ViewCount != 1 || files.SequenceCount != 1 || files.TriggerCount != 1 || files.SynonymCount != 1 || files.TabPrivilegeCount != 2 {
 		t.Fatalf("unexpected loaded files result: %+v", files)
 	}
 	if loaded.Source != "dictionary files" || loaded.DictionaryDir != dir {
@@ -70,10 +77,16 @@ func TestWriteAndLoadDictionaryFiles(t *testing.T) {
 	if len(loaded.Views) != 1 || loaded.Views[0].Name != "V_EMP" || loaded.Views[0].SQL == "" {
 		t.Fatalf("view was not preserved: %+v", loaded.Views)
 	}
+	if len(loaded.Sequences) != 1 || loaded.Sequences[0].Name != "SEQ_EMP" || loaded.Sequences[0].IncrementBy != 1 || loaded.Sequences[0].MaxValue != 999999999999 || loaded.Sequences[0].CacheSize != 20 {
+		t.Fatalf("sequence was not preserved: %+v", loaded.Sequences)
+	}
+	if len(loaded.Triggers) != 1 || loaded.Triggers[0].Name != "TRG_EMP" || loaded.Triggers[0].SQL == "" {
+		t.Fatalf("trigger was not preserved: %+v", loaded.Triggers)
+	}
 	if len(loaded.Synonyms) != 1 || loaded.Synonyms[0].Name != "SYN_V_EMP" {
 		t.Fatalf("synonym was not preserved: %+v", loaded.Synonyms)
 	}
-	if len(loaded.TabPrivileges) != 1 || loaded.TabPrivileges[0].Privilege != "SELECT" {
+	if len(loaded.TabPrivileges) != 2 || loaded.TabPrivileges[0].Privilege != "SELECT" {
 		t.Fatalf("tab privilege was not preserved: %+v", loaded.TabPrivileges)
 	}
 }

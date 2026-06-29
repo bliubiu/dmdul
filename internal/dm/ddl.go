@@ -94,6 +94,8 @@ type DDLExportResult struct {
 	RoleCount          int
 	RoleGrantCount     int
 	ViewCount          int
+	SequenceCount      int
+	TriggerCount       int
 	SynonymCount       int
 	TabPrivilegeCount  int
 }
@@ -111,7 +113,10 @@ type dictionaryObject struct {
 	Owner       string
 	ParentID    int32
 	Info1       uint32
+	Info2       uint32
 	Info3       uint64
+	Info4       int64
+	Payload     []byte
 	Valid       string
 	Name        string
 	Type        string
@@ -406,6 +411,14 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 	if dictViews, ok := dictionaryViewsForDDL(opts.Dictionary, ownerMatcher); ok {
 		views = dictViews
 	}
+	sequences := scanDictionarySequences(objects, texts, ownerMatcher)
+	if dictSequences, ok := dictionarySequencesForDDL(opts.Dictionary, ownerMatcher); ok {
+		sequences = dictSequences
+	}
+	triggers := scanDictionaryTriggers(objects, texts, scanRawTriggerTexts(data, decoder), ownerMatcher)
+	if dictTriggers, ok := dictionaryTriggersForDDL(opts.Dictionary, ownerMatcher, tableMatcher); ok {
+		triggers = dictTriggers
+	}
 	synonyms := scanDictionarySynonyms(objects, ownerMatcher)
 	if dictSynonyms, ok := dictionarySynonymsForDDL(opts.Dictionary, ownerMatcher); ok {
 		synonyms = dictSynonyms
@@ -415,7 +428,7 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 		tabPrivileges = dictPrivileges
 	}
 
-	sql := renderDDL(objects, users, roles, roleGrants, tables, columnsByTable, columnsByTableColID, indexObjects, indexes, tableStorage, partitionsByTable, partitionKeysByTable, constraintObjects, constraints, tableComments, columnComments, views, synonyms, tabPrivileges, ownerMatcher, tableMatcher, tablespaces)
+	sql := renderDDL(objects, users, roles, roleGrants, tables, columnsByTable, columnsByTableColID, indexObjects, indexes, tableStorage, partitionsByTable, partitionKeysByTable, constraintObjects, constraints, tableComments, columnComments, views, sequences, triggers, synonyms, tabPrivileges, ownerMatcher, tableMatcher, tablespaces)
 	if err := os.WriteFile(opts.OutputPath, []byte(sql), 0644); err != nil {
 		return nil, fmt.Errorf("write ddl output: %w", err)
 	}
@@ -442,6 +455,8 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 		RoleCount:          len(exportedRoles),
 		RoleGrantCount:     countExportedRoleGrants(roleGrants, users, roles, exportedUsers, exportedRoles),
 		ViewCount:          len(views),
+		SequenceCount:      len(sequences),
+		TriggerCount:       len(triggers),
 		SynonymCount:       len(synonyms),
 		TabPrivilegeCount:  len(tabPrivileges),
 	}, nil
@@ -552,6 +567,7 @@ func parseDDLObjectRow(page []byte, rowOff int, pageNo uint32, slotNo uint16, sl
 	if objType == "DSYNOM" || subtype == "SYNOM" {
 		targetOwner, targetName = parseDDLSynonymTarget(page, subtypeNext, decoder)
 	}
+	payload := parseDDLObjectPayload(page, subtypeNext)
 	valid := ""
 	if b := page[rowOff+0x3F]; b == 'Y' || b == 'N' {
 		valid = string([]byte{b})
@@ -564,7 +580,10 @@ func parseDDLObjectRow(page []byte, rowOff int, pageNo uint32, slotNo uint16, sl
 		Owner:       schemaName(schemaID),
 		ParentID:    int32(binary.LittleEndian.Uint32(page[rowOff+0x0F:])),
 		Info1:       binary.LittleEndian.Uint32(page[rowOff+sysObjectsInfo1Offset:]),
+		Info2:       binary.LittleEndian.Uint32(page[rowOff+0x23:]),
 		Info3:       binary.LittleEndian.Uint64(page[rowOff+sysObjectsInfo3Offset:]),
+		Info4:       int64(binary.LittleEndian.Uint64(page[rowOff+0x2F:])),
+		Payload:     payload,
 		Valid:       valid,
 		Name:        name,
 		Type:        objType,
@@ -612,6 +631,23 @@ func readOptionalDDLObjectSubtype(page []byte, markerOff int, decoder textDecode
 	default:
 		return "", markerOff, false
 	}
+}
+
+func parseDDLObjectPayload(page []byte, pos int) []byte {
+	if pos >= len(page) {
+		return nil
+	}
+	marker := page[pos]
+	if marker < 0x80 || marker > 0xBF {
+		return nil
+	}
+	length := int(marker - 0x80)
+	start := pos + 1
+	end := start + length
+	if length <= 0 || end > len(page) {
+		return nil
+	}
+	return append([]byte(nil), page[start:end]...)
 }
 
 func parseDDLColumnRow(page []byte, rowOff int, pageNo uint32, slotNo uint16, slotOff uint16, pageSize uint32, decoder textDecoder) (columnDef, bool) {
@@ -1197,15 +1233,17 @@ func userDefaultTablespaceName(user dictionaryObject, tablespaces map[uint32]str
 	return tablespaces[groupID]
 }
 
-func renderDDL(objects map[uint32]dictionaryObject, users map[uint32]dictionaryObject, roles map[uint32]dictionaryObject, roleGrants []roleGrantDef, tables map[uint32]dictionaryObject, columnsByTable map[uint32][]columnDef, columnsByTableColID map[tableColKey]columnDef, indexObjects map[uint32]dictionaryObject, indexes map[uint32]indexDef, tableStorage map[uint32]indexDef, partitionsByTable map[uint32][]PartitionInfo, partitionKeysByTable map[uint32][]uint16, constraintObjects map[uint32]dictionaryObject, constraints []constraintDef, tableComments map[ownerTableKey]tableComment, columnComments map[ownerTableColumnKey]columnComment, views []DictionaryView, synonyms []DictionarySynonym, tabPrivileges []DictionaryTabPrivilege, matcher ownerMatcher, tableMatcher tableNameMatcher, tablespaces map[uint32]string) string {
+func renderDDL(objects map[uint32]dictionaryObject, users map[uint32]dictionaryObject, roles map[uint32]dictionaryObject, roleGrants []roleGrantDef, tables map[uint32]dictionaryObject, columnsByTable map[uint32][]columnDef, columnsByTableColID map[tableColKey]columnDef, indexObjects map[uint32]dictionaryObject, indexes map[uint32]indexDef, tableStorage map[uint32]indexDef, partitionsByTable map[uint32][]PartitionInfo, partitionKeysByTable map[uint32][]uint16, constraintObjects map[uint32]dictionaryObject, constraints []constraintDef, tableComments map[ownerTableKey]tableComment, columnComments map[ownerTableColumnKey]columnComment, views []DictionaryView, sequences []DictionarySequence, triggers []DictionaryTrigger, synonyms []DictionarySynonym, tabPrivileges []DictionaryTabPrivilege, matcher ownerMatcher, tableMatcher tableNameMatcher, tablespaces map[uint32]string) string {
 	var out strings.Builder
 	out.WriteString("-- Generated by dmdul export-ddl. Review before running.\n\n")
 	renderUsersAndRoles(&out, users, roles, roleGrants, matcher, tablespaces)
 	renderCreateTables(&out, tables, columnsByTable, columnsByTableColID, tableStorage, partitionsByTable, partitionKeysByTable, matcher, tableMatcher, tablespaces)
+	renderSequences(&out, sequences)
 	renderViews(&out, views)
 	renderIndexes(&out, tables, columnsByTableColID, indexObjects, indexes, matcher, tableMatcher, tablespaces)
 	renderConstraints(&out, objects, tables, columnsByTableColID, constraintObjects, indexes, constraints, matcher, tableMatcher)
 	renderComments(&out, tables, columnsByTable, tableComments, columnComments, matcher, tableMatcher)
+	renderTriggers(&out, triggers)
 	renderSynonyms(&out, synonyms)
 	renderTabPrivileges(&out, tabPrivileges)
 	return out.String()
@@ -1511,6 +1549,68 @@ func renderViews(out *strings.Builder, views []DictionaryView) {
 		}
 		if sql == "" {
 			fmt.Fprintf(out, "-- WARNING: view text not recovered for %s.%s\n", quoteIdent(view.Owner), quoteIdent(view.Name))
+			continue
+		}
+		out.WriteString(ensureSQLTerminator(sql))
+		out.WriteString("\n\n")
+	}
+}
+
+func renderSequences(out *strings.Builder, sequences []DictionarySequence) {
+	if len(sequences) == 0 {
+		return
+	}
+	out.WriteString("-- Sequences\n")
+	for _, seq := range sequences {
+		sql := strings.TrimSpace(seq.SQL)
+		if sql == "" {
+			sql = renderRecoveredSequenceSQL(seq)
+		}
+		out.WriteString(ensureSQLTerminator(sql))
+		out.WriteString("\n\n")
+	}
+}
+
+func renderRecoveredSequenceSQL(seq DictionarySequence) string {
+	increment := seq.IncrementBy
+	if increment == 0 {
+		increment = 1
+	}
+	var lines []string
+	lines = append(lines, fmt.Sprintf("CREATE SEQUENCE %s.%s", quoteIdent(seq.Owner), quoteIdent(seq.Name)))
+	if seq.StartWith > 0 {
+		lines = append(lines, fmt.Sprintf("START WITH %d", seq.StartWith))
+	}
+	lines = append(lines, fmt.Sprintf("INCREMENT BY %d", increment))
+	if seq.MinValue > 0 {
+		lines = append(lines, fmt.Sprintf("MINVALUE %d", seq.MinValue))
+	}
+	if seq.MaxValue > 0 {
+		lines = append(lines, fmt.Sprintf("MAXVALUE %d", seq.MaxValue))
+	}
+	if strings.EqualFold(seq.CycleFlag, "Y") || strings.EqualFold(seq.CycleFlag, "YES") {
+		lines = append(lines, "CYCLE")
+	} else {
+		lines = append(lines, "NOCYCLE")
+	}
+	if seq.CacheSize > 0 {
+		lines = append(lines, fmt.Sprintf("CACHE %d", seq.CacheSize))
+	}
+	if strings.EqualFold(seq.OrderFlag, "Y") || strings.EqualFold(seq.OrderFlag, "YES") {
+		lines = append(lines, "ORDER")
+	}
+	return strings.Join(lines, "\n")
+}
+
+func renderTriggers(out *strings.Builder, triggers []DictionaryTrigger) {
+	if len(triggers) == 0 {
+		return
+	}
+	out.WriteString("-- Triggers\n")
+	for _, trigger := range triggers {
+		sql := strings.TrimSpace(trigger.SQL)
+		if sql == "" {
+			fmt.Fprintf(out, "-- WARNING: trigger text not recovered for %s.%s\n", quoteIdent(trigger.Owner), quoteIdent(trigger.Name))
 			continue
 		}
 		out.WriteString(ensureSQLTerminator(sql))

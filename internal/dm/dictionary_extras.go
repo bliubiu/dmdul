@@ -1,8 +1,11 @@
 package dm
 
 import (
+	"bytes"
 	"encoding/binary"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -161,6 +164,114 @@ func scanDictionaryViews(objects map[uint32]dictionaryObject, texts map[uint32]m
 	}
 	sortDictionaryViews(views)
 	return views
+}
+
+func scanDictionarySequences(objects map[uint32]dictionaryObject, texts map[uint32]map[uint32]string, matcher ownerMatcher) []DictionarySequence {
+	var sequences []DictionarySequence
+	for _, obj := range objects {
+		if obj.Type != "SCHOBJ" || obj.Subtype != "SEQ" || obj.Valid == "N" || !matcher.allowed(obj.Owner) {
+			continue
+		}
+		seqInfo := parseSequencePayload(obj.Payload)
+		sequences = append(sequences, DictionarySequence{
+			ID:          obj.ID,
+			Owner:       obj.Owner,
+			Name:        obj.Name,
+			Valid:       obj.Valid,
+			StartWith:   seqInfo.startWith,
+			MinValue:    seqInfo.minValue,
+			MaxValue:    seqInfo.maxValue,
+			IncrementBy: obj.Info4,
+			CycleFlag:   boolFlag(obj.Info1&0x01 != 0),
+			OrderFlag:   boolFlag(obj.Info1&0xFF00 == 0x100),
+			CacheSize:   seqInfo.cacheSize,
+			SQL:         sequenceTextSQL(texts[obj.ID]),
+		})
+	}
+	sortDictionarySequences(sequences)
+	return sequences
+}
+
+func sequenceTextSQL(seqs map[uint32]string) string {
+	for _, seqNo := range []uint32{0, 1} {
+		if sql := strings.TrimSpace(seqs[seqNo]); strings.HasPrefix(strings.ToUpper(sql), "CREATE") {
+			return sql
+		}
+	}
+	return ""
+}
+
+type sequencePayloadInfo struct {
+	startWith uint64
+	minValue  uint64
+	maxValue  uint64
+	cacheSize uint32
+}
+
+func parseSequencePayload(payload []byte) sequencePayloadInfo {
+	var result sequencePayloadInfo
+	if len(payload) >= 16 {
+		result.maxValue = binary.LittleEndian.Uint64(payload[0:])
+		result.minValue = binary.LittleEndian.Uint64(payload[8:])
+		if result.minValue > 0 {
+			result.startWith = result.minValue
+		}
+	}
+	if len(payload) >= 28 {
+		cache := binary.LittleEndian.Uint32(payload[24:])
+		if cache < 1_000_000 {
+			result.cacheSize = cache
+		}
+	}
+	return result
+}
+
+func scanDictionaryTriggers(objects map[uint32]dictionaryObject, texts map[uint32]map[uint32]string, rawTexts map[string]string, matcher ownerMatcher) []DictionaryTrigger {
+	var triggers []DictionaryTrigger
+	for _, obj := range objects {
+		if obj.Type != "SCHOBJ" || obj.Subtype != "TRIG" || obj.Valid == "N" || !matcher.allowed(obj.Owner) {
+			continue
+		}
+		sql := triggerTextSQL(texts[obj.ID])
+		if raw := rawTexts[qualifiedObjectKey(obj.Owner, obj.Name)]; len(raw) > len(sql) {
+			sql = raw
+		}
+		tableOwner, tableName := triggerTargetFromParent(objects, obj)
+		if tableOwner == "" || tableName == "" {
+			tableOwner, tableName = parseTriggerTargetTable(sql)
+		}
+		triggers = append(triggers, DictionaryTrigger{
+			ID:         obj.ID,
+			Owner:      obj.Owner,
+			Name:       obj.Name,
+			TableOwner: tableOwner,
+			TableName:  tableName,
+			Valid:      obj.Valid,
+			SQL:        sql,
+		})
+	}
+	sortDictionaryTriggers(triggers)
+	return triggers
+}
+
+func triggerTextSQL(seqs map[uint32]string) string {
+	for _, seqNo := range []uint32{0, 1} {
+		if sql := strings.TrimSpace(seqs[seqNo]); strings.Contains(strings.ToUpper(sql), "TRIGGER") {
+			return sql
+		}
+	}
+	return ""
+}
+
+func triggerTargetFromParent(objects map[uint32]dictionaryObject, trigger dictionaryObject) (string, string) {
+	if trigger.ParentID <= 0 {
+		return "", ""
+	}
+	table, ok := objects[uint32(trigger.ParentID)]
+	if !ok || table.Type != "SCHOBJ" || table.Subtype != "UTAB" {
+		return "", ""
+	}
+	return table.Owner, table.Name
 }
 
 func scanDictionarySynonyms(objects map[uint32]dictionaryObject, matcher ownerMatcher) []DictionarySynonym {
@@ -341,7 +452,7 @@ func isTabPrivilegeTarget(obj dictionaryObject) bool {
 		return false
 	}
 	switch obj.Subtype {
-	case "UTAB", "VIEW":
+	case "UTAB", "VIEW", "SEQ":
 		return obj.Owner != "" && obj.Name != ""
 	default:
 		return false
@@ -349,10 +460,14 @@ func isTabPrivilegeTarget(obj dictionaryObject) bool {
 }
 
 func dictionaryPrivilegeObjectType(obj dictionaryObject) string {
-	if obj.Subtype == "VIEW" {
+	switch obj.Subtype {
+	case "VIEW":
 		return "VIEW"
+	case "SEQ":
+		return "SEQUENCE"
+	default:
+		return "TABLE"
 	}
-	return "TABLE"
 }
 
 func sortDictionaryViews(views []DictionaryView) {
@@ -364,6 +479,30 @@ func sortDictionaryViews(views []DictionaryView) {
 			return views[i].Name < views[j].Name
 		}
 		return views[i].ID < views[j].ID
+	})
+}
+
+func sortDictionarySequences(sequences []DictionarySequence) {
+	sort.Slice(sequences, func(i, j int) bool {
+		if sequences[i].Owner != sequences[j].Owner {
+			return sequences[i].Owner < sequences[j].Owner
+		}
+		if sequences[i].Name != sequences[j].Name {
+			return sequences[i].Name < sequences[j].Name
+		}
+		return sequences[i].ID < sequences[j].ID
+	})
+}
+
+func sortDictionaryTriggers(triggers []DictionaryTrigger) {
+	sort.Slice(triggers, func(i, j int) bool {
+		if triggers[i].Owner != triggers[j].Owner {
+			return triggers[i].Owner < triggers[j].Owner
+		}
+		if triggers[i].Name != triggers[j].Name {
+			return triggers[i].Name < triggers[j].Name
+		}
+		return triggers[i].ID < triggers[j].ID
 	})
 }
 
@@ -395,6 +534,42 @@ func sortDictionaryTabPrivileges(privileges []DictionaryTabPrivilege) {
 		}
 		return privileges[i].Grantable < privileges[j].Grantable
 	})
+}
+
+func dictionarySequencesForDDL(dict *DictionaryInfo, matcher ownerMatcher) ([]DictionarySequence, bool) {
+	if dict == nil || len(dict.Sequences) == 0 {
+		return nil, false
+	}
+	sequences := make([]DictionarySequence, 0, len(dict.Sequences))
+	for _, seq := range dict.Sequences {
+		if strings.TrimSpace(seq.Owner) == "" || strings.TrimSpace(seq.Name) == "" || !matcher.allowed(seq.Owner) {
+			continue
+		}
+		sequences = append(sequences, seq)
+	}
+	sortDictionarySequences(sequences)
+	return sequences, true
+}
+
+func dictionaryTriggersForDDL(dict *DictionaryInfo, matcher ownerMatcher, tableMatcher tableNameMatcher) ([]DictionaryTrigger, bool) {
+	if dict == nil || len(dict.Triggers) == 0 {
+		return nil, false
+	}
+	triggers := make([]DictionaryTrigger, 0, len(dict.Triggers))
+	for _, trigger := range dict.Triggers {
+		if strings.TrimSpace(trigger.Owner) == "" || strings.TrimSpace(trigger.Name) == "" {
+			continue
+		}
+		if !matcher.allowed(trigger.Owner) && !matcher.allowed(trigger.TableOwner) {
+			continue
+		}
+		if tableMatcher.hasRules && !tableMatcher.all && !tableMatcher.allowed(trigger.TableOwner, trigger.TableName) {
+			continue
+		}
+		triggers = append(triggers, trigger)
+	}
+	sortDictionaryTriggers(triggers)
+	return triggers, true
 }
 
 func dictionaryViewsForDDL(dict *DictionaryInfo, matcher ownerMatcher) ([]DictionaryView, bool) {
@@ -449,4 +624,168 @@ func dictionaryTabPrivilegesForDDL(dict *DictionaryInfo, matcher ownerMatcher, t
 	}
 	sortDictionaryTabPrivileges(privileges)
 	return privileges, true
+}
+
+func boolFlag(value bool) string {
+	if value {
+		return "Y"
+	}
+	return "N"
+}
+
+func qualifiedObjectKey(owner string, name string) string {
+	return strings.ToUpper(strings.TrimSpace(owner)) + "." + strings.ToUpper(strings.TrimSpace(name))
+}
+
+var createTriggerNamePattern = regexp.MustCompile(`(?is)CREATE\s+OR\s+REPLACE\s+TRIGGER\s+((?:"[^"]+"|[A-Za-z_][A-Za-z0-9_$#]*)\.)?("[^"]+"|[A-Za-z_][A-Za-z0-9_$#]*)`)
+var triggerOnTablePattern = regexp.MustCompile(`(?is)\bON\s+((?:"[^"]+"|[A-Za-z_][A-Za-z0-9_$#]*)\.)?("[^"]+"|[A-Za-z_][A-Za-z0-9_$#]*)`)
+
+func scanRawTriggerTexts(data []byte, decoder textDecoder) map[string]string {
+	result := make(map[string]string)
+	keyword := []byte("CREATE OR REPLACE TRIGGER")
+	for searchFrom := 0; searchFrom < len(data); {
+		rel := indexASCIIInsensitive(data[searchFrom:], keyword)
+		if rel < 0 {
+			break
+		}
+		start := searchFrom + rel
+		end := rawTriggerEnd(data, start)
+		if end <= start {
+			searchFrom = start + len(keyword)
+			continue
+		}
+		sql, ok := decoder.decode(data[start:end])
+		if !ok {
+			sql = string(data[start:end])
+		}
+		sql = strings.TrimSpace(sql)
+		owner, name := parseCreateTriggerName(sql)
+		if owner != "" && name != "" {
+			key := qualifiedObjectKey(owner, name)
+			if len(sql) > len(result[key]) {
+				result[key] = sql
+			}
+		}
+		searchFrom = end
+	}
+	return result
+}
+
+func indexASCIIInsensitive(data []byte, needle []byte) int {
+	if len(needle) == 0 {
+		return 0
+	}
+	if len(data) < len(needle) {
+		return -1
+	}
+	first := toUpperASCII(needle[0])
+	limit := len(data) - len(needle)
+	for i := 0; i <= limit; i++ {
+		if toUpperASCII(data[i]) != first {
+			continue
+		}
+		matched := true
+		for j := 1; j < len(needle); j++ {
+			if toUpperASCII(data[i+j]) != toUpperASCII(needle[j]) {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return i
+		}
+	}
+	return -1
+}
+
+func toUpperASCII(b byte) byte {
+	if b >= 'a' && b <= 'z' {
+		return b - ('a' - 'A')
+	}
+	return b
+}
+
+func rawTriggerEnd(data []byte, start int) int {
+	maxEnd := start + 65536
+	if maxEnd > len(data) {
+		maxEnd = len(data)
+	}
+	window := data[start:maxEnd]
+	upper := bytes.ToUpper(window)
+	for search := 0; search < len(upper); {
+		rel := bytes.Index(upper[search:], []byte("END;"))
+		if rel < 0 {
+			return 0
+		}
+		end := search + rel + len("END;")
+		if rawSQLBoundary(window, end) {
+			return start + end
+		}
+		search = end
+	}
+	return 0
+}
+
+func rawSQLBoundary(window []byte, end int) bool {
+	for i := end; i < len(window) && i < end+64; i++ {
+		b := window[i]
+		if b == 0 {
+			return true
+		}
+		if b == '/' || b == '\r' || b == '\n' || b == '\t' || b == ' ' {
+			continue
+		}
+		if b < 32 || b >= 0x80 {
+			return true
+		}
+		return false
+	}
+	return true
+}
+
+func parseCreateTriggerName(sql string) (string, string) {
+	matches := createTriggerNamePattern.FindStringSubmatch(sql)
+	if len(matches) == 0 {
+		return "", ""
+	}
+	owner := strings.TrimSuffix(matches[1], ".")
+	name := matches[2]
+	return unquoteIdentifier(owner), unquoteIdentifier(name)
+}
+
+func parseTriggerTargetTable(sql string) (string, string) {
+	matches := triggerOnTablePattern.FindStringSubmatch(sql)
+	if len(matches) == 0 {
+		return "", ""
+	}
+	owner := strings.TrimSuffix(matches[1], ".")
+	name := matches[2]
+	return unquoteIdentifier(owner), unquoteIdentifier(name)
+}
+
+func unquoteIdentifier(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) >= 2 && strings.HasPrefix(value, `"`) && strings.HasSuffix(value, `"`) {
+		return strings.ReplaceAll(value[1:len(value)-1], `""`, `"`)
+	}
+	return value
+}
+
+func formatInt64Field(value int64) string {
+	if value == 0 {
+		return ""
+	}
+	return strconv.FormatInt(value, 10)
+}
+
+func parseInt64Field(value string) int64 {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return parsed
 }

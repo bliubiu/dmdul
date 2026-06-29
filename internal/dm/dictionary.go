@@ -32,12 +32,16 @@ type DictionaryInfo struct {
 	TableCount        int
 	ColumnCount       int
 	ViewCount         int
+	SequenceCount     int
+	TriggerCount      int
 	SynonymCount      int
 	TabPrivilegeCount int
 	Users             []DictionaryUser
 	Tables            []DictionaryTable
 	Columns           []DictionaryColumn
 	Views             []DictionaryView
+	Sequences         []DictionarySequence
+	Triggers          []DictionaryTrigger
 	Synonyms          []DictionarySynonym
 	TabPrivileges     []DictionaryTabPrivilege
 }
@@ -84,6 +88,31 @@ type DictionaryView struct {
 	Valid    string
 	SQL      string
 	QuerySQL string
+}
+
+type DictionarySequence struct {
+	ID          uint32
+	Owner       string
+	Name        string
+	Valid       string
+	StartWith   uint64
+	MinValue    uint64
+	MaxValue    uint64
+	IncrementBy int64
+	CycleFlag   string
+	OrderFlag   string
+	CacheSize   uint32
+	SQL         string
+}
+
+type DictionaryTrigger struct {
+	ID         uint32
+	Owner      string
+	Name       string
+	TableOwner string
+	TableName  string
+	Valid      string
+	SQL        string
 }
 
 type DictionarySynonym struct {
@@ -202,6 +231,8 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 	})
 	texts := scanDictionaryTexts(data, pageSize, decoder)
 	viewList := scanDictionaryViews(objects, texts, ownerMatcher)
+	sequenceList := scanDictionarySequences(objects, texts, ownerMatcher)
+	triggerList := scanDictionaryTriggers(objects, texts, scanRawTriggerTexts(data, decoder), ownerMatcher)
 	synonymList := scanDictionarySynonyms(objects, ownerMatcher)
 	tabPrivilegeList := scanDictionaryTabPrivileges(data, pageSize, objects, userObjects, roleObjects, ownerMatcher, newTableNameMatcher("all"))
 
@@ -299,12 +330,16 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 		TableCount:        len(tableList),
 		ColumnCount:       columnCount,
 		ViewCount:         len(viewList),
+		SequenceCount:     len(sequenceList),
+		TriggerCount:      len(triggerList),
 		SynonymCount:      len(synonymList),
 		TabPrivilegeCount: len(tabPrivilegeList),
 		Users:             userList,
 		Tables:            tableList,
 		Columns:           columnList,
 		Views:             viewList,
+		Sequences:         sequenceList,
+		Triggers:          triggerList,
 		Synonyms:          synonymList,
 		TabPrivileges:     tabPrivilegeList,
 	}, nil

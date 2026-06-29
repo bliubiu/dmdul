@@ -199,8 +199,10 @@ func TestInteractiveUnloadDatabaseSQLAutoLoadsDictionary(t *testing.T) {
 			"users exported: 2",
 			"tables exported: 2",
 			"views exported: 1",
-			"synonyms exported: 1",
-			"tab privileges exported: 2",
+			"sequences exported: 1",
+			"triggers exported: 1",
+			"synonyms exported: 2",
+			"tab privileges exported: 3",
 			"rows exported: 1",
 			"rows failed: 0",
 		} {
@@ -214,10 +216,18 @@ func TestInteractiveUnloadDatabaseSQLAutoLoadsDictionary(t *testing.T) {
 			"CREATE USER NO_TABLE",
 			"CREATE TABLE APP.WITH_ROWS",
 			"CREATE TABLE APP.EMPTY_TABLE",
+			"CREATE SEQUENCE APP.SEQ_WITH_ROWS",
+			"START WITH 1",
+			"INCREMENT BY 1",
+			"MAXVALUE 999999999999",
+			"CACHE 20",
 			"CREATE OR REPLACE VIEW APP.V_WITH_ROWS AS SELECT ID FROM APP.WITH_ROWS;",
+			"CREATE OR REPLACE TRIGGER APP.TRG_WITH_ROWS BEFORE INSERT ON APP.WITH_ROWS BEGIN NULL; END;",
 			"CREATE OR REPLACE SYNONYM NO_TABLE.SYN_WITH_ROWS FOR APP.WITH_ROWS;",
+			"CREATE OR REPLACE SYNONYM NO_TABLE.SYN_SEQ_WITH_ROWS FOR APP.SEQ_WITH_ROWS;",
 			"GRANT SELECT ON APP.WITH_ROWS TO NO_TABLE;",
 			"GRANT SELECT ON APP.V_WITH_ROWS TO NO_TABLE;",
+			"GRANT SELECT ON APP.SEQ_WITH_ROWS TO NO_TABLE;",
 			"STORAGE(ON \"MAIN\", CLUSTERBTR)",
 		} {
 			if !strings.Contains(ddl, want) {
@@ -343,12 +353,20 @@ func setupUnloadDatabaseFixture(t *testing.T) (string, string) {
 		Views: []dm.DictionaryView{
 			{ID: 2001, Owner: "APP", Name: "V_WITH_ROWS", Valid: "Y", SQL: "CREATE OR REPLACE VIEW APP.V_WITH_ROWS AS SELECT ID FROM APP.WITH_ROWS"},
 		},
+		Sequences: []dm.DictionarySequence{
+			{ID: 2101, Owner: "APP", Name: "SEQ_WITH_ROWS", Valid: "Y", StartWith: 1, MinValue: 1, MaxValue: 999999999999, IncrementBy: 1, CycleFlag: "N", OrderFlag: "N", CacheSize: 20},
+		},
+		Triggers: []dm.DictionaryTrigger{
+			{ID: 2201, Owner: "APP", Name: "TRG_WITH_ROWS", TableOwner: "APP", TableName: "WITH_ROWS", Valid: "Y", SQL: "CREATE OR REPLACE TRIGGER APP.TRG_WITH_ROWS BEFORE INSERT ON APP.WITH_ROWS BEGIN NULL; END;"},
+		},
 		Synonyms: []dm.DictionarySynonym{
 			{ID: 3001, Owner: "NO_TABLE", Name: "SYN_WITH_ROWS", TableOwner: "APP", TableName: "WITH_ROWS"},
+			{ID: 3002, Owner: "NO_TABLE", Name: "SYN_SEQ_WITH_ROWS", TableOwner: "APP", TableName: "SEQ_WITH_ROWS"},
 		},
 		TabPrivileges: []dm.DictionaryTabPrivilege{
 			{Grantee: "NO_TABLE", Owner: "APP", ObjectName: "WITH_ROWS", ObjectType: "TABLE", Privilege: "SELECT", Grantable: "N"},
 			{Grantee: "NO_TABLE", Owner: "APP", ObjectName: "V_WITH_ROWS", ObjectType: "VIEW", Privilege: "SELECT", Grantable: "N"},
+			{Grantee: "NO_TABLE", Owner: "APP", ObjectName: "SEQ_WITH_ROWS", ObjectType: "SEQUENCE", Privilege: "SELECT", Grantable: "N"},
 		},
 	})
 	if err != nil {

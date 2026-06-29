@@ -272,6 +272,8 @@ func runExportDDL(args []string, stdout io.Writer, stderr io.Writer) error {
 	fmt.Fprintf(stdout, "tables exported: %d\n", result.TableCount)
 	fmt.Fprintf(stdout, "columns exported: %d\n", result.ColumnCount)
 	fmt.Fprintf(stdout, "views exported: %d\n", result.ViewCount)
+	fmt.Fprintf(stdout, "sequences exported: %d\n", result.SequenceCount)
+	fmt.Fprintf(stdout, "triggers exported: %d\n", result.TriggerCount)
 	fmt.Fprintf(stdout, "indexes exported: %d\n", result.IndexCount)
 	fmt.Fprintf(stdout, "constraints exported: %d\n", result.ConstraintCount)
 	fmt.Fprintf(stdout, "synonyms exported: %d\n", result.SynonymCount)

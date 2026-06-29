@@ -9,6 +9,7 @@ coverage.out
 *.trc
 *.sql
 *.csv
+*.ps1
 
 # Local database samples can be large and sensitive.
 *.DBF

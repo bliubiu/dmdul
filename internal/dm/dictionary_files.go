@@ -20,12 +20,16 @@ type DictionaryFilesResult struct {
 	TablesPath        string
 	ColumnsPath       string
 	ViewsPath         string
+	SequencesPath     string
+	TriggersPath      string
 	SynonymsPath      string
 	TabPrivilegesPath string
 	UserCount         int
 	TableCount        int
 	ColumnCount       int
 	ViewCount         int
+	SequenceCount     int
+	TriggerCount      int
 	SynonymCount      int
 	TabPrivilegeCount int
 }
@@ -56,6 +60,12 @@ func WriteDictionaryFiles(dir string, dict *DictionaryInfo) (*DictionaryFilesRes
 	if err := writeDictionaryViews(result.ViewsPath, dict.Views); err != nil {
 		return nil, err
 	}
+	if err := writeDictionarySequences(result.SequencesPath, dict.Sequences); err != nil {
+		return nil, err
+	}
+	if err := writeDictionaryTriggers(result.TriggersPath, dict.Triggers); err != nil {
+		return nil, err
+	}
 	if err := writeDictionarySynonyms(result.SynonymsPath, dict.Synonyms); err != nil {
 		return nil, err
 	}
@@ -66,6 +76,8 @@ func WriteDictionaryFiles(dir string, dict *DictionaryInfo) (*DictionaryFilesRes
 	result.TableCount = len(dict.Tables)
 	result.ColumnCount = len(dict.Columns)
 	result.ViewCount = len(dict.Views)
+	result.SequenceCount = len(dict.Sequences)
+	result.TriggerCount = len(dict.Triggers)
 	result.SynonymCount = len(dict.Synonyms)
 	result.TabPrivilegeCount = len(dict.TabPrivileges)
 	return result, nil
@@ -102,6 +114,20 @@ func LoadDictionaryFiles(dir string) (*DictionaryInfo, *DictionaryFilesResult, e
 	if err != nil && os.IsNotExist(err) {
 		views = nil
 	}
+	sequences, err := readDictionarySequences(result.SequencesPath)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, nil, err
+	}
+	if err != nil && os.IsNotExist(err) {
+		sequences = nil
+	}
+	triggers, err := readDictionaryTriggers(result.TriggersPath)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, nil, err
+	}
+	if err != nil && os.IsNotExist(err) {
+		triggers = nil
+	}
 	synonyms, err := readDictionarySynonyms(result.SynonymsPath)
 	if err != nil && !os.IsNotExist(err) {
 		return nil, nil, err
@@ -116,7 +142,7 @@ func LoadDictionaryFiles(dir string) (*DictionaryInfo, *DictionaryFilesResult, e
 	if err != nil && os.IsNotExist(err) {
 		tabPrivileges = nil
 	}
-	users, tables, columns, views, synonyms, tabPrivileges = normalizeDictionaryFromFiles(users, tables, columns, views, synonyms, tabPrivileges)
+	users, tables, columns, views, sequences, triggers, synonyms, tabPrivileges = normalizeDictionaryFromFiles(users, tables, columns, views, sequences, triggers, synonyms, tabPrivileges)
 	dict := &DictionaryInfo{
 		SystemPath:        meta["system_path"],
 		ControlPath:       meta["control_path"],
@@ -133,12 +159,16 @@ func LoadDictionaryFiles(dir string) (*DictionaryInfo, *DictionaryFilesResult, e
 		TableCount:        len(tables),
 		ColumnCount:       len(columns),
 		ViewCount:         len(views),
+		SequenceCount:     len(sequences),
+		TriggerCount:      len(triggers),
 		SynonymCount:      len(synonyms),
 		TabPrivilegeCount: len(tabPrivileges),
 		Users:             users,
 		Tables:            tables,
 		Columns:           columns,
 		Views:             views,
+		Sequences:         sequences,
+		Triggers:          triggers,
 		Synonyms:          synonyms,
 		TabPrivileges:     tabPrivileges,
 	}
@@ -146,6 +176,8 @@ func LoadDictionaryFiles(dir string) (*DictionaryInfo, *DictionaryFilesResult, e
 	result.TableCount = len(tables)
 	result.ColumnCount = len(columns)
 	result.ViewCount = len(views)
+	result.SequenceCount = len(sequences)
+	result.TriggerCount = len(triggers)
 	result.SynonymCount = len(synonyms)
 	result.TabPrivilegeCount = len(tabPrivileges)
 	return dict, result, nil
@@ -159,6 +191,8 @@ func dictionaryFilesResultForDir(dir string) *DictionaryFilesResult {
 		TablesPath:        filepath.Join(dir, "tables.tsv"),
 		ColumnsPath:       filepath.Join(dir, "columns.tsv"),
 		ViewsPath:         filepath.Join(dir, "views.tsv"),
+		SequencesPath:     filepath.Join(dir, "sequences.tsv"),
+		TriggersPath:      filepath.Join(dir, "triggers.tsv"),
 		SynonymsPath:      filepath.Join(dir, "synonyms.tsv"),
 		TabPrivilegesPath: filepath.Join(dir, "tab_privs.tsv"),
 	}
@@ -181,6 +215,8 @@ func writeDictionaryMeta(path string, dict *DictionaryInfo) error {
 		{"table_count", strconv.Itoa(len(dict.Tables))},
 		{"column_count", strconv.Itoa(len(dict.Columns))},
 		{"view_count", strconv.Itoa(len(dict.Views))},
+		{"sequence_count", strconv.Itoa(len(dict.Sequences))},
+		{"trigger_count", strconv.Itoa(len(dict.Triggers))},
 		{"synonym_count", strconv.Itoa(len(dict.Synonyms))},
 		{"tab_privilege_count", strconv.Itoa(len(dict.TabPrivileges))},
 	}
@@ -254,6 +290,43 @@ func writeDictionaryViews(path string, views []DictionaryView) error {
 		})
 	}
 	return writeTSV(path, []string{"view_id", "owner", "view_name", "valid", "sql", "query_sql"}, rows)
+}
+
+func writeDictionarySequences(path string, sequences []DictionarySequence) error {
+	rows := make([][]string, 0, len(sequences))
+	for _, seq := range sequences {
+		rows = append(rows, []string{
+			formatUint32Field(seq.ID),
+			seq.Owner,
+			seq.Name,
+			seq.Valid,
+			formatUint64Field(seq.StartWith),
+			formatUint64Field(seq.MinValue),
+			formatUint64Field(seq.MaxValue),
+			formatInt64Field(seq.IncrementBy),
+			seq.CycleFlag,
+			seq.OrderFlag,
+			formatUint32Field(seq.CacheSize),
+			seq.SQL,
+		})
+	}
+	return writeTSV(path, []string{"sequence_id", "owner", "sequence_name", "valid", "start_with", "min_value", "max_value", "increment_by", "cycle_flag", "order_flag", "cache_size", "sql"}, rows)
+}
+
+func writeDictionaryTriggers(path string, triggers []DictionaryTrigger) error {
+	rows := make([][]string, 0, len(triggers))
+	for _, trigger := range triggers {
+		rows = append(rows, []string{
+			formatUint32Field(trigger.ID),
+			trigger.Owner,
+			trigger.Name,
+			trigger.TableOwner,
+			trigger.TableName,
+			trigger.Valid,
+			trigger.SQL,
+		})
+	}
+	return writeTSV(path, []string{"trigger_id", "owner", "trigger_name", "table_owner", "table_name", "valid", "sql"}, rows)
 }
 
 func writeDictionarySynonyms(path string, synonyms []DictionarySynonym) error {
@@ -418,6 +491,67 @@ func readDictionaryViews(path string) ([]DictionaryView, error) {
 	return views, nil
 }
 
+func readDictionarySequences(path string) ([]DictionarySequence, error) {
+	records, err := readTSV(path)
+	if err != nil {
+		return nil, err
+	}
+	var sequences []DictionarySequence
+	for _, rec := range records {
+		if len(rec) < 7 || rec[0] == "sequence_id" {
+			continue
+		}
+		seq := DictionarySequence{
+			ID:    parseUint32Field(rec[0]),
+			Owner: rec[1],
+			Name:  rec[2],
+			Valid: rec[3],
+		}
+		if len(rec) >= 12 {
+			seq.StartWith = parseUint64Field(rec[4])
+			seq.MinValue = parseUint64Field(rec[5])
+			seq.MaxValue = parseUint64Field(rec[6])
+			seq.IncrementBy = parseInt64Field(rec[7])
+			seq.CycleFlag = rec[8]
+			seq.OrderFlag = rec[9]
+			seq.CacheSize = parseUint32Field(rec[10])
+			seq.SQL = rec[11]
+		} else {
+			seq.IncrementBy = parseInt64Field(rec[4])
+			seq.CycleFlag = rec[5]
+			seq.OrderFlag = rec[6]
+			if len(rec) >= 8 {
+				seq.SQL = rec[7]
+			}
+		}
+		sequences = append(sequences, seq)
+	}
+	return sequences, nil
+}
+
+func readDictionaryTriggers(path string) ([]DictionaryTrigger, error) {
+	records, err := readTSV(path)
+	if err != nil {
+		return nil, err
+	}
+	var triggers []DictionaryTrigger
+	for _, rec := range records {
+		if len(rec) < 7 || rec[0] == "trigger_id" {
+			continue
+		}
+		triggers = append(triggers, DictionaryTrigger{
+			ID:         parseUint32Field(rec[0]),
+			Owner:      rec[1],
+			Name:       rec[2],
+			TableOwner: rec[3],
+			TableName:  rec[4],
+			Valid:      rec[5],
+			SQL:        rec[6],
+		})
+	}
+	return triggers, nil
+}
+
 func readDictionarySynonyms(path string) ([]DictionarySynonym, error) {
 	records, err := readTSV(path)
 	if err != nil {
@@ -462,7 +596,7 @@ func readDictionaryTabPrivileges(path string) ([]DictionaryTabPrivilege, error) 
 	return privileges, nil
 }
 
-func normalizeDictionaryFromFiles(users []DictionaryUser, tables []DictionaryTable, columns []DictionaryColumn, views []DictionaryView, synonyms []DictionarySynonym, privileges []DictionaryTabPrivilege) ([]DictionaryUser, []DictionaryTable, []DictionaryColumn, []DictionaryView, []DictionarySynonym, []DictionaryTabPrivilege) {
+func normalizeDictionaryFromFiles(users []DictionaryUser, tables []DictionaryTable, columns []DictionaryColumn, views []DictionaryView, sequences []DictionarySequence, triggers []DictionaryTrigger, synonyms []DictionarySynonym, privileges []DictionaryTabPrivilege) ([]DictionaryUser, []DictionaryTable, []DictionaryColumn, []DictionaryView, []DictionarySequence, []DictionaryTrigger, []DictionarySynonym, []DictionaryTabPrivilege) {
 	columnCounts := make(map[uint32]int)
 	for _, col := range columns {
 		columnCounts[col.TableID]++
@@ -506,9 +640,11 @@ func normalizeDictionaryFromFiles(users []DictionaryUser, tables []DictionaryTab
 		return columns[i].ColID < columns[j].ColID
 	})
 	sortDictionaryViews(views)
+	sortDictionarySequences(sequences)
+	sortDictionaryTriggers(triggers)
 	sortDictionarySynonyms(synonyms)
 	sortDictionaryTabPrivileges(privileges)
-	return users, tables, columns, views, synonyms, privileges
+	return users, tables, columns, views, sequences, triggers, synonyms, privileges
 }
 
 func writeTSV(path string, header []string, rows [][]string) error {

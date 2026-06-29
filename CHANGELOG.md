@@ -2,6 +2,18 @@
 
 本项目遵循“尽量记录可验证能力”的原则。版本号暂不严格承诺语义化兼容，直到离线解析能力稳定。
 
+## v0.1.7
+
+### Added
+
+- `bootstrap` 新增序列和触发器字典落盘，生成 `sequences.tsv`、`triggers.tsv`。
+- DDL 导出新增 `CREATE SEQUENCE`、`CREATE OR REPLACE TRIGGER`。
+- 同义词和对象授权恢复支持序列对象，例如 `GRANT SELECT ON owner.sequence TO grantee`。
+
+### Fixed
+
+- 修复部分触发器源码无法通过 `SYSTEXTS` 行格式解析时漏导的问题，增加原始 SQL 文本兜底扫描。
+
 ## 0.1.0-dev
 
 当前开发版本。

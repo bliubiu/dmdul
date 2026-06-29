@@ -39,12 +39,13 @@
 ## 功能预览
 
 ~~~markdown
-## v0.1.6 核心能力
+## 当前核心能力
 
 - 支持 `unload database;` 整库离线导出。
 - 支持从 `dmdul_dict` 字典文件驱动 DDL 和数据恢复。
-- `bootstrap` 可生成并补充 `tables.tsv` 段定位字段。
+- `bootstrap` 可生成并补充 `tables.tsv` 段定位字段，并落盘视图、序列、触发器、同义词和对象授权字典。
 - 支持基于 `header_file/header_block/blocks` 缩小数据页扫描范围。
+- 支持恢复视图、序列、触发器、同义词和对象授权。
 - 修复相同表名不同 owner 时可能串表的问题。
 ~~~
 
@@ -52,7 +53,7 @@
 | --------------------- | ---------- | ------------------------------------ |
 | `SYSTEM.DBF` 基础解析 | ✅ 支持     | 识别页大小、簇大小、页数、字符集标记 |
 | `dm.ctl` 解析         | ✅ 支持     | 识别数据库名、表空间名、数据文件路径 |
-| 用户 DDL 导出         | ✅ 支持     | 用户、表、字段、索引、约束、注释     |
+| 用户 DDL 导出         | ✅ 支持     | 用户、表、字段、序列、触发器、索引、约束、注释 |
 | 普通表数据导出        | ✅ 支持     | 导出为 INSERT SQL 或 CSV             |
 | 字符集处理            | ✅ 支持     | UTF-8、GB18030/GBK、EUC-KR           |
 | 交互式 DUL 模式       | ✅ 支持     | 提供类似 Oracle DUL 的交互式命令     |
@@ -77,7 +78,7 @@
   - 表空间名
   - 数据文件路径
 - 扫描 `data_dir` 下 DBF 页头，辅助生成 `control.dul`。
-- `bootstrap` 会把字典摘要写入 `dmdul_dict` 文本目录，便于再次启动快速加载和人工修正；修正后的文本字典会参与后续 DDL 和数据导出。
+- `bootstrap` 会把字典摘要写入 `dmdul_dict` 文本目录，便于再次启动快速加载和人工修正；修正后的文本字典会参与后续 DDL 和数据导出。当前会落盘 `users.tsv`、`tables.tsv`、`columns.tsv`、`views.tsv`、`sequences.tsv`、`triggers.tsv`、`synonyms.tsv`、`tab_privs.tsv`。
 - `bootstrap` 会把识别到的数据库字符集回写到 `init.dul` 的 `charset` 参数。
 
 ### DDL 导出
@@ -88,8 +89,10 @@
 - 角色授权 `GRANT role TO user`
 - 表结构
 - 视图 `CREATE OR REPLACE VIEW`
+- 序列 `CREATE SEQUENCE`
+- 触发器 `CREATE OR REPLACE TRIGGER`
 - 同义词 `CREATE OR REPLACE SYNONYM`
-- 表/视图授权 `GRANT privilege ON object TO grantee`
+- 表/视图/序列授权 `GRANT privilege ON object TO grantee`
 - 字段名、字段类型、默认值
 - 索引
 - 主键
@@ -300,13 +303,14 @@ dmdul scan-partitions -file SYSTEM.DBF -ctl dm.ctl -owner all
 
 ## 文档
 
-- [安装方式](https://chatgpt.com/c/docs/install.md)
-- [使用示例](https://chatgpt.com/c/docs/usage.md)
-- [配置和参数说明](https://chatgpt.com/c/docs/config.md)
-- [本地开发、测试、构建说明](https://chatgpt.com/c/docs/development.md)
-- [版本变更记录](https://chatgpt.com/c/CHANGELOG.md)
-- [逆向扫描笔记](https://chatgpt.com/c/docs/offline-system-scan.md)
-- [系统字典字段笔记](https://chatgpt.com/c/docs/system-dictionary-fields.md)
+- [安装方式](docs/install.md)
+- [使用示例](docs/usage.md)
+- [配置和参数说明](docs/config.md)
+- [本地开发、测试、构建说明](docs/development.md)
+- [版本变更记录](CHANGELOG.md)
+- [逆向扫描笔记](docs/offline-system-scan.md)
+- [系统字典字段笔记](docs/system-dictionary-fields.md)
+- [离线恢复流程](docs/recovery-workflow.md)
 
 ------
 
@@ -398,4 +402,4 @@ go build -o .\bin\dmdul.exe .\cmd\dmdul
 
 ## 开源协议
 
-本项目使用 [MIT License](https://chatgpt.com/c/LICENSE)。
+本项目使用 [MIT License](LICENSE)。

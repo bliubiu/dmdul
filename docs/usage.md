@@ -78,6 +78,8 @@ users.tsv
 tables.tsv
 columns.tsv
 views.tsv
+sequences.tsv
+triggers.tsv
 synonyms.tsv
 tab_privs.tsv
 ```
@@ -89,8 +91,9 @@ DMDUL> load dictionary;
 ```
 
 加载后的 `dmdul_dict` 会真正参与后续恢复：DDL 和数据导出时，用户、表名、字段名、字段类型、
-默认值、表空间和存储组织会优先使用文本字典中的内容；`SYSTEM.DBF` 仍用于辅助定位索引、约束、
-分区和数据页等物理信息。Windows 下手工保存为带 UTF-8 BOM 的 TSV 文件也可以正常读取。
+默认值、表空间、存储组织、视图、序列、触发器、同义词和对象授权会优先使用文本字典中的内容；
+`SYSTEM.DBF` 仍用于辅助定位索引、约束、分区和数据页等物理信息。Windows 下手工保存为带
+UTF-8 BOM 的 TSV 文件也可以正常读取。
 
 `tables.tsv` 还预留了 `header_file`、`header_block`、`bytes`、`blocks`、`extents`
 字段，对应在线 `DBA_SEGMENTS` 的段信息。补齐这些字段后，数据抽取会按段页范围过滤候选页，
