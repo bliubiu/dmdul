@@ -148,6 +148,16 @@ DMDUL> load dictionary;
 `header_file + header_block + blocks` 限定扫描页范围，避免相同表名、相似行格式或隐藏索引
 候选导致误匹配。
 
+| 字段           | 来源/含义                                   |
+| -------------- | ------------------------------------------- |
+| `header_file`  | 段头文件号，对应 `DBA_SEGMENTS.HEADER_FILE` |
+| `header_block` | 段头块号，对应 `DBA_SEGMENTS.HEADER_BLOCK`  |
+| `bytes`        | 段大小，对应 `DBA_SEGMENTS.BYTES`           |
+| `blocks`       | 段块数，对应 `DBA_SEGMENTS.BLOCKS`          |
+| `extents`      | extent 数量，对应 `DBA_SEGMENTS.EXTENTS`    |
+
+v0.1.6 开始，`bootstrap` 会尝试通过 DBF 页头和 assist id 自动推断这些字段；如果自动推断不完整，可以人工参考在线 `DBA_SEGMENTS` 补齐。
+
 ## Git 忽略建议
 
 生产文件和导出结果通常包含敏感信息，建议不要提交：

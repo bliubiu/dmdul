@@ -5,9 +5,13 @@
 - Go 1.22 或更高版本。
 - Windows、Linux、macOS 均可编译；当前样例和命令主要在 Windows PowerShell 下验证。
 - 离线抽取至少需要：
+  
   - `SYSTEM.DBF`
-  - `dm.ctl`
-  - 用户数据所在表空间文件，例如 `MAIN.DBF`、`TBS_*.DBF`
+  -  用户数据所在表空间文件，例如 `MAIN.DBF`、`TBS_*.DBF`
+  
+  可选但强烈建议提供：
+  
+  - `dm.ctl`：用于补充数据库名、表空间名和数据文件路径。
 
 ## 从源码构建
 

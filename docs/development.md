@@ -77,18 +77,27 @@ DMDUL> unload table SYSDBA.T;
 
 ## 版本信息
 
-默认版本在 `internal/version/version.go` 中：
+源码默认版本建议保持为 `dev`。正式发布版本通过 `-ldflags` 注入：
 
-```text
-v0.1.2
+```powershell
+.\build.ps1
 ```
 
 发布构建可以写入版本号和提交号：
 
 ```powershell
+cd D:\OneDrive\learn\dmdul
+
+$ver = "v0.1.7"
 $commit = git rev-parse --short HEAD
-$tag = git describe --tags --abbrev=0
-go build -trimpath -ldflags "-s -w -X dmdul/internal/version.Version=$tag -X dmdul/internal/version.Commit=$commit" -o .\bin\dmdul.exe .\cmd\dmdul
+
+go build -ldflags "-X dmdul/internal/version.Version=$ver -X dmdul/internal/version.Commit=$commit" -o bin/dmdul.exe ./cmd/dmdul
+
+.\bin\dmdul.exe version
+
+Compress-Archive -Path .\bin\dmdul.exe -DestinationPath .\bin\dmdul_windows_amd64_v0.1.6.zip -Force
+
+Get-FileHash .\bin\dmdul_windows_amd64_v0.1.7.zip -Algorithm SHA256
 ```
 
 ## 测试覆盖方向

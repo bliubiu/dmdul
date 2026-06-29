@@ -60,3 +60,23 @@
 - 新增中文 README。
 - 新增安装、使用、配置、开发文档。
 - 整理离线扫描规则和系统字典字段笔记。
+
+## v0.1.6
+
+### Added
+
+- 新增 `unload database;` 整库导出。
+- 新增字典驱动恢复流程。
+- 新增 `dictionary_overrides.go`。
+- 新增 `dictionary_segments.go`。
+- `bootstrap` 可生成 `header_file/header_block/bytes/blocks/extents` 段信息。
+
+### Fixed
+
+- 修复同名表不同 owner 时可能误匹配数据页的问题。
+- 降低普通索引页被误识别为表数据页的概率。
+
+### Tests
+
+- 新增 unload database 自动化测试。
+- 新增 dictionary override 和 segment 推断测试。
