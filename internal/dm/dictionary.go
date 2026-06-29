@@ -3,6 +3,7 @@ package dm
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -47,6 +48,11 @@ type DictionaryTable struct {
 	ColumnCount int
 	Tablespace  string
 	GroupID     uint32
+	HeaderFile  int16
+	HeaderBlock uint32
+	Bytes       uint64
+	Blocks      uint32
+	Extents     uint32
 	Temporary   bool
 	Storage     string
 	Partitioned bool
@@ -186,6 +192,22 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 		})
 		if _, ok := userNamesByName[strings.ToUpper(table.Owner)]; !ok {
 			userNamesByName[strings.ToUpper(table.Owner)] = DictionaryUser{Name: table.Owner}
+		}
+	}
+	segments := inferDictionaryTableSegments(opts.ControlPath, opts.ControlDULPath, filepath.Dir(opts.SystemPath), pageSize, extentSize, tables, indexObjects, indexes, partitionsByTable, tableList)
+	for i := range tableList {
+		if seg, ok := segments[tableList[i].ID]; ok {
+			tableList[i].HeaderFile = seg.fileID
+			tableList[i].HeaderBlock = seg.headerPage
+			tableList[i].Bytes = seg.bytes
+			tableList[i].Blocks = seg.blocks
+			tableList[i].Extents = seg.extents
+			if seg.tablespaceID != 0 {
+				tableList[i].GroupID = seg.tablespaceID
+				if name := tablespaces[seg.tablespaceID]; name != "" {
+					tableList[i].Tablespace = name
+				}
+			}
 		}
 	}
 

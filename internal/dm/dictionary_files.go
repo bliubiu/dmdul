@@ -144,6 +144,10 @@ func writeDictionaryUsers(path string, users []DictionaryUser) error {
 func writeDictionaryTables(path string, tables []DictionaryTable) error {
 	rows := make([][]string, 0, len(tables))
 	for _, table := range tables {
+		headerFile := ""
+		if dictionaryTableHasSegment(table) {
+			headerFile = strconv.FormatInt(int64(table.HeaderFile), 10)
+		}
 		rows = append(rows, []string{
 			formatUint32Field(table.ID),
 			table.Owner,
@@ -151,12 +155,17 @@ func writeDictionaryTables(path string, tables []DictionaryTable) error {
 			strconv.Itoa(table.ColumnCount),
 			table.Tablespace,
 			formatUint32Field(table.GroupID),
+			headerFile,
+			formatUint32Field(table.HeaderBlock),
+			formatUint64Field(table.Bytes),
+			formatUint32Field(table.Blocks),
+			formatUint32Field(table.Extents),
 			formatBoolField(table.Temporary),
 			table.Storage,
 			formatBoolField(table.Partitioned),
 		})
 	}
-	return writeTSV(path, []string{"table_id", "owner", "table_name", "column_count", "tablespace", "group_id", "temporary", "storage", "partitioned"}, rows)
+	return writeTSV(path, []string{"table_id", "owner", "table_name", "column_count", "tablespace", "group_id", "header_file", "header_block", "bytes", "blocks", "extents", "temporary", "storage", "partitioned"}, rows)
 }
 
 func writeDictionaryColumns(path string, columns []DictionaryColumn) error {
@@ -224,13 +233,33 @@ func readDictionaryTables(path string) ([]DictionaryTable, error) {
 		if len(rec) < 9 || rec[0] == "table_id" {
 			continue
 		}
-		tables = append(tables, DictionaryTable{
+		table := DictionaryTable{
 			ID:          parseUint32Field(rec[0]),
 			Owner:       rec[1],
 			Name:        rec[2],
 			ColumnCount: parseIntField(rec[3]),
 			Tablespace:  rec[4],
 			GroupID:     parseUint32Field(rec[5]),
+		}
+		if len(rec) >= 14 {
+			table.HeaderFile = int16(parseIntField(rec[6]))
+			table.HeaderBlock = parseUint32Field(rec[7])
+			table.Bytes = parseUint64Field(rec[8])
+			table.Blocks = parseUint32Field(rec[9])
+			table.Extents = parseUint32Field(rec[10])
+			table.Temporary = parseBoolField(rec[11])
+			table.Storage = rec[12]
+			table.Partitioned = parseBoolField(rec[13])
+			tables = append(tables, table)
+			continue
+		}
+		tables = append(tables, DictionaryTable{
+			ID:          table.ID,
+			Owner:       table.Owner,
+			Name:        table.Name,
+			ColumnCount: table.ColumnCount,
+			Tablespace:  table.Tablespace,
+			GroupID:     table.GroupID,
 			Temporary:   parseBoolField(rec[6]),
 			Storage:     rec[7],
 			Partitioned: parseBoolField(rec[8]),
@@ -352,6 +381,9 @@ func readTSV(path string) ([][]string, error) {
 		if err != nil {
 			return nil, err
 		}
+		if len(rec) > 0 {
+			rec[0] = strings.TrimPrefix(rec[0], "\ufeff")
+		}
 		records = append(records, rec)
 	}
 	return records, nil
@@ -362,6 +394,13 @@ func formatUint32Field(value uint32) string {
 		return ""
 	}
 	return strconv.FormatUint(uint64(value), 10)
+}
+
+func formatUint64Field(value uint64) string {
+	if value == 0 {
+		return ""
+	}
+	return strconv.FormatUint(value, 10)
 }
 
 func formatBoolField(value bool) string {
@@ -389,6 +428,18 @@ func parseUint32Field(value string) uint32 {
 		return 0
 	}
 	return uint32(parsed)
+}
+
+func parseUint64Field(value string) uint64 {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	parsed, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return parsed
 }
 
 func parseIntField(value string) int {

@@ -123,6 +123,53 @@ func TestDataFileKeyFromPageHeader(t *testing.T) {
 	}
 }
 
+func TestCandidateMatchesFileUsesDictionarySegmentRange(t *testing.T) {
+	info := dataTableInfo{
+		table: dictionaryObject{ID: 1024, Owner: "SY", Name: "t"},
+		segment: tableSegment{
+			fileID:       0,
+			headerPage:   176,
+			blocks:       16,
+			tablespaceID: 4,
+		},
+		segmentKnown: true,
+	}
+	file := dataFileRef{key: dataFileKey{groupID: 4, fileID: 0}}
+	if !candidateMatchesFile(info, file, 176) || !candidateMatchesFile(info, file, 191) {
+		t.Fatal("candidate should match pages inside segment range")
+	}
+	if candidateMatchesFile(info, file, 175) || candidateMatchesFile(info, file, 192) {
+		t.Fatal("candidate should not match pages outside segment range")
+	}
+	if candidateMatchesFile(info, dataFileRef{key: dataFileKey{groupID: 4, fileID: 1}}, 176) {
+		t.Fatal("candidate should not match a different file")
+	}
+}
+
+func TestCandidateMatchesFileKeepsMultiExtentPagesInSameFile(t *testing.T) {
+	info := dataTableInfo{
+		table: dictionaryObject{ID: 1033, Owner: "SYSDBA", Name: "T"},
+		segment: tableSegment{
+			fileID:       0,
+			headerPage:   32,
+			blocks:       32,
+			extents:      2,
+			tablespaceID: 4,
+		},
+		segmentKnown: true,
+	}
+	file := dataFileRef{key: dataFileKey{groupID: 4, fileID: 0}}
+	if !candidateMatchesFile(info, file, 160) {
+		t.Fatal("multi-extent table should keep pages in the same file")
+	}
+	if candidateMatchesFile(info, dataFileRef{key: dataFileKey{groupID: 5, fileID: 0}}, 160) {
+		t.Fatal("multi-extent table should still reject a different tablespace")
+	}
+	if candidateMatchesFile(info, dataFileRef{key: dataFileKey{groupID: 4, fileID: 1}}, 160) {
+		t.Fatal("multi-extent table should still reject a different file")
+	}
+}
+
 func TestResolveDataFilesWithoutControlFileUsesPageHeaders(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "MAIN.DBF")
@@ -451,6 +498,32 @@ func TestRenderInsertForIOTRowWithNullableFixedSentinel(t *testing.T) {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("insert sql missing %q: %s", want, sql)
 		}
+	}
+}
+
+func TestRenderInsertForSingleFixedColumnPrefersRowHeaderStart(t *testing.T) {
+	row := []byte{
+		0x00, 0x1A, 0x00,
+		0x14, 0x00, 0x00, 0x00,
+		0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0xFF, 0xFF, 0xFF, 0xFF, 0x7F, 0xFF, 0xFF,
+		0xE2, 0x19, 0x01, 0x00, 0x00, 0x00,
+	}
+	info := dataTableInfo{
+		table: dictionaryObject{Owner: "SY", Name: "t"},
+		columns: []columnDef{
+			{ColID: 1, Name: "id", DataType: "INT", Nullable: "Y"},
+		},
+	}
+	sql, start, _, err := renderInsertForDataRow(info, row, textDecoder{preferred: "utf-8"})
+	if err != nil {
+		t.Fatalf("renderInsertForDataRow returned error: %v", err)
+	}
+	if start != 3 {
+		t.Fatalf("data start = %d, want 3", start)
+	}
+	if !strings.Contains(sql, `INSERT INTO SY."t" ("id") VALUES (20);`) {
+		t.Fatalf("unexpected insert sql: %s", sql)
 	}
 }
 

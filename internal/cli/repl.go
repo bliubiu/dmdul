@@ -136,6 +136,8 @@ func printInteractiveHelp(stdout io.Writer) {
 	fmt.Fprintln(stdout, "      Export one table to <owner>_<table>_ddl.sql and <owner>_<table>_data.{sql|csv}.")
 	fmt.Fprintln(stdout, "  unload user <owner>;")
 	fmt.Fprintln(stdout, "      Export all tables for one owner to DDL plus SQL or per-table CSV data files.")
+	fmt.Fprintln(stdout, "  unload database;")
+	fmt.Fprintln(stdout, "      Export all recovered users and tables to DDL plus SQL or per-table CSV data files.")
 	fmt.Fprintln(stdout, "  set system <SYSTEM.DBF path>;")
 	fmt.Fprintln(stdout, "  set data_dir <DBF directory>;")
 	fmt.Fprintln(stdout, "  set control <dm.ctl path>;")
@@ -230,19 +232,27 @@ func (s *interactiveSession) executeLoad(args []string, stdout io.Writer) error 
 }
 
 func (s *interactiveSession) executeUnload(args []string, stdout io.Writer) error {
-	if len(args) < 2 {
-		return fmt.Errorf("usage: unload table <owner.table_name> | unload user <owner>")
+	if len(args) < 1 {
+		return fmt.Errorf("usage: unload table <owner.table_name> | unload user <owner> | unload database")
 	}
 	if err := s.ensureDictionaryLoaded(); err != nil {
 		return err
 	}
 	switch strings.ToLower(args[0]) {
 	case "table":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: unload table <owner.table_name>")
+		}
 		return s.unloadTable(args[1:], stdout)
 	case "user":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: unload user <owner>")
+		}
 		return s.unloadUser(args[1:], stdout)
+	case "database", "db":
+		return s.unloadDatabase(args[1:], stdout)
 	default:
-		return fmt.Errorf("usage: unload table <owner.table_name> | unload user <owner>")
+		return fmt.Errorf("usage: unload table <owner.table_name> | unload user <owner> | unload database")
 	}
 }
 
@@ -411,6 +421,7 @@ func (s *interactiveSession) unloadTable(args []string, stdout io.Writer) error 
 		OwnerFilter:    table.Owner,
 		TableFilter:    table.Owner + "." + table.Name,
 		Charset:        s.charset,
+		Dictionary:     s.dictionary,
 	})
 	if err != nil {
 		return err
@@ -426,6 +437,7 @@ func (s *interactiveSession) unloadTable(args []string, stdout io.Writer) error 
 		ExcludeTables:  "",
 		Charset:        s.charset,
 		OutputFormat:   s.dataFormat,
+		Dictionary:     s.dictionary,
 	})
 	if err != nil {
 		return err
@@ -463,6 +475,7 @@ func (s *interactiveSession) unloadUser(args []string, stdout io.Writer) error {
 		OwnerFilter:    owner,
 		TableFilter:    "all",
 		Charset:        s.charset,
+		Dictionary:     s.dictionary,
 	})
 	if err != nil {
 		return err
@@ -492,6 +505,66 @@ func (s *interactiveSession) unloadUser(args []string, stdout io.Writer) error {
 		ExcludeTables:  "",
 		Charset:        s.charset,
 		OutputFormat:   "sql",
+		Dictionary:     s.dictionary,
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "data output: %s\n", data.OutputPath)
+	fmt.Fprintf(stdout, "rows exported: %d\n", data.RowsExported)
+	fmt.Fprintf(stdout, "rows failed: %d\n", data.RowsFailed)
+	return nil
+}
+
+func (s *interactiveSession) unloadDatabase(args []string, stdout io.Writer) error {
+	prefix := "DATABASE"
+	if customPrefix, ok := optionalToPrefix(args); ok {
+		prefix = sanitizedFilePrefix(customPrefix)
+	}
+	ddlPath := s.outputPath(prefix + "_ddl.sql")
+	if err := s.ensureOutputDir(); err != nil {
+		return err
+	}
+	ddl, err := dm.ExportDDL(dm.DDLExportOptions{
+		SystemPath:     s.systemPath,
+		ControlPath:    s.controlPath,
+		ControlDULPath: s.effectiveControlDULPath(),
+		OutputPath:     ddlPath,
+		OwnerFilter:    "all",
+		TableFilter:    "all",
+		Charset:        s.charset,
+		Dictionary:     s.dictionary,
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "ddl output: %s\n", ddl.OutputPath)
+	fmt.Fprintf(stdout, "users exported: %d\n", ddl.UserCount)
+	fmt.Fprintf(stdout, "tables exported: %d\n", ddl.TableCount)
+	if s.dataFormat == "csv" {
+		files, rowsExported, rowsFailed, err := s.unloadDatabaseCSV(prefix, stdout)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "csv output dir: %s\n", s.effectiveOutputDir())
+		fmt.Fprintf(stdout, "csv files exported: %d\n", files)
+		fmt.Fprintf(stdout, "rows exported: %d\n", rowsExported)
+		fmt.Fprintf(stdout, "rows failed: %d\n", rowsFailed)
+		return nil
+	}
+	dataPath := s.outputPath(prefix + "_data.sql")
+	data, err := dm.ExportData(dm.DataExportOptions{
+		SystemPath:     s.systemPath,
+		ControlPath:    s.controlPath,
+		ControlDULPath: s.effectiveControlDULPath(),
+		DataDir:        s.effectiveDataDir(),
+		OutputPath:     dataPath,
+		OwnerFilter:    "all",
+		TableFilter:    "all",
+		ExcludeTables:  "",
+		Charset:        s.charset,
+		OutputFormat:   "sql",
+		Dictionary:     s.dictionary,
 	})
 	if err != nil {
 		return err
@@ -523,6 +596,45 @@ func (s *interactiveSession) unloadUserCSV(prefix string, owner string, stdout i
 			ExcludeTables:  "",
 			Charset:        s.charset,
 			OutputFormat:   "csv",
+			Dictionary:     s.dictionary,
+		})
+		if err != nil {
+			return files, rowsExported, rowsFailed, err
+		}
+		rowsExported += data.RowsExported
+		rowsFailed += data.RowsFailed
+		if data.OutputPath == "" {
+			fmt.Fprintf(stdout, "csv skipped: %s.%s (no rows)\n", table.Owner, table.Name)
+			continue
+		}
+		files++
+		fmt.Fprintf(stdout, "csv output: %s\n", data.OutputPath)
+	}
+	return files, rowsExported, rowsFailed, nil
+}
+
+func (s *interactiveSession) unloadDatabaseCSV(prefix string, stdout io.Writer) (int, int, int, error) {
+	files := 0
+	rowsExported := 0
+	rowsFailed := 0
+	for _, table := range s.dictionary.Tables {
+		if table.Temporary {
+			continue
+		}
+		tablePrefix := sanitizedFilePrefix(prefix + "_" + table.Owner + "_" + table.Name)
+		dataPath := s.outputPath(tablePrefix + "_data.csv")
+		data, err := dm.ExportData(dm.DataExportOptions{
+			SystemPath:     s.systemPath,
+			ControlPath:    s.controlPath,
+			ControlDULPath: s.effectiveControlDULPath(),
+			DataDir:        s.effectiveDataDir(),
+			OutputPath:     dataPath,
+			OwnerFilter:    table.Owner,
+			TableFilter:    table.Owner + "." + table.Name,
+			ExcludeTables:  "",
+			Charset:        s.charset,
+			OutputFormat:   "csv",
+			Dictionary:     s.dictionary,
 		})
 		if err != nil {
 			return files, rowsExported, rowsFailed, err
@@ -582,6 +694,9 @@ func (s *interactiveSession) loadDictionaryFiles(stdout io.Writer) error {
 	if strings.TrimSpace(dict.ControlPath) != "" {
 		s.controlPath = dict.ControlPath
 		s.controlProvided = true
+	}
+	if detectedCharset, ok := charsetParameterFromDictionary(dict.Charset); ok && (s.charset == "" || strings.EqualFold(s.charset, "auto")) {
+		s.charset = detectedCharset
 	}
 	if stdout != io.Discard {
 		fmt.Fprintf(stdout, "dictionary loaded: %s\n", files.Dir)

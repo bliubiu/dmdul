@@ -71,6 +71,7 @@ type DDLExportOptions struct {
 	OwnerFilter    string
 	TableFilter    string
 	Charset        string
+	Dictionary     *DictionaryInfo
 }
 
 type DDLExportResult struct {
@@ -275,6 +276,8 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 			roles[obj.ID] = obj
 		}
 	}
+	applyDictionaryUserOverrides(opts.Dictionary, users)
+	dictionaryTables := applyDictionaryTableOverrides(opts.Dictionary, tables, tablespaces)
 
 	partitionsByTable := scanPartitionsByTable(data, pageSize, decoder, tables, ownerMatcher)
 	partitionKeysByTable := scanPartitionKeysByTable(data, pageSize, tables, ownerMatcher)
@@ -303,6 +306,11 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 			return columnsByTable[tableID][i].ColID < columnsByTable[tableID][j].ColID
 		})
 	}
+	if dictColumnsByTable, dictColumnsByTableColID, dictColumnCount, ok := dictionaryColumnMaps(opts.Dictionary, dictionaryTables, tables, ownerMatcher, tableMatcher, tableNameMatcher{}); ok {
+		columnsByTable = dictColumnsByTable
+		columnsByTableColID = dictColumnsByTableColID
+		columnCount = dictColumnCount
+	}
 
 	indexes := make(map[uint32]indexDef)
 	iterDictionaryRows(data, pageSize, func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16) {
@@ -313,6 +321,7 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 	})
 
 	tableStorage := tableStorageByID(tables, indexObjects, indexes, tablespaces)
+	applyDictionaryTableStorage(dictionaryTables, tableStorage, tablespaces)
 
 	var constraints []constraintDef
 	iterDictionaryRows(data, pageSize, func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16) {

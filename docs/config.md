@@ -125,7 +125,7 @@ datafile 5 0 TBS_BIN_TEST D:\temp\oldpro\TBS_BIN_TEST01.DBF
 | --- | --- |
 | `meta.tsv` | SYSTEM.DBF、页大小、字符集、对象数量等摘要。 |
 | `users.tsv` | 用户/owner 列表。 |
-| `tables.tsv` | 用户表摘要，包含 table id、owner、表名、表空间、存储组织、是否临时表、是否分区。 |
+| `tables.tsv` | 用户表摘要，包含 table id、owner、表名、表空间、段头文件/页号、段大小、存储组织、是否临时表、是否分区。 |
 | `columns.tsv` | 字段摘要，包含 table id、owner、表名、字段序号、字段名、类型、长度、默认值等。 |
 
 这些文件是文本文件，可以人工修正。再次启动后执行：
@@ -136,6 +136,17 @@ DMDUL> load dictionary;
 
 也可以直接执行 `list user;`，工具会在内存字典为空时自动尝试从 `dmdul_dict`
 恢复字典摘要。
+
+加载文本字典后，后续 `unload table`、`unload user`、`unload database` 会优先使用
+`dmdul_dict` 中修正后的用户、表、字段、字段类型、默认值、表空间和存储组织信息。
+底层 `SYSTEM.DBF` 仍用于读取索引、约束、分区和数据页定位所需的物理元数据。
+如果在 Windows 工具中手工保存 TSV 文件并产生 UTF-8 BOM，DMDUL 会自动兼容。
+
+`tables.tsv` 中的 `header_file`、`header_block`、`bytes`、`blocks`、`extents`
+对应在线视图 `DBA_SEGMENTS` 的 `HEADER_FILE`、`HEADER_BLOCK`、`BYTES`、`BLOCKS`、
+`EXTENTS`。当前版本会生成这些列；如果能够从在线库或人工分析中补齐它们，数据抽取会优先按
+`header_file + header_block + blocks` 限定扫描页范围，避免相同表名、相似行格式或隐藏索引
+候选导致误匹配。
 
 ## Git 忽略建议
 

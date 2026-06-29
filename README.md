@@ -67,7 +67,7 @@
   - 表空间名
   - 数据文件路径
 - 扫描 `data_dir` 下 DBF 页头，辅助生成 `control.dul`。
-- `bootstrap` 会把字典摘要写入 `dmdul_dict` 文本目录，便于再次启动快速加载和人工修正。
+- `bootstrap` 会把字典摘要写入 `dmdul_dict` 文本目录，便于再次启动快速加载和人工修正；修正后的文本字典会参与后续 DDL 和数据导出。
 - `bootstrap` 会把识别到的数据库字符集回写到 `init.dul` 的 `charset` 参数。
 
 ### DDL 导出
@@ -117,6 +117,7 @@ list user;
 list table <owner>;
 unload table <owner.table_name>;
 unload user <owner>;
+unload database;
 exit;
 ```
 
@@ -203,6 +204,7 @@ DMDUL> list table HR_TEST;
 DMDUL> unload table HR_TEST.EMP_INFO;
 DMDUL> set data_format csv;
 DMDUL> unload user HR_TEST;
+DMDUL> unload database;
 DMDUL> exit;
 ```
 
@@ -214,11 +216,14 @@ DMDUL> exit;
 - `control.dul` 用于记录表空间号、文件号、表空间名和数据文件路径。
 - `bootstrap` 会生成 `dmdul_dict\meta.tsv`、`users.tsv`、`tables.tsv`、`columns.tsv`。
 - 再次启动后可以用 `load dictionary;` 从文本字典恢复，`list user;` 也会显示字典来源和统计。
+- `unload table`、`unload user`、`unload database` 会优先使用 `dmdul_dict` 中修正后的用户、表、字段、类型、表空间和存储组织信息。
+- `tables.tsv` 支持补充 `DBA_SEGMENTS` 风格的 `header_file/header_block/bytes/blocks/extents`，用于按段页范围过滤数据页。
 - 交互模式会自动生成 `init.dul` 参数文件；未设置 `data_dir` 时写在当前目录，
   设置 `data_dir` 后写到 `data_dir` 目录。
 - `init.dul` 可以人工修改，交互界面中执行 `load init;` 可重新加载参数。
 - `unload table` 用于抽取单表。
 - `unload user` 用于抽取指定用户下的表。
+- `unload database` 用于抽取整库所有用户、所有用户表 DDL 和数据。
 - 数据默认导出为 INSERT SQL。
 - 可通过 `set data_format csv;` 导出 CSV；空表不会生成空 CSV 文件。
 

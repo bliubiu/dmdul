@@ -42,6 +42,7 @@ Examples:
   DMDUL> list table HR_TEST;
   DMDUL> unload table HR_TEST.EMP_INFO;
   DMDUL> unload user HR_TEST;
+  DMDUL> unload database;
   dmdul inspect -file SYSTEM.DBF
   dmdul scan-system -file oldpro\SYSTEM.DBF
   dmdul scan-partitions -file SYSTEM.DBF -ctl dm.ctl -owner all

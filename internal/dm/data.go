@@ -35,6 +35,7 @@ type DataExportOptions struct {
 	OutputFormat        string
 	MaxRows             int
 	WriteFailedComments bool
+	Dictionary          *DictionaryInfo
 }
 
 type DataExportResult struct {
@@ -81,6 +82,18 @@ type dataTableInfo struct {
 	columns      []columnDef
 	storage      indexDef
 	storageKnown bool
+	segment      tableSegment
+	segmentKnown bool
+}
+
+type tableSegment struct {
+	fileID       int16
+	headerPage   uint32
+	blocks       uint32
+	extents      uint32
+	bytes        uint64
+	tablespace   string
+	tablespaceID uint32
 }
 
 type dataValue struct {
@@ -154,6 +167,7 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 			indexObjects[obj.ID] = obj
 		}
 	}
+	dictionaryTables := applyDictionaryTableOverrides(opts.Dictionary, tables, nil)
 
 	columnsByTable := make(map[uint32][]columnDef)
 	columnCount := 0
@@ -176,6 +190,10 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 		sort.Slice(columnsByTable[tableID], func(i, j int) bool {
 			return columnsByTable[tableID][i].ColID < columnsByTable[tableID][j].ColID
 		})
+	}
+	if dictColumnsByTable, _, dictColumnCount, ok := dictionaryColumnMaps(opts.Dictionary, dictionaryTables, tables, ownerMatcher, tableMatcher, excludeMatcher); ok {
+		columnsByTable = dictColumnsByTable
+		columnCount = dictColumnCount
 	}
 
 	indexes := make(map[uint32]indexDef)
@@ -200,8 +218,10 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 			continue
 		}
 		baseInfo := dataTableInfo{
-			table:   table,
-			columns: columnsByTable[tableID],
+			table:        table,
+			columns:      columnsByTable[tableID],
+			segment:      segmentByTableID(opts.Dictionary, tableID),
+			segmentKnown: hasSegmentRange(opts.Dictionary, tableID),
 		}
 		selectedTables[tableID] = baseInfo
 		for _, storage := range assistByParentID[tableID] {
@@ -318,7 +338,7 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 				continue
 			}
 			rows := locateRowsInDataPage(page, pageSize, nRec)
-			info, ok := selectDataPageCandidate(candidates, file, page, pageSize, rows, decoder)
+			info, ok := selectDataPageCandidate(candidates, file, uint32(pageNo), page, pageSize, rows, decoder)
 			if !ok {
 				continue
 			}
@@ -475,12 +495,12 @@ func isCandidateDataIndex(table dictionaryObject, idx indexDef) bool {
 	return table.isIOTTable() && idx.Flag&0x4 != 0
 }
 
-func selectDataPageCandidate(candidates []dataTableInfo, file dataFileRef, page []byte, pageSize uint32, rows []locatedDataRow, decoder textDecoder) (dataTableInfo, bool) {
+func selectDataPageCandidate(candidates []dataTableInfo, file dataFileRef, pageNo uint32, page []byte, pageSize uint32, rows []locatedDataRow, decoder textDecoder) (dataTableInfo, bool) {
 	if len(rows) == 0 {
 		return dataTableInfo{}, false
 	}
 	for _, candidate := range candidates {
-		if !candidateMatchesFile(candidate, file) {
+		if !candidateMatchesFile(candidate, file, pageNo) {
 			continue
 		}
 		limit := len(rows)
@@ -502,11 +522,63 @@ func selectDataPageCandidate(candidates []dataTableInfo, file dataFileRef, page 
 	return dataTableInfo{}, false
 }
 
-func candidateMatchesFile(info dataTableInfo, file dataFileRef) bool {
+func candidateMatchesFile(info dataTableInfo, file dataFileRef, pageNo uint32) bool {
+	if info.segmentKnown {
+		if uint32(info.segment.fileID) != uint32(file.key.fileID) {
+			return false
+		}
+		if info.segment.tablespaceID != 0 && info.segment.tablespaceID != file.key.groupID {
+			return false
+		}
+		if info.segment.blocks > 0 && info.segment.extents <= 1 {
+			return pageNo >= info.segment.headerPage && pageNo < info.segment.headerPage+info.segment.blocks
+		}
+		if info.segment.headerPage > 0 && info.segment.extents <= 1 {
+			return pageNo >= info.segment.headerPage
+		}
+		return true
+	}
 	if !info.storageKnown {
 		return true
 	}
 	return uint32(info.storage.GroupID) == file.key.groupID && info.storage.RootFile == file.key.fileID
+}
+
+func segmentByTableID(dict *DictionaryInfo, tableID uint32) tableSegment {
+	if dict == nil {
+		return tableSegment{}
+	}
+	for _, table := range dict.Tables {
+		if table.ID != tableID || !dictionaryTableHasSegment(table) {
+			continue
+		}
+		return tableSegment{
+			fileID:       table.HeaderFile,
+			headerPage:   table.HeaderBlock,
+			blocks:       table.Blocks,
+			extents:      table.Extents,
+			bytes:        table.Bytes,
+			tablespace:   table.Tablespace,
+			tablespaceID: table.GroupID,
+		}
+	}
+	return tableSegment{}
+}
+
+func hasSegmentRange(dict *DictionaryInfo, tableID uint32) bool {
+	if dict == nil {
+		return false
+	}
+	for _, table := range dict.Tables {
+		if table.ID == tableID {
+			return dictionaryTableHasSegment(table)
+		}
+	}
+	return false
+}
+
+func dictionaryTableHasSegment(table DictionaryTable) bool {
+	return table.HeaderBlock > 0 && table.Blocks > 0
 }
 
 func initDataTableRowStats(tables map[uint32]dataTableInfo) map[uint32]*DataTableRowCount {
@@ -1055,7 +1127,7 @@ func parseDataRowValues(row []byte, columns []columnDef, decoder textDecoder) (m
 			errors = append(errors, fmt.Sprintf("start=%d bad trailing length %d", start, trailing))
 			continue
 		}
-		score := 100 - trailing
+		score := 100 - trailing - start*4
 		if best == nil || score > best.score {
 			best = &candidate{score: score, values: values, start: start, end: pos, omittedTrailingNullValue: omittedTrailingNullValue}
 		}

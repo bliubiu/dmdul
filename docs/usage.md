@@ -85,8 +85,16 @@ columns.tsv
 DMDUL> load dictionary;
 ```
 
-如果内存中还没有字典，执行 `list user`、`list table`、`unload table`、`unload user` 前也会尝试自动从
-`dmdul_dict` 加载。
+加载后的 `dmdul_dict` 会真正参与后续恢复：DDL 和数据导出时，用户、表名、字段名、字段类型、
+默认值、表空间和存储组织会优先使用文本字典中的内容；`SYSTEM.DBF` 仍用于辅助定位索引、约束、
+分区和数据页等物理信息。Windows 下手工保存为带 UTF-8 BOM 的 TSV 文件也可以正常读取。
+
+`tables.tsv` 还预留了 `header_file`、`header_block`、`bytes`、`blocks`、`extents`
+字段，对应在线 `DBA_SEGMENTS` 的段信息。补齐这些字段后，数据抽取会按段页范围过滤候选页，
+能减少同名表或相似行格式造成的误匹配。
+
+如果内存中还没有字典，执行 `list user`、`list table`、`unload table`、`unload user`、
+`unload database` 前也会尝试自动从 `dmdul_dict` 加载。
 
 ## 查看用户和表
 
@@ -175,6 +183,37 @@ HR_TEST_T_LOG_HEAP_data.csv
 
 ```text
 DMDUL> unload user HR_TEST to hr_test_all;
+```
+
+## 恢复整库
+
+```text
+DMDUL> unload database;
+```
+
+默认生成：
+
+```text
+DATABASE_ddl.sql
+DATABASE_data.sql
+```
+
+`DATABASE_ddl.sql` 包含可识别用户、授权和所有用户表 DDL；`DATABASE_data.sql`
+包含所有可识别用户表的 INSERT 数据。
+
+如果 `data_format=csv`，`unload database` 会生成一个全库 DDL 文件，并按 owner/table
+分别生成 CSV 文件；没有数据的表不会生成空 CSV。例如：
+
+```text
+DATABASE_ddl.sql
+DATABASE_HR_TEST_EMP_INFO_data.csv
+DATABASE_SYSDBA_T_data.csv
+```
+
+也可以指定输出前缀：
+
+```text
+DMDUL> unload database to dmdb_all;
 ```
 
 ## init.dul 示例
