@@ -158,6 +158,21 @@ DMDUL> load dictionary;
 
 v0.1.6 开始，`bootstrap` 会尝试通过 DBF 页头和 assist id 自动推断这些字段；如果自动推断不完整，可以人工参考在线 `DBA_SEGMENTS` 补齐。
 
+## v0.1.6 对象字典文件
+
+`bootstrap` 除了 `users.tsv`、`tables.tsv`、`columns.tsv`，还会在 `dmdul_dict`
+下生成以下对象级字典文件：
+
+| 文件 | 内容 |
+| --- | --- |
+| `views.tsv` | 视图 owner、view name、完整 `CREATE OR REPLACE VIEW` SQL、查询 SQL |
+| `synonyms.tsv` | 同义词 owner/name 以及目标 owner/name |
+| `tab_privs.tsv` | 表/视图授权的 grantee、owner、object、privilege、grantable |
+
+`unload table`、`unload user`、`unload database` 会优先使用这些 TSV
+中的内容生成视图、同义词和对象授权 DDL。人工修复这些文件后重新执行
+`load dictionary;` 即可让修正后的字典参与恢复。
+
 ## Git 忽略建议
 
 生产文件和导出结果通常包含敏感信息，建议不要提交：

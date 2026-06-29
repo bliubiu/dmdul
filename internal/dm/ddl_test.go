@@ -72,6 +72,46 @@ func TestParseDDLRoleGrantRow(t *testing.T) {
 	}
 }
 
+func TestParseDDLObjectPrivilegeRow(t *testing.T) {
+	page := make([]byte, 256)
+	rowOff := 0x40
+	page[rowOff] = 0
+	binary.LittleEndian.PutUint16(page[rowOff+1:], 44)
+	binary.LittleEndian.PutUint32(page[rowOff+4:], 50331752)
+	binary.LittleEndian.PutUint32(page[rowOff+8:], 1063)
+	binary.LittleEndian.PutUint32(page[rowOff+12:], ^uint32(0))
+	binary.LittleEndian.PutUint32(page[rowOff+16:], 8192)
+	binary.LittleEndian.PutUint32(page[rowOff+20:], 50331649)
+	page[rowOff+24] = 'N'
+
+	grant, ok := parseDDLObjectPrivilegeRow(page, rowOff, 208, 88, uint16(rowOff), 8192)
+	if !ok {
+		t.Fatal("parseDDLObjectPrivilegeRow() returned false")
+	}
+	if grant.GranteeID != 50331752 || grant.ObjectID != 1063 || grant.Privilege != "SELECT" || grant.Grantable != "N" {
+		t.Fatalf("grant = %+v", grant)
+	}
+}
+
+func TestParseDDLTextRow(t *testing.T) {
+	page := make([]byte, 512)
+	rowOff := 0x40
+	text := []byte("CREATE OR REPLACE VIEW SYSDBA.V AS SELECT 1 AS ID")
+	binary.LittleEndian.PutUint16(page[rowOff:], uint16(25+len(text)+8))
+	binary.LittleEndian.PutUint32(page[rowOff+2:], 0x010004E2)
+	binary.LittleEndian.PutUint32(page[rowOff+6:], 0)
+	binary.LittleEndian.PutUint32(page[rowOff+21:], uint32(len(text)))
+	copy(page[rowOff+25:], text)
+
+	row, ok := parseDDLTextRow(page, rowOff, 1985, 12, uint16(rowOff), 8192, textDecoder{preferred: "utf-8"})
+	if !ok {
+		t.Fatal("parseDDLTextRow() returned false")
+	}
+	if row.ID != 0x010004E2 || row.SeqNo != 0 || row.Text != string(text) {
+		t.Fatalf("row = %+v", row)
+	}
+}
+
 func TestRenderCreateUserUsesPlaceholderPasswordAndTablespaces(t *testing.T) {
 	user := dictionaryObject{Name: "HR_TEST", Info3: 4}
 	tablespaces := map[uint32]string{3: "TEMP", 4: "MAIN"}

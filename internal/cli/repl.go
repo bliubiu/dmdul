@@ -302,8 +302,8 @@ func (s *interactiveSession) bootstrap(stdout io.Writer) error {
 		fmt.Fprintf(stdout, "control file: %s\n", dict.ControlPath)
 	}
 	fmt.Fprintf(stdout, "control.dul: %s (data files: %d)\n", controlDULPath, len(dataFiles))
-	fmt.Fprintf(stdout, "dictionary dir: %s (users=%d tables=%d columns=%d)\n",
-		dictFiles.Dir, dictFiles.UserCount, dictFiles.TableCount, dictFiles.ColumnCount)
+	fmt.Fprintf(stdout, "dictionary dir: %s (users=%d tables=%d columns=%d views=%d synonyms=%d tab_privs=%d)\n",
+		dictFiles.Dir, dictFiles.UserCount, dictFiles.TableCount, dictFiles.ColumnCount, dictFiles.ViewCount, dictFiles.SynonymCount, dictFiles.TabPrivilegeCount)
 	fmt.Fprintf(stdout, "page size: %d bytes\n", dict.PageSize)
 	fmt.Fprintf(stdout, "extent size: %d pages (%s)\n", dict.ExtentSize, dict.ExtentSizeSource)
 	fmt.Fprintf(stdout, "page count: %d\n", dict.PageCount)
@@ -313,6 +313,9 @@ func (s *interactiveSession) bootstrap(stdout io.Writer) error {
 	fmt.Fprintf(stdout, "users loaded: %d\n", dict.UserCount)
 	fmt.Fprintf(stdout, "tables loaded: %d\n", dict.TableCount)
 	fmt.Fprintf(stdout, "columns loaded: %d\n", dict.ColumnCount)
+	fmt.Fprintf(stdout, "views loaded: %d\n", dict.ViewCount)
+	fmt.Fprintf(stdout, "synonyms loaded: %d\n", dict.SynonymCount)
+	fmt.Fprintf(stdout, "tab privileges loaded: %d\n", dict.TabPrivilegeCount)
 	return nil
 }
 
@@ -355,8 +358,8 @@ func (s *interactiveSession) printDictionarySummary(stdout io.Writer) {
 	dir := defaultIfBlank(s.dictionary.DictionaryDir, s.effectiveDictionaryDir())
 	fmt.Fprintf(stdout, "dictionary source: %s\n", source)
 	fmt.Fprintf(stdout, "dictionary dir: %s\n", dir)
-	fmt.Fprintf(stdout, "dictionary rows: users=%d tables=%d columns=%d objects=%d\n\n",
-		len(s.dictionary.Users), len(s.dictionary.Tables), len(s.dictionary.Columns), s.dictionary.ObjectCount)
+	fmt.Fprintf(stdout, "dictionary rows: users=%d tables=%d columns=%d views=%d synonyms=%d tab_privs=%d objects=%d\n\n",
+		len(s.dictionary.Users), len(s.dictionary.Tables), len(s.dictionary.Columns), len(s.dictionary.Views), len(s.dictionary.Synonyms), len(s.dictionary.TabPrivileges), s.dictionary.ObjectCount)
 }
 
 func (s *interactiveSession) printTables(stdout io.Writer, owner string) {
@@ -449,6 +452,9 @@ func (s *interactiveSession) unloadTable(args []string, stdout io.Writer) error 
 		fmt.Fprintf(stdout, "data output: %s\n", data.OutputPath)
 	}
 	fmt.Fprintf(stdout, "tables exported: %d\n", ddl.TableCount)
+	fmt.Fprintf(stdout, "views exported: %d\n", ddl.ViewCount)
+	fmt.Fprintf(stdout, "synonyms exported: %d\n", ddl.SynonymCount)
+	fmt.Fprintf(stdout, "tab privileges exported: %d\n", ddl.TabPrivilegeCount)
 	fmt.Fprintf(stdout, "rows exported: %d\n", data.RowsExported)
 	fmt.Fprintf(stdout, "rows failed: %d\n", data.RowsFailed)
 	return nil
@@ -482,6 +488,9 @@ func (s *interactiveSession) unloadUser(args []string, stdout io.Writer) error {
 	}
 	fmt.Fprintf(stdout, "ddl output: %s\n", ddl.OutputPath)
 	fmt.Fprintf(stdout, "tables exported: %d\n", ddl.TableCount)
+	fmt.Fprintf(stdout, "views exported: %d\n", ddl.ViewCount)
+	fmt.Fprintf(stdout, "synonyms exported: %d\n", ddl.SynonymCount)
+	fmt.Fprintf(stdout, "tab privileges exported: %d\n", ddl.TabPrivilegeCount)
 	if s.dataFormat == "csv" {
 		files, rowsExported, rowsFailed, err := s.unloadUserCSV(prefix, owner, stdout)
 		if err != nil {
@@ -541,6 +550,9 @@ func (s *interactiveSession) unloadDatabase(args []string, stdout io.Writer) err
 	fmt.Fprintf(stdout, "ddl output: %s\n", ddl.OutputPath)
 	fmt.Fprintf(stdout, "users exported: %d\n", ddl.UserCount)
 	fmt.Fprintf(stdout, "tables exported: %d\n", ddl.TableCount)
+	fmt.Fprintf(stdout, "views exported: %d\n", ddl.ViewCount)
+	fmt.Fprintf(stdout, "synonyms exported: %d\n", ddl.SynonymCount)
+	fmt.Fprintf(stdout, "tab privileges exported: %d\n", ddl.TabPrivilegeCount)
 	if s.dataFormat == "csv" {
 		files, rowsExported, rowsFailed, err := s.unloadDatabaseCSV(prefix, stdout)
 		if err != nil {
@@ -700,7 +712,8 @@ func (s *interactiveSession) loadDictionaryFiles(stdout io.Writer) error {
 	}
 	if stdout != io.Discard {
 		fmt.Fprintf(stdout, "dictionary loaded: %s\n", files.Dir)
-		fmt.Fprintf(stdout, "users=%d tables=%d columns=%d\n", files.UserCount, files.TableCount, files.ColumnCount)
+		fmt.Fprintf(stdout, "users=%d tables=%d columns=%d views=%d synonyms=%d tab_privs=%d\n",
+			files.UserCount, files.TableCount, files.ColumnCount, files.ViewCount, files.SynonymCount, files.TabPrivilegeCount)
 	}
 	return nil
 }

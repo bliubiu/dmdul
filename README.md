@@ -87,6 +87,9 @@
 - 普通用户 `CREATE USER`
 - 角色授权 `GRANT role TO user`
 - 表结构
+- 视图 `CREATE OR REPLACE VIEW`
+- 同义词 `CREATE OR REPLACE SYNONYM`
+- 表/视图授权 `GRANT privilege ON object TO grantee`
 - 字段名、字段类型、默认值
 - 索引
 - 主键

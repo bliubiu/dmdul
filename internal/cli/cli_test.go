@@ -198,6 +198,9 @@ func TestInteractiveUnloadDatabaseSQLAutoLoadsDictionary(t *testing.T) {
 			"DATABASE_data.sql",
 			"users exported: 2",
 			"tables exported: 2",
+			"views exported: 1",
+			"synonyms exported: 1",
+			"tab privileges exported: 2",
 			"rows exported: 1",
 			"rows failed: 0",
 		} {
@@ -211,6 +214,10 @@ func TestInteractiveUnloadDatabaseSQLAutoLoadsDictionary(t *testing.T) {
 			"CREATE USER NO_TABLE",
 			"CREATE TABLE APP.WITH_ROWS",
 			"CREATE TABLE APP.EMPTY_TABLE",
+			"CREATE OR REPLACE VIEW APP.V_WITH_ROWS AS SELECT ID FROM APP.WITH_ROWS;",
+			"CREATE OR REPLACE SYNONYM NO_TABLE.SYN_WITH_ROWS FOR APP.WITH_ROWS;",
+			"GRANT SELECT ON APP.WITH_ROWS TO NO_TABLE;",
+			"GRANT SELECT ON APP.V_WITH_ROWS TO NO_TABLE;",
 			"STORAGE(ON \"MAIN\", CLUSTERBTR)",
 		} {
 			if !strings.Contains(ddl, want) {
@@ -332,6 +339,16 @@ func setupUnloadDatabaseFixture(t *testing.T) (string, string) {
 		Columns: []dm.DictionaryColumn{
 			{TableID: 1001, TableOwner: "APP", TableName: "WITH_ROWS", ColID: 1, Name: "ID", DataType: "INT", Nullable: "N"},
 			{TableID: 1002, TableOwner: "APP", TableName: "EMPTY_TABLE", ColID: 1, Name: "ID", DataType: "INT", Nullable: "N"},
+		},
+		Views: []dm.DictionaryView{
+			{ID: 2001, Owner: "APP", Name: "V_WITH_ROWS", Valid: "Y", SQL: "CREATE OR REPLACE VIEW APP.V_WITH_ROWS AS SELECT ID FROM APP.WITH_ROWS"},
+		},
+		Synonyms: []dm.DictionarySynonym{
+			{ID: 3001, Owner: "NO_TABLE", Name: "SYN_WITH_ROWS", TableOwner: "APP", TableName: "WITH_ROWS"},
+		},
+		TabPrivileges: []dm.DictionaryTabPrivilege{
+			{Grantee: "NO_TABLE", Owner: "APP", ObjectName: "WITH_ROWS", ObjectType: "TABLE", Privilege: "SELECT", Grantable: "N"},
+			{Grantee: "NO_TABLE", Owner: "APP", ObjectName: "V_WITH_ROWS", ObjectType: "VIEW", Privilege: "SELECT", Grantable: "N"},
 		},
 	})
 	if err != nil {

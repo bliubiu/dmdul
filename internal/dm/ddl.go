@@ -93,6 +93,9 @@ type DDLExportResult struct {
 	UserCount          int
 	RoleCount          int
 	RoleGrantCount     int
+	ViewCount          int
+	SynonymCount       int
+	TabPrivilegeCount  int
 }
 
 type ddlLocation struct {
@@ -103,17 +106,19 @@ type ddlLocation struct {
 }
 
 type dictionaryObject struct {
-	ID       uint32
-	SchemaID uint32
-	Owner    string
-	ParentID int32
-	Info1    uint32
-	Info3    uint64
-	Valid    string
-	Name     string
-	Type     string
-	Subtype  string
-	Location ddlLocation
+	ID          uint32
+	SchemaID    uint32
+	Owner       string
+	ParentID    int32
+	Info1       uint32
+	Info3       uint64
+	Valid       string
+	Name        string
+	Type        string
+	Subtype     string
+	TargetOwner string
+	TargetName  string
+	Location    ddlLocation
 }
 
 func (obj dictionaryObject) isIOTTable() bool {
@@ -396,7 +401,21 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 		roleGrants = append(roleGrants, grant)
 	})
 
-	sql := renderDDL(objects, users, roles, roleGrants, tables, columnsByTable, columnsByTableColID, indexObjects, indexes, tableStorage, partitionsByTable, partitionKeysByTable, constraintObjects, constraints, tableComments, columnComments, ownerMatcher, tableMatcher, tablespaces)
+	texts := scanDictionaryTexts(data, pageSize, decoder)
+	views := scanDictionaryViews(objects, texts, ownerMatcher)
+	if dictViews, ok := dictionaryViewsForDDL(opts.Dictionary, ownerMatcher); ok {
+		views = dictViews
+	}
+	synonyms := scanDictionarySynonyms(objects, ownerMatcher)
+	if dictSynonyms, ok := dictionarySynonymsForDDL(opts.Dictionary, ownerMatcher); ok {
+		synonyms = dictSynonyms
+	}
+	tabPrivileges := scanDictionaryTabPrivileges(data, pageSize, objects, users, roles, ownerMatcher, tableMatcher)
+	if dictPrivileges, ok := dictionaryTabPrivilegesForDDL(opts.Dictionary, ownerMatcher, tableMatcher); ok {
+		tabPrivileges = dictPrivileges
+	}
+
+	sql := renderDDL(objects, users, roles, roleGrants, tables, columnsByTable, columnsByTableColID, indexObjects, indexes, tableStorage, partitionsByTable, partitionKeysByTable, constraintObjects, constraints, tableComments, columnComments, views, synonyms, tabPrivileges, ownerMatcher, tableMatcher, tablespaces)
 	if err := os.WriteFile(opts.OutputPath, []byte(sql), 0644); err != nil {
 		return nil, fmt.Errorf("write ddl output: %w", err)
 	}
@@ -422,6 +441,9 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 		UserCount:          len(exportedUsers),
 		RoleCount:          len(exportedRoles),
 		RoleGrantCount:     countExportedRoleGrants(roleGrants, users, roles, exportedUsers, exportedRoles),
+		ViewCount:          len(views),
+		SynonymCount:       len(synonyms),
+		TabPrivilegeCount:  len(tabPrivileges),
 	}, nil
 }
 
@@ -519,12 +541,16 @@ func parseDDLObjectRow(page []byte, rowOff int, pageNo uint32, slotNo uint16, sl
 	if !ok {
 		return dictionaryObject{}, false
 	}
-	subtype, ok := readOptionalDDLObjectSubtype(page, next, decoder, objType)
+	subtype, subtypeNext, ok := readOptionalDDLObjectSubtype(page, next, decoder, objType)
 	if !ok {
 		return dictionaryObject{}, false
 	}
 	if !isLikelyDictionaryType(objType, subtype) {
 		return dictionaryObject{}, false
+	}
+	targetOwner, targetName := "", ""
+	if objType == "DSYNOM" || subtype == "SYNOM" {
+		targetOwner, targetName = parseDDLSynonymTarget(page, subtypeNext, decoder)
 	}
 	valid := ""
 	if b := page[rowOff+0x3F]; b == 'Y' || b == 'N' {
@@ -533,28 +559,30 @@ func parseDDLObjectRow(page []byte, rowOff int, pageNo uint32, slotNo uint16, sl
 	rowAbs := uint64(pageNo)*uint64(pageSize) + uint64(rowOff)
 	schemaID := binary.LittleEndian.Uint32(page[rowOff+0x0B:])
 	return dictionaryObject{
-		ID:       binary.LittleEndian.Uint32(page[rowOff+0x07:]),
-		SchemaID: schemaID,
-		Owner:    schemaName(schemaID),
-		ParentID: int32(binary.LittleEndian.Uint32(page[rowOff+0x0F:])),
-		Info1:    binary.LittleEndian.Uint32(page[rowOff+sysObjectsInfo1Offset:]),
-		Info3:    binary.LittleEndian.Uint64(page[rowOff+sysObjectsInfo3Offset:]),
-		Valid:    valid,
-		Name:     name,
-		Type:     objType,
-		Subtype:  subtype,
-		Location: ddlLocation{PageNo: pageNo, SlotNo: slotNo, SlotOffset: slotOff, RowOffset: rowAbs},
+		ID:          binary.LittleEndian.Uint32(page[rowOff+0x07:]),
+		SchemaID:    schemaID,
+		Owner:       schemaName(schemaID),
+		ParentID:    int32(binary.LittleEndian.Uint32(page[rowOff+0x0F:])),
+		Info1:       binary.LittleEndian.Uint32(page[rowOff+sysObjectsInfo1Offset:]),
+		Info3:       binary.LittleEndian.Uint64(page[rowOff+sysObjectsInfo3Offset:]),
+		Valid:       valid,
+		Name:        name,
+		Type:        objType,
+		Subtype:     subtype,
+		TargetOwner: targetOwner,
+		TargetName:  targetName,
+		Location:    ddlLocation{PageNo: pageNo, SlotNo: slotNo, SlotOffset: slotOff, RowOffset: rowAbs},
 	}, true
 }
 
 func isLikelyDictionaryType(objType string, subtype string) bool {
 	switch objType {
-	case "UR", "SCH", "DIR", "PROFILE", "SCHOBJ", "DMNOBJ", "TABOBJ":
+	case "UR", "SCH", "DIR", "PROFILE", "SCHOBJ", "DMNOBJ", "TABOBJ", "DSYNOM":
 	default:
 		return false
 	}
 	if subtype == "" {
-		return objType == "SCH" || objType == "DIR" || objType == "PROFILE"
+		return objType == "SCH" || objType == "DIR" || objType == "PROFILE" || objType == "DSYNOM"
 	}
 	if len(subtype) > 16 {
 		return false
@@ -567,21 +595,22 @@ func isLikelyDictionaryType(objType string, subtype string) bool {
 	return true
 }
 
-func readOptionalDDLObjectSubtype(page []byte, markerOff int, decoder textDecoder, objType string) (string, bool) {
+func readOptionalDDLObjectSubtype(page []byte, markerOff int, decoder textDecoder, objType string) (string, int, bool) {
 	if markerOff < len(page) {
 		marker := page[markerOff]
 		if marker >= 0x80 && marker <= 0xBF {
 			value, _, ok := readDDLShortString(page, markerOff, decoder, false)
 			if ok {
-				return value, true
+				_, next, _ := readDDLShortString(page, markerOff, decoder, false)
+				return value, next, true
 			}
 		}
 	}
 	switch objType {
-	case "SCH", "DIR", "PROFILE":
-		return "", true
+	case "SCH", "DIR", "PROFILE", "DSYNOM":
+		return "", markerOff, true
 	default:
-		return "", false
+		return "", markerOff, false
 	}
 }
 
@@ -1168,14 +1197,17 @@ func userDefaultTablespaceName(user dictionaryObject, tablespaces map[uint32]str
 	return tablespaces[groupID]
 }
 
-func renderDDL(objects map[uint32]dictionaryObject, users map[uint32]dictionaryObject, roles map[uint32]dictionaryObject, roleGrants []roleGrantDef, tables map[uint32]dictionaryObject, columnsByTable map[uint32][]columnDef, columnsByTableColID map[tableColKey]columnDef, indexObjects map[uint32]dictionaryObject, indexes map[uint32]indexDef, tableStorage map[uint32]indexDef, partitionsByTable map[uint32][]PartitionInfo, partitionKeysByTable map[uint32][]uint16, constraintObjects map[uint32]dictionaryObject, constraints []constraintDef, tableComments map[ownerTableKey]tableComment, columnComments map[ownerTableColumnKey]columnComment, matcher ownerMatcher, tableMatcher tableNameMatcher, tablespaces map[uint32]string) string {
+func renderDDL(objects map[uint32]dictionaryObject, users map[uint32]dictionaryObject, roles map[uint32]dictionaryObject, roleGrants []roleGrantDef, tables map[uint32]dictionaryObject, columnsByTable map[uint32][]columnDef, columnsByTableColID map[tableColKey]columnDef, indexObjects map[uint32]dictionaryObject, indexes map[uint32]indexDef, tableStorage map[uint32]indexDef, partitionsByTable map[uint32][]PartitionInfo, partitionKeysByTable map[uint32][]uint16, constraintObjects map[uint32]dictionaryObject, constraints []constraintDef, tableComments map[ownerTableKey]tableComment, columnComments map[ownerTableColumnKey]columnComment, views []DictionaryView, synonyms []DictionarySynonym, tabPrivileges []DictionaryTabPrivilege, matcher ownerMatcher, tableMatcher tableNameMatcher, tablespaces map[uint32]string) string {
 	var out strings.Builder
 	out.WriteString("-- Generated by dmdul export-ddl. Review before running.\n\n")
 	renderUsersAndRoles(&out, users, roles, roleGrants, matcher, tablespaces)
 	renderCreateTables(&out, tables, columnsByTable, columnsByTableColID, tableStorage, partitionsByTable, partitionKeysByTable, matcher, tableMatcher, tablespaces)
+	renderViews(&out, views)
 	renderIndexes(&out, tables, columnsByTableColID, indexObjects, indexes, matcher, tableMatcher, tablespaces)
 	renderConstraints(&out, objects, tables, columnsByTableColID, constraintObjects, indexes, constraints, matcher, tableMatcher)
 	renderComments(&out, tables, columnsByTable, tableComments, columnComments, matcher, tableMatcher)
+	renderSynonyms(&out, synonyms)
+	renderTabPrivileges(&out, tabPrivileges)
 	return out.String()
 }
 
@@ -1464,6 +1496,70 @@ func partitionTypeSummary(parts []PartitionInfo) string {
 		types = append(types, part.Type)
 	}
 	return strings.Join(types, ",")
+}
+
+func renderViews(out *strings.Builder, views []DictionaryView) {
+	if len(views) == 0 {
+		return
+	}
+	out.WriteString("-- Views\n")
+	for _, view := range views {
+		sql := strings.TrimSpace(view.SQL)
+		if sql == "" && strings.TrimSpace(view.QuerySQL) != "" {
+			sql = fmt.Sprintf("CREATE OR REPLACE VIEW %s.%s AS\n%s",
+				quoteIdent(view.Owner), quoteIdent(view.Name), strings.TrimSpace(view.QuerySQL))
+		}
+		if sql == "" {
+			fmt.Fprintf(out, "-- WARNING: view text not recovered for %s.%s\n", quoteIdent(view.Owner), quoteIdent(view.Name))
+			continue
+		}
+		out.WriteString(ensureSQLTerminator(sql))
+		out.WriteString("\n\n")
+	}
+}
+
+func renderSynonyms(out *strings.Builder, synonyms []DictionarySynonym) {
+	if len(synonyms) == 0 {
+		return
+	}
+	out.WriteString("-- Synonyms\n")
+	for _, syn := range synonyms {
+		if syn.Public || strings.EqualFold(syn.Owner, "PUBLIC") {
+			fmt.Fprintf(out, "CREATE OR REPLACE PUBLIC SYNONYM %s FOR %s.%s;\n",
+				quoteIdent(syn.Name), quoteIdent(syn.TableOwner), quoteIdent(syn.TableName))
+			continue
+		}
+		fmt.Fprintf(out, "CREATE OR REPLACE SYNONYM %s.%s FOR %s.%s;\n",
+			quoteIdent(syn.Owner), quoteIdent(syn.Name), quoteIdent(syn.TableOwner), quoteIdent(syn.TableName))
+	}
+	out.WriteByte('\n')
+}
+
+func renderTabPrivileges(out *strings.Builder, privileges []DictionaryTabPrivilege) {
+	if len(privileges) == 0 {
+		return
+	}
+	out.WriteString("-- Object privileges\n")
+	for _, priv := range privileges {
+		fmt.Fprintf(out, "GRANT %s ON %s.%s TO %s",
+			strings.ToUpper(strings.TrimSpace(priv.Privilege)),
+			quoteIdent(priv.Owner),
+			quoteIdent(priv.ObjectName),
+			quoteIdent(priv.Grantee))
+		if strings.EqualFold(priv.Grantable, "Y") || strings.EqualFold(priv.Grantable, "YES") {
+			out.WriteString(" WITH GRANT OPTION")
+		}
+		out.WriteString(";\n")
+	}
+	out.WriteByte('\n')
+}
+
+func ensureSQLTerminator(sql string) string {
+	sql = strings.TrimSpace(sql)
+	if strings.HasSuffix(sql, ";") {
+		return sql
+	}
+	return sql + ";"
 }
 
 func renderIndexes(out *strings.Builder, tables map[uint32]dictionaryObject, columnsByTableColID map[tableColKey]columnDef, indexObjects map[uint32]dictionaryObject, indexes map[uint32]indexDef, matcher ownerMatcher, tableMatcher tableNameMatcher, tablespaces map[uint32]string) {

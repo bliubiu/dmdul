@@ -14,14 +14,20 @@ import (
 const DefaultDictionaryDirName = "dmdul_dict"
 
 type DictionaryFilesResult struct {
-	Dir         string
-	MetaPath    string
-	UsersPath   string
-	TablesPath  string
-	ColumnsPath string
-	UserCount   int
-	TableCount  int
-	ColumnCount int
+	Dir               string
+	MetaPath          string
+	UsersPath         string
+	TablesPath        string
+	ColumnsPath       string
+	ViewsPath         string
+	SynonymsPath      string
+	TabPrivilegesPath string
+	UserCount         int
+	TableCount        int
+	ColumnCount       int
+	ViewCount         int
+	SynonymCount      int
+	TabPrivilegeCount int
 }
 
 func WriteDictionaryFiles(dir string, dict *DictionaryInfo) (*DictionaryFilesResult, error) {
@@ -47,9 +53,21 @@ func WriteDictionaryFiles(dir string, dict *DictionaryInfo) (*DictionaryFilesRes
 	if err := writeDictionaryColumns(result.ColumnsPath, dict.Columns); err != nil {
 		return nil, err
 	}
+	if err := writeDictionaryViews(result.ViewsPath, dict.Views); err != nil {
+		return nil, err
+	}
+	if err := writeDictionarySynonyms(result.SynonymsPath, dict.Synonyms); err != nil {
+		return nil, err
+	}
+	if err := writeDictionaryTabPrivileges(result.TabPrivilegesPath, dict.TabPrivileges); err != nil {
+		return nil, err
+	}
 	result.UserCount = len(dict.Users)
 	result.TableCount = len(dict.Tables)
 	result.ColumnCount = len(dict.Columns)
+	result.ViewCount = len(dict.Views)
+	result.SynonymCount = len(dict.Synonyms)
+	result.TabPrivilegeCount = len(dict.TabPrivileges)
 	return result, nil
 }
 
@@ -77,39 +95,72 @@ func LoadDictionaryFiles(dir string) (*DictionaryInfo, *DictionaryFilesResult, e
 	if err != nil && os.IsNotExist(err) {
 		columns = nil
 	}
-	users, tables, columns = normalizeDictionaryFromFiles(users, tables, columns)
+	views, err := readDictionaryViews(result.ViewsPath)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, nil, err
+	}
+	if err != nil && os.IsNotExist(err) {
+		views = nil
+	}
+	synonyms, err := readDictionarySynonyms(result.SynonymsPath)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, nil, err
+	}
+	if err != nil && os.IsNotExist(err) {
+		synonyms = nil
+	}
+	tabPrivileges, err := readDictionaryTabPrivileges(result.TabPrivilegesPath)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, nil, err
+	}
+	if err != nil && os.IsNotExist(err) {
+		tabPrivileges = nil
+	}
+	users, tables, columns, views, synonyms, tabPrivileges = normalizeDictionaryFromFiles(users, tables, columns, views, synonyms, tabPrivileges)
 	dict := &DictionaryInfo{
-		SystemPath:       meta["system_path"],
-		ControlPath:      meta["control_path"],
-		Source:           "dictionary files",
-		DictionaryDir:    dir,
-		ExtentSize:       parseMetaUint32(meta["extent_size"]),
-		ExtentSizeSource: meta["extent_size_source"],
-		PageSize:         parseMetaUint32(meta["page_size"]),
-		PageCount:        parseMetaUint32(meta["page_count"]),
-		Charset:          meta["charset"],
-		CharsetSource:    meta["charset_source"],
-		ObjectCount:      parseMetaInt(meta["object_count"]),
-		UserCount:        len(users),
-		TableCount:       len(tables),
-		ColumnCount:      len(columns),
-		Users:            users,
-		Tables:           tables,
-		Columns:          columns,
+		SystemPath:        meta["system_path"],
+		ControlPath:       meta["control_path"],
+		Source:            "dictionary files",
+		DictionaryDir:     dir,
+		ExtentSize:        parseMetaUint32(meta["extent_size"]),
+		ExtentSizeSource:  meta["extent_size_source"],
+		PageSize:          parseMetaUint32(meta["page_size"]),
+		PageCount:         parseMetaUint32(meta["page_count"]),
+		Charset:           meta["charset"],
+		CharsetSource:     meta["charset_source"],
+		ObjectCount:       parseMetaInt(meta["object_count"]),
+		UserCount:         len(users),
+		TableCount:        len(tables),
+		ColumnCount:       len(columns),
+		ViewCount:         len(views),
+		SynonymCount:      len(synonyms),
+		TabPrivilegeCount: len(tabPrivileges),
+		Users:             users,
+		Tables:            tables,
+		Columns:           columns,
+		Views:             views,
+		Synonyms:          synonyms,
+		TabPrivileges:     tabPrivileges,
 	}
 	result.UserCount = len(users)
 	result.TableCount = len(tables)
 	result.ColumnCount = len(columns)
+	result.ViewCount = len(views)
+	result.SynonymCount = len(synonyms)
+	result.TabPrivilegeCount = len(tabPrivileges)
 	return dict, result, nil
 }
 
 func dictionaryFilesResultForDir(dir string) *DictionaryFilesResult {
 	return &DictionaryFilesResult{
-		Dir:         dir,
-		MetaPath:    filepath.Join(dir, "meta.tsv"),
-		UsersPath:   filepath.Join(dir, "users.tsv"),
-		TablesPath:  filepath.Join(dir, "tables.tsv"),
-		ColumnsPath: filepath.Join(dir, "columns.tsv"),
+		Dir:               dir,
+		MetaPath:          filepath.Join(dir, "meta.tsv"),
+		UsersPath:         filepath.Join(dir, "users.tsv"),
+		TablesPath:        filepath.Join(dir, "tables.tsv"),
+		ColumnsPath:       filepath.Join(dir, "columns.tsv"),
+		ViewsPath:         filepath.Join(dir, "views.tsv"),
+		SynonymsPath:      filepath.Join(dir, "synonyms.tsv"),
+		TabPrivilegesPath: filepath.Join(dir, "tab_privs.tsv"),
 	}
 }
 
@@ -129,6 +180,9 @@ func writeDictionaryMeta(path string, dict *DictionaryInfo) error {
 		{"user_count", strconv.Itoa(len(dict.Users))},
 		{"table_count", strconv.Itoa(len(dict.Tables))},
 		{"column_count", strconv.Itoa(len(dict.Columns))},
+		{"view_count", strconv.Itoa(len(dict.Views))},
+		{"synonym_count", strconv.Itoa(len(dict.Synonyms))},
+		{"tab_privilege_count", strconv.Itoa(len(dict.TabPrivileges))},
 	}
 	return writeTSV(path, []string{"key", "value"}, rows)
 }
@@ -185,6 +239,51 @@ func writeDictionaryColumns(path string, columns []DictionaryColumn) error {
 		})
 	}
 	return writeTSV(path, []string{"table_id", "owner", "table_name", "col_id", "column_name", "data_type", "length", "scale", "nullable", "default"}, rows)
+}
+
+func writeDictionaryViews(path string, views []DictionaryView) error {
+	rows := make([][]string, 0, len(views))
+	for _, view := range views {
+		rows = append(rows, []string{
+			formatUint32Field(view.ID),
+			view.Owner,
+			view.Name,
+			view.Valid,
+			view.SQL,
+			view.QuerySQL,
+		})
+	}
+	return writeTSV(path, []string{"view_id", "owner", "view_name", "valid", "sql", "query_sql"}, rows)
+}
+
+func writeDictionarySynonyms(path string, synonyms []DictionarySynonym) error {
+	rows := make([][]string, 0, len(synonyms))
+	for _, syn := range synonyms {
+		rows = append(rows, []string{
+			formatUint32Field(syn.ID),
+			syn.Owner,
+			syn.Name,
+			syn.TableOwner,
+			syn.TableName,
+			formatBoolField(syn.Public),
+		})
+	}
+	return writeTSV(path, []string{"synonym_id", "owner", "synonym_name", "table_owner", "table_name", "public"}, rows)
+}
+
+func writeDictionaryTabPrivileges(path string, privileges []DictionaryTabPrivilege) error {
+	rows := make([][]string, 0, len(privileges))
+	for _, priv := range privileges {
+		rows = append(rows, []string{
+			priv.Grantee,
+			priv.Owner,
+			priv.ObjectName,
+			priv.ObjectType,
+			priv.Privilege,
+			priv.Grantable,
+		})
+	}
+	return writeTSV(path, []string{"grantee", "owner", "object_name", "object_type", "privilege", "grantable"}, rows)
 }
 
 func readDictionaryMeta(path string) (map[string]string, error) {
@@ -294,7 +393,76 @@ func readDictionaryColumns(path string) ([]DictionaryColumn, error) {
 	return columns, nil
 }
 
-func normalizeDictionaryFromFiles(users []DictionaryUser, tables []DictionaryTable, columns []DictionaryColumn) ([]DictionaryUser, []DictionaryTable, []DictionaryColumn) {
+func readDictionaryViews(path string) ([]DictionaryView, error) {
+	records, err := readTSV(path)
+	if err != nil {
+		return nil, err
+	}
+	var views []DictionaryView
+	for _, rec := range records {
+		if len(rec) < 5 || rec[0] == "view_id" {
+			continue
+		}
+		view := DictionaryView{
+			ID:    parseUint32Field(rec[0]),
+			Owner: rec[1],
+			Name:  rec[2],
+			Valid: rec[3],
+			SQL:   rec[4],
+		}
+		if len(rec) >= 6 {
+			view.QuerySQL = rec[5]
+		}
+		views = append(views, view)
+	}
+	return views, nil
+}
+
+func readDictionarySynonyms(path string) ([]DictionarySynonym, error) {
+	records, err := readTSV(path)
+	if err != nil {
+		return nil, err
+	}
+	var synonyms []DictionarySynonym
+	for _, rec := range records {
+		if len(rec) < 6 || rec[0] == "synonym_id" {
+			continue
+		}
+		synonyms = append(synonyms, DictionarySynonym{
+			ID:         parseUint32Field(rec[0]),
+			Owner:      rec[1],
+			Name:       rec[2],
+			TableOwner: rec[3],
+			TableName:  rec[4],
+			Public:     parseBoolField(rec[5]),
+		})
+	}
+	return synonyms, nil
+}
+
+func readDictionaryTabPrivileges(path string) ([]DictionaryTabPrivilege, error) {
+	records, err := readTSV(path)
+	if err != nil {
+		return nil, err
+	}
+	var privileges []DictionaryTabPrivilege
+	for _, rec := range records {
+		if len(rec) < 6 || rec[0] == "grantee" {
+			continue
+		}
+		privileges = append(privileges, DictionaryTabPrivilege{
+			Grantee:    rec[0],
+			Owner:      rec[1],
+			ObjectName: rec[2],
+			ObjectType: rec[3],
+			Privilege:  rec[4],
+			Grantable:  rec[5],
+		})
+	}
+	return privileges, nil
+}
+
+func normalizeDictionaryFromFiles(users []DictionaryUser, tables []DictionaryTable, columns []DictionaryColumn, views []DictionaryView, synonyms []DictionarySynonym, privileges []DictionaryTabPrivilege) ([]DictionaryUser, []DictionaryTable, []DictionaryColumn, []DictionaryView, []DictionarySynonym, []DictionaryTabPrivilege) {
 	columnCounts := make(map[uint32]int)
 	for _, col := range columns {
 		columnCounts[col.TableID]++
@@ -337,7 +505,10 @@ func normalizeDictionaryFromFiles(users []DictionaryUser, tables []DictionaryTab
 		}
 		return columns[i].ColID < columns[j].ColID
 	})
-	return users, tables, columns
+	sortDictionaryViews(views)
+	sortDictionarySynonyms(synonyms)
+	sortDictionaryTabPrivileges(privileges)
+	return users, tables, columns, views, synonyms, privileges
 }
 
 func writeTSV(path string, header []string, rows [][]string) error {

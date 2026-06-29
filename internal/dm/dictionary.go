@@ -17,23 +17,29 @@ type DictionaryOptions struct {
 }
 
 type DictionaryInfo struct {
-	SystemPath       string
-	ControlPath      string
-	Source           string
-	DictionaryDir    string
-	ExtentSize       uint32
-	ExtentSizeSource string
-	PageSize         uint32
-	PageCount        uint32
-	Charset          string
-	CharsetSource    string
-	ObjectCount      int
-	UserCount        int
-	TableCount       int
-	ColumnCount      int
-	Users            []DictionaryUser
-	Tables           []DictionaryTable
-	Columns          []DictionaryColumn
+	SystemPath        string
+	ControlPath       string
+	Source            string
+	DictionaryDir     string
+	ExtentSize        uint32
+	ExtentSizeSource  string
+	PageSize          uint32
+	PageCount         uint32
+	Charset           string
+	CharsetSource     string
+	ObjectCount       int
+	UserCount         int
+	TableCount        int
+	ColumnCount       int
+	ViewCount         int
+	SynonymCount      int
+	TabPrivilegeCount int
+	Users             []DictionaryUser
+	Tables            []DictionaryTable
+	Columns           []DictionaryColumn
+	Views             []DictionaryView
+	Synonyms          []DictionarySynonym
+	TabPrivileges     []DictionaryTabPrivilege
 }
 
 type DictionaryUser struct {
@@ -69,6 +75,33 @@ type DictionaryColumn struct {
 	Scale      int16
 	Nullable   string
 	Default    string
+}
+
+type DictionaryView struct {
+	ID       uint32
+	Owner    string
+	Name     string
+	Valid    string
+	SQL      string
+	QuerySQL string
+}
+
+type DictionarySynonym struct {
+	ID         uint32
+	Owner      string
+	Name       string
+	TableOwner string
+	TableName  string
+	Public     bool
+}
+
+type DictionaryTabPrivilege struct {
+	Grantee    string
+	Owner      string
+	ObjectName string
+	ObjectType string
+	Privilege  string
+	Grantable  string
 }
 
 func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
@@ -114,14 +147,21 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 	tables := make(map[uint32]dictionaryObject)
 	indexObjects := make(map[uint32]dictionaryObject)
 	users := make(map[uint32]DictionaryUser)
+	userObjects := make(map[uint32]dictionaryObject)
+	roleObjects := make(map[uint32]dictionaryObject)
 	for _, obj := range objects {
 		switch {
 		case obj.Type == "SCHOBJ" && obj.Subtype == "UTAB":
 			tables[obj.ID] = obj
 		case obj.Type == "TABOBJ" && obj.Subtype == "INDEX":
 			indexObjects[obj.ID] = obj
-		case obj.Type == "UR" && obj.Subtype == "USER" && isRealURObject(obj) && ownerMatcher.allowed(obj.Name):
-			users[obj.ID] = DictionaryUser{ID: obj.ID, Name: obj.Name}
+		case obj.Type == "UR" && obj.Subtype == "USER" && isRealURObject(obj):
+			userObjects[obj.ID] = obj
+			if ownerMatcher.allowed(obj.Name) {
+				users[obj.ID] = DictionaryUser{ID: obj.ID, Name: obj.Name}
+			}
+		case obj.Type == "UR" && obj.Subtype == "ROLE" && isRealURObject(obj):
+			roleObjects[obj.ID] = obj
 		}
 	}
 
@@ -160,6 +200,10 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 			indexes[idx.ID] = idx
 		}
 	})
+	texts := scanDictionaryTexts(data, pageSize, decoder)
+	viewList := scanDictionaryViews(objects, texts, ownerMatcher)
+	synonymList := scanDictionarySynonyms(objects, ownerMatcher)
+	tabPrivilegeList := scanDictionaryTabPrivileges(data, pageSize, objects, userObjects, roleObjects, ownerMatcher, newTableNameMatcher("all"))
 
 	tablespaces := loadTablespaceNames(opts.ControlPath, opts.ControlDULPath)
 	tableStorage := tableStorageByID(tables, indexObjects, indexes, tablespaces)
@@ -241,21 +285,27 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 	})
 
 	return &DictionaryInfo{
-		SystemPath:       opts.SystemPath,
-		ControlPath:      opts.ControlPath,
-		Source:           "SYSTEM.DBF",
-		ExtentSize:       extentSize,
-		ExtentSizeSource: extentSizeSource,
-		PageSize:         pageSize,
-		PageCount:        pageCount,
-		Charset:          charsetDisplay,
-		CharsetSource:    charsetSource,
-		ObjectCount:      len(objects),
-		UserCount:        len(userList),
-		TableCount:       len(tableList),
-		ColumnCount:      columnCount,
-		Users:            userList,
-		Tables:           tableList,
-		Columns:          columnList,
+		SystemPath:        opts.SystemPath,
+		ControlPath:       opts.ControlPath,
+		Source:            "SYSTEM.DBF",
+		ExtentSize:        extentSize,
+		ExtentSizeSource:  extentSizeSource,
+		PageSize:          pageSize,
+		PageCount:         pageCount,
+		Charset:           charsetDisplay,
+		CharsetSource:     charsetSource,
+		ObjectCount:       len(objects),
+		UserCount:         len(userList),
+		TableCount:        len(tableList),
+		ColumnCount:       columnCount,
+		ViewCount:         len(viewList),
+		SynonymCount:      len(synonymList),
+		TabPrivilegeCount: len(tabPrivilegeList),
+		Users:             userList,
+		Tables:            tableList,
+		Columns:           columnList,
+		Views:             viewList,
+		Synonyms:          synonymList,
+		TabPrivileges:     tabPrivilegeList,
 	}, nil
 }

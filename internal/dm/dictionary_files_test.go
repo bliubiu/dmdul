@@ -29,13 +29,22 @@ func TestWriteAndLoadDictionaryFiles(t *testing.T) {
 			{TableID: 1035, TableOwner: "HR_TEST", TableName: "EMP_INFO", ColID: 1, Name: "EMP_ID", DataType: "INT", Nullable: "N"},
 			{TableID: 1035, TableOwner: "HR_TEST", TableName: "EMP_INFO", ColID: 2, Name: "EMP_NAME", DataType: "VARCHAR", Length: 50, Nullable: "Y", Default: "'匿名'"},
 		},
+		Views: []DictionaryView{
+			{ID: 2001, Owner: "SYSDBA", Name: "V_EMP", Valid: "Y", SQL: "CREATE OR REPLACE VIEW SYSDBA.V_EMP AS SELECT 1 AS ID"},
+		},
+		Synonyms: []DictionarySynonym{
+			{ID: 3001, Owner: "HR_TEST", Name: "SYN_V_EMP", TableOwner: "SYSDBA", TableName: "V_EMP"},
+		},
+		TabPrivileges: []DictionaryTabPrivilege{
+			{Grantee: "HR_TEST", Owner: "SYSDBA", ObjectName: "V_EMP", ObjectType: "VIEW", Privilege: "SELECT", Grantable: "N"},
+		},
 	}
 
 	written, err := WriteDictionaryFiles(dir, dict)
 	if err != nil {
 		t.Fatalf("WriteDictionaryFiles returned error: %v", err)
 	}
-	if written.UserCount != 1 || written.TableCount != 1 || written.ColumnCount != 2 {
+	if written.UserCount != 1 || written.TableCount != 1 || written.ColumnCount != 2 || written.ViewCount != 1 || written.SynonymCount != 1 || written.TabPrivilegeCount != 1 {
 		t.Fatalf("unexpected written counts: %+v", written)
 	}
 
@@ -43,7 +52,7 @@ func TestWriteAndLoadDictionaryFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadDictionaryFiles returned error: %v", err)
 	}
-	if files.Dir != dir || files.ColumnCount != 2 {
+	if files.Dir != dir || files.ColumnCount != 2 || files.ViewCount != 1 || files.SynonymCount != 1 || files.TabPrivilegeCount != 1 {
 		t.Fatalf("unexpected loaded files result: %+v", files)
 	}
 	if loaded.Source != "dictionary files" || loaded.DictionaryDir != dir {
@@ -57,6 +66,15 @@ func TestWriteAndLoadDictionaryFiles(t *testing.T) {
 	}
 	if loaded.Columns[1].Default != "'匿名'" {
 		t.Fatalf("default value was not preserved: %+v", loaded.Columns[1])
+	}
+	if len(loaded.Views) != 1 || loaded.Views[0].Name != "V_EMP" || loaded.Views[0].SQL == "" {
+		t.Fatalf("view was not preserved: %+v", loaded.Views)
+	}
+	if len(loaded.Synonyms) != 1 || loaded.Synonyms[0].Name != "SYN_V_EMP" {
+		t.Fatalf("synonym was not preserved: %+v", loaded.Synonyms)
+	}
+	if len(loaded.TabPrivileges) != 1 || loaded.TabPrivileges[0].Privilege != "SELECT" {
+		t.Fatalf("tab privilege was not preserved: %+v", loaded.TabPrivileges)
 	}
 }
 

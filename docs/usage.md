@@ -77,6 +77,9 @@ meta.tsv
 users.tsv
 tables.tsv
 columns.tsv
+views.tsv
+synonyms.tsv
+tab_privs.tsv
 ```
 
 这些文件可以人工审查和修正。再次进入 DMDUL 后，可以不重扫 `SYSTEM.DBF`，直接加载文本字典：
@@ -198,7 +201,7 @@ DATABASE_ddl.sql
 DATABASE_data.sql
 ```
 
-`DATABASE_ddl.sql` 包含可识别用户、授权和所有用户表 DDL；`DATABASE_data.sql`
+`DATABASE_ddl.sql` 包含可识别用户、用户表、视图、同义词和表/视图授权 DDL；`DATABASE_data.sql`
 包含所有可识别用户表的 INSERT 数据。
 
 如果 `data_format=csv`，`unload database` 会生成一个全库 DDL 文件，并按 owner/table

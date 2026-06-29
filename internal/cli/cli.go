@@ -271,8 +271,11 @@ func runExportDDL(args []string, stdout io.Writer, stderr io.Writer) error {
 	fmt.Fprintf(stdout, "role grants exported: %d\n", result.RoleGrantCount)
 	fmt.Fprintf(stdout, "tables exported: %d\n", result.TableCount)
 	fmt.Fprintf(stdout, "columns exported: %d\n", result.ColumnCount)
+	fmt.Fprintf(stdout, "views exported: %d\n", result.ViewCount)
 	fmt.Fprintf(stdout, "indexes exported: %d\n", result.IndexCount)
 	fmt.Fprintf(stdout, "constraints exported: %d\n", result.ConstraintCount)
+	fmt.Fprintf(stdout, "synonyms exported: %d\n", result.SynonymCount)
+	fmt.Fprintf(stdout, "tab privileges exported: %d\n", result.TabPrivilegeCount)
 	fmt.Fprintf(stdout, "partition ddl exported: tables=%d partitions=%d\n", result.PartitionedTables, result.PartitionCount)
 	fmt.Fprintf(stdout, "comments exported: table=%d column=%d\n", result.TableCommentCount, result.ColumnCommentCount)
 	return nil
