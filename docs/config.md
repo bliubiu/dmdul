@@ -167,12 +167,13 @@ v0.1.6 开始，`bootstrap` 会尝试通过 DBF 页头和 assist id 自动推断
 | --- | --- |
 | `views.tsv` | 视图 owner、view name、完整 `CREATE OR REPLACE VIEW` SQL、查询 SQL |
 | `sequences.tsv` | 序列 owner/name、start/min/max、increment、cycle/order、cache，以及可人工修正的序列 SQL |
+| `routines.tsv` | 存储过程、函数、包、包体 owner/name/type、文本序号、状态和完整 `CREATE OR REPLACE` SQL |
 | `triggers.tsv` | 触发器 owner/name、目标表 owner/name、完整 `CREATE OR REPLACE TRIGGER` SQL |
 | `synonyms.tsv` | 同义词 owner/name 以及目标 owner/name |
 | `tab_privs.tsv` | 表/视图/序列授权的 grantee、owner、object、privilege、grantable |
 
 `unload table`、`unload user`、`unload database` 会优先使用这些 TSV
-中的内容生成视图、序列、触发器、同义词和对象授权 DDL。人工修复这些文件后重新执行
+中的内容生成视图、序列、存储过程/函数/包、触发器、同义词和对象授权 DDL。人工修复这些文件后重新执行
 `load dictionary;` 即可让修正后的字典参与恢复。
 
 ## Git 忽略建议

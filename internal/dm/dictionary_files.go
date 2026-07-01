@@ -21,6 +21,7 @@ type DictionaryFilesResult struct {
 	ColumnsPath       string
 	ViewsPath         string
 	SequencesPath     string
+	RoutinesPath      string
 	TriggersPath      string
 	SynonymsPath      string
 	TabPrivilegesPath string
@@ -29,6 +30,7 @@ type DictionaryFilesResult struct {
 	ColumnCount       int
 	ViewCount         int
 	SequenceCount     int
+	RoutineCount      int
 	TriggerCount      int
 	SynonymCount      int
 	TabPrivilegeCount int
@@ -63,6 +65,9 @@ func WriteDictionaryFiles(dir string, dict *DictionaryInfo) (*DictionaryFilesRes
 	if err := writeDictionarySequences(result.SequencesPath, dict.Sequences); err != nil {
 		return nil, err
 	}
+	if err := writeDictionaryRoutines(result.RoutinesPath, dict.Routines); err != nil {
+		return nil, err
+	}
 	if err := writeDictionaryTriggers(result.TriggersPath, dict.Triggers); err != nil {
 		return nil, err
 	}
@@ -77,6 +82,7 @@ func WriteDictionaryFiles(dir string, dict *DictionaryInfo) (*DictionaryFilesRes
 	result.ColumnCount = len(dict.Columns)
 	result.ViewCount = len(dict.Views)
 	result.SequenceCount = len(dict.Sequences)
+	result.RoutineCount = len(dict.Routines)
 	result.TriggerCount = len(dict.Triggers)
 	result.SynonymCount = len(dict.Synonyms)
 	result.TabPrivilegeCount = len(dict.TabPrivileges)
@@ -121,6 +127,13 @@ func LoadDictionaryFiles(dir string) (*DictionaryInfo, *DictionaryFilesResult, e
 	if err != nil && os.IsNotExist(err) {
 		sequences = nil
 	}
+	routines, err := readDictionaryRoutines(result.RoutinesPath)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, nil, err
+	}
+	if err != nil && os.IsNotExist(err) {
+		routines = nil
+	}
 	triggers, err := readDictionaryTriggers(result.TriggersPath)
 	if err != nil && !os.IsNotExist(err) {
 		return nil, nil, err
@@ -142,7 +155,7 @@ func LoadDictionaryFiles(dir string) (*DictionaryInfo, *DictionaryFilesResult, e
 	if err != nil && os.IsNotExist(err) {
 		tabPrivileges = nil
 	}
-	users, tables, columns, views, sequences, triggers, synonyms, tabPrivileges = normalizeDictionaryFromFiles(users, tables, columns, views, sequences, triggers, synonyms, tabPrivileges)
+	users, tables, columns, views, sequences, routines, triggers, synonyms, tabPrivileges = normalizeDictionaryFromFiles(users, tables, columns, views, sequences, routines, triggers, synonyms, tabPrivileges)
 	dict := &DictionaryInfo{
 		SystemPath:        meta["system_path"],
 		ControlPath:       meta["control_path"],
@@ -160,6 +173,7 @@ func LoadDictionaryFiles(dir string) (*DictionaryInfo, *DictionaryFilesResult, e
 		ColumnCount:       len(columns),
 		ViewCount:         len(views),
 		SequenceCount:     len(sequences),
+		RoutineCount:      len(routines),
 		TriggerCount:      len(triggers),
 		SynonymCount:      len(synonyms),
 		TabPrivilegeCount: len(tabPrivileges),
@@ -168,6 +182,7 @@ func LoadDictionaryFiles(dir string) (*DictionaryInfo, *DictionaryFilesResult, e
 		Columns:           columns,
 		Views:             views,
 		Sequences:         sequences,
+		Routines:          routines,
 		Triggers:          triggers,
 		Synonyms:          synonyms,
 		TabPrivileges:     tabPrivileges,
@@ -177,6 +192,7 @@ func LoadDictionaryFiles(dir string) (*DictionaryInfo, *DictionaryFilesResult, e
 	result.ColumnCount = len(columns)
 	result.ViewCount = len(views)
 	result.SequenceCount = len(sequences)
+	result.RoutineCount = len(routines)
 	result.TriggerCount = len(triggers)
 	result.SynonymCount = len(synonyms)
 	result.TabPrivilegeCount = len(tabPrivileges)
@@ -192,6 +208,7 @@ func dictionaryFilesResultForDir(dir string) *DictionaryFilesResult {
 		ColumnsPath:       filepath.Join(dir, "columns.tsv"),
 		ViewsPath:         filepath.Join(dir, "views.tsv"),
 		SequencesPath:     filepath.Join(dir, "sequences.tsv"),
+		RoutinesPath:      filepath.Join(dir, "routines.tsv"),
 		TriggersPath:      filepath.Join(dir, "triggers.tsv"),
 		SynonymsPath:      filepath.Join(dir, "synonyms.tsv"),
 		TabPrivilegesPath: filepath.Join(dir, "tab_privs.tsv"),
@@ -216,6 +233,7 @@ func writeDictionaryMeta(path string, dict *DictionaryInfo) error {
 		{"column_count", strconv.Itoa(len(dict.Columns))},
 		{"view_count", strconv.Itoa(len(dict.Views))},
 		{"sequence_count", strconv.Itoa(len(dict.Sequences))},
+		{"routine_count", strconv.Itoa(len(dict.Routines))},
 		{"trigger_count", strconv.Itoa(len(dict.Triggers))},
 		{"synonym_count", strconv.Itoa(len(dict.Synonyms))},
 		{"tab_privilege_count", strconv.Itoa(len(dict.TabPrivileges))},
@@ -311,6 +329,22 @@ func writeDictionarySequences(path string, sequences []DictionarySequence) error
 		})
 	}
 	return writeTSV(path, []string{"sequence_id", "owner", "sequence_name", "valid", "start_with", "min_value", "max_value", "increment_by", "cycle_flag", "order_flag", "cache_size", "sql"}, rows)
+}
+
+func writeDictionaryRoutines(path string, routines []DictionaryRoutine) error {
+	rows := make([][]string, 0, len(routines))
+	for _, routine := range routines {
+		rows = append(rows, []string{
+			formatUint32Field(routine.ID),
+			routine.Owner,
+			routine.Name,
+			normalizeRoutineObjectType(routine.ObjectType),
+			strconv.FormatUint(uint64(routine.SeqNo), 10),
+			routine.Valid,
+			routine.SQL,
+		})
+	}
+	return writeTSV(path, []string{"routine_id", "owner", "routine_name", "object_type", "seq_no", "valid", "sql"}, rows)
 }
 
 func writeDictionaryTriggers(path string, triggers []DictionaryTrigger) error {
@@ -529,6 +563,29 @@ func readDictionarySequences(path string) ([]DictionarySequence, error) {
 	return sequences, nil
 }
 
+func readDictionaryRoutines(path string) ([]DictionaryRoutine, error) {
+	records, err := readTSV(path)
+	if err != nil {
+		return nil, err
+	}
+	var routines []DictionaryRoutine
+	for _, rec := range records {
+		if len(rec) < 7 || rec[0] == "routine_id" {
+			continue
+		}
+		routines = append(routines, DictionaryRoutine{
+			ID:         parseUint32Field(rec[0]),
+			Owner:      rec[1],
+			Name:       rec[2],
+			ObjectType: normalizeRoutineObjectType(rec[3]),
+			SeqNo:      parseUint32Field(rec[4]),
+			Valid:      rec[5],
+			SQL:        rec[6],
+		})
+	}
+	return routines, nil
+}
+
 func readDictionaryTriggers(path string) ([]DictionaryTrigger, error) {
 	records, err := readTSV(path)
 	if err != nil {
@@ -596,7 +653,7 @@ func readDictionaryTabPrivileges(path string) ([]DictionaryTabPrivilege, error) 
 	return privileges, nil
 }
 
-func normalizeDictionaryFromFiles(users []DictionaryUser, tables []DictionaryTable, columns []DictionaryColumn, views []DictionaryView, sequences []DictionarySequence, triggers []DictionaryTrigger, synonyms []DictionarySynonym, privileges []DictionaryTabPrivilege) ([]DictionaryUser, []DictionaryTable, []DictionaryColumn, []DictionaryView, []DictionarySequence, []DictionaryTrigger, []DictionarySynonym, []DictionaryTabPrivilege) {
+func normalizeDictionaryFromFiles(users []DictionaryUser, tables []DictionaryTable, columns []DictionaryColumn, views []DictionaryView, sequences []DictionarySequence, routines []DictionaryRoutine, triggers []DictionaryTrigger, synonyms []DictionarySynonym, privileges []DictionaryTabPrivilege) ([]DictionaryUser, []DictionaryTable, []DictionaryColumn, []DictionaryView, []DictionarySequence, []DictionaryRoutine, []DictionaryTrigger, []DictionarySynonym, []DictionaryTabPrivilege) {
 	columnCounts := make(map[uint32]int)
 	for _, col := range columns {
 		columnCounts[col.TableID]++
@@ -641,10 +698,11 @@ func normalizeDictionaryFromFiles(users []DictionaryUser, tables []DictionaryTab
 	})
 	sortDictionaryViews(views)
 	sortDictionarySequences(sequences)
+	sortDictionaryRoutines(routines)
 	sortDictionaryTriggers(triggers)
 	sortDictionarySynonyms(synonyms)
 	sortDictionaryTabPrivileges(privileges)
-	return users, tables, columns, views, sequences, triggers, synonyms, privileges
+	return users, tables, columns, views, sequences, routines, triggers, synonyms, privileges
 }
 
 func writeTSV(path string, header []string, rows [][]string) error {

@@ -35,6 +35,9 @@ func TestWriteAndLoadDictionaryFiles(t *testing.T) {
 		Sequences: []DictionarySequence{
 			{ID: 2101, Owner: "SYSDBA", Name: "SEQ_EMP", Valid: "Y", StartWith: 1, MinValue: 1, MaxValue: 999999999999, IncrementBy: 1, CycleFlag: "N", OrderFlag: "N", CacheSize: 20},
 		},
+		Routines: []DictionaryRoutine{
+			{ID: 2151, Owner: "SYSDBA", Name: "F_EMP", ObjectType: "FUNCTION", SeqNo: 0, Valid: "Y", SQL: "CREATE OR REPLACE FUNCTION SYSDBA.F_EMP RETURN INT AS BEGIN RETURN 1; END;"},
+		},
 		Triggers: []DictionaryTrigger{
 			{ID: 2201, Owner: "SYSDBA", Name: "TRG_EMP", TableOwner: "HR_TEST", TableName: "EMP_INFO", Valid: "Y", SQL: "CREATE OR REPLACE TRIGGER SYSDBA.TRG_EMP BEFORE INSERT ON HR_TEST.EMP_INFO BEGIN NULL; END;"},
 		},
@@ -51,7 +54,7 @@ func TestWriteAndLoadDictionaryFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WriteDictionaryFiles returned error: %v", err)
 	}
-	if written.UserCount != 1 || written.TableCount != 1 || written.ColumnCount != 2 || written.ViewCount != 1 || written.SequenceCount != 1 || written.TriggerCount != 1 || written.SynonymCount != 1 || written.TabPrivilegeCount != 2 {
+	if written.UserCount != 1 || written.TableCount != 1 || written.ColumnCount != 2 || written.ViewCount != 1 || written.SequenceCount != 1 || written.RoutineCount != 1 || written.TriggerCount != 1 || written.SynonymCount != 1 || written.TabPrivilegeCount != 2 {
 		t.Fatalf("unexpected written counts: %+v", written)
 	}
 
@@ -59,7 +62,7 @@ func TestWriteAndLoadDictionaryFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadDictionaryFiles returned error: %v", err)
 	}
-	if files.Dir != dir || files.ColumnCount != 2 || files.ViewCount != 1 || files.SequenceCount != 1 || files.TriggerCount != 1 || files.SynonymCount != 1 || files.TabPrivilegeCount != 2 {
+	if files.Dir != dir || files.ColumnCount != 2 || files.ViewCount != 1 || files.SequenceCount != 1 || files.RoutineCount != 1 || files.TriggerCount != 1 || files.SynonymCount != 1 || files.TabPrivilegeCount != 2 {
 		t.Fatalf("unexpected loaded files result: %+v", files)
 	}
 	if loaded.Source != "dictionary files" || loaded.DictionaryDir != dir {
@@ -79,6 +82,9 @@ func TestWriteAndLoadDictionaryFiles(t *testing.T) {
 	}
 	if len(loaded.Sequences) != 1 || loaded.Sequences[0].Name != "SEQ_EMP" || loaded.Sequences[0].IncrementBy != 1 || loaded.Sequences[0].MaxValue != 999999999999 || loaded.Sequences[0].CacheSize != 20 {
 		t.Fatalf("sequence was not preserved: %+v", loaded.Sequences)
+	}
+	if len(loaded.Routines) != 1 || loaded.Routines[0].Name != "F_EMP" || loaded.Routines[0].ObjectType != "FUNCTION" || loaded.Routines[0].SQL == "" {
+		t.Fatalf("routine was not preserved: %+v", loaded.Routines)
 	}
 	if len(loaded.Triggers) != 1 || loaded.Triggers[0].Name != "TRG_EMP" || loaded.Triggers[0].SQL == "" {
 		t.Fatalf("trigger was not preserved: %+v", loaded.Triggers)

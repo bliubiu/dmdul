@@ -200,6 +200,7 @@ func TestInteractiveUnloadDatabaseSQLAutoLoadsDictionary(t *testing.T) {
 			"tables exported: 2",
 			"views exported: 1",
 			"sequences exported: 1",
+			"routines exported: 1",
 			"triggers exported: 1",
 			"synonyms exported: 2",
 			"tab privileges exported: 3",
@@ -221,6 +222,7 @@ func TestInteractiveUnloadDatabaseSQLAutoLoadsDictionary(t *testing.T) {
 			"INCREMENT BY 1",
 			"MAXVALUE 999999999999",
 			"CACHE 20",
+			"CREATE OR REPLACE FUNCTION APP.F_WITH_ROWS RETURN INT AS BEGIN RETURN 1; END;",
 			"CREATE OR REPLACE VIEW APP.V_WITH_ROWS AS SELECT ID FROM APP.WITH_ROWS;",
 			"CREATE OR REPLACE TRIGGER APP.TRG_WITH_ROWS BEFORE INSERT ON APP.WITH_ROWS BEGIN NULL; END;",
 			"CREATE OR REPLACE SYNONYM NO_TABLE.SYN_WITH_ROWS FOR APP.WITH_ROWS;",
@@ -355,6 +357,9 @@ func setupUnloadDatabaseFixture(t *testing.T) (string, string) {
 		},
 		Sequences: []dm.DictionarySequence{
 			{ID: 2101, Owner: "APP", Name: "SEQ_WITH_ROWS", Valid: "Y", StartWith: 1, MinValue: 1, MaxValue: 999999999999, IncrementBy: 1, CycleFlag: "N", OrderFlag: "N", CacheSize: 20},
+		},
+		Routines: []dm.DictionaryRoutine{
+			{ID: 2151, Owner: "APP", Name: "F_WITH_ROWS", ObjectType: "FUNCTION", SeqNo: 0, Valid: "Y", SQL: "CREATE OR REPLACE FUNCTION APP.F_WITH_ROWS RETURN INT AS BEGIN RETURN 1; END;"},
 		},
 		Triggers: []dm.DictionaryTrigger{
 			{ID: 2201, Owner: "APP", Name: "TRG_WITH_ROWS", TableOwner: "APP", TableName: "WITH_ROWS", Valid: "Y", SQL: "CREATE OR REPLACE TRIGGER APP.TRG_WITH_ROWS BEFORE INSERT ON APP.WITH_ROWS BEGIN NULL; END;"},

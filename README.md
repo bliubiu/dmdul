@@ -43,9 +43,9 @@
 
 - 支持 `unload database;` 整库离线导出。
 - 支持从 `dmdul_dict` 字典文件驱动 DDL 和数据恢复。
-- `bootstrap` 可生成并补充 `tables.tsv` 段定位字段，并落盘视图、序列、触发器、同义词和对象授权字典。
+- `bootstrap` 可生成并补充 `tables.tsv` 段定位字段，并落盘视图、序列、存储过程/函数/包、触发器、同义词和对象授权字典。
 - 支持基于 `header_file/header_block/blocks` 缩小数据页扫描范围。
-- 支持恢复视图、序列、触发器、同义词和对象授权。
+- 支持恢复视图、序列、存储过程/函数/包、触发器、同义词和对象授权。
 - 修复相同表名不同 owner 时可能串表的问题。
 ~~~
 
@@ -53,7 +53,7 @@
 | --------------------- | ---------- | ------------------------------------ |
 | `SYSTEM.DBF` 基础解析 | ✅ 支持     | 识别页大小、簇大小、页数、字符集标记 |
 | `dm.ctl` 解析         | ✅ 支持     | 识别数据库名、表空间名、数据文件路径 |
-| 用户 DDL 导出         | ✅ 支持     | 用户、表、字段、序列、触发器、索引、约束、注释 |
+| 用户 DDL 导出         | ✅ 支持     | 用户、表、字段、序列、存储过程/函数/包、触发器、索引、约束、注释 |
 | 普通表数据导出        | ✅ 支持     | 导出为 INSERT SQL 或 CSV             |
 | 字符集处理            | ✅ 支持     | UTF-8、GB18030/GBK、EUC-KR           |
 | 交互式 DUL 模式       | ✅ 支持     | 提供类似 Oracle DUL 的交互式命令     |
@@ -78,7 +78,7 @@
   - 表空间名
   - 数据文件路径
 - 扫描 `data_dir` 下 DBF 页头，辅助生成 `control.dul`。
-- `bootstrap` 会把字典摘要写入 `dmdul_dict` 文本目录，便于再次启动快速加载和人工修正；修正后的文本字典会参与后续 DDL 和数据导出。当前会落盘 `users.tsv`、`tables.tsv`、`columns.tsv`、`views.tsv`、`sequences.tsv`、`triggers.tsv`、`synonyms.tsv`、`tab_privs.tsv`。
+- `bootstrap` 会把字典摘要写入 `dmdul_dict` 文本目录，便于再次启动快速加载和人工修正；修正后的文本字典会参与后续 DDL 和数据导出。当前会落盘 `users.tsv`、`tables.tsv`、`columns.tsv`、`views.tsv`、`sequences.tsv`、`routines.tsv`、`triggers.tsv`、`synonyms.tsv`、`tab_privs.tsv`。
 - `bootstrap` 会把识别到的数据库字符集回写到 `init.dul` 的 `charset` 参数。
 
 ### DDL 导出
@@ -90,6 +90,7 @@
 - 表结构
 - 视图 `CREATE OR REPLACE VIEW`
 - 序列 `CREATE SEQUENCE`
+- 存储过程、函数、包、包体 `CREATE OR REPLACE PROCEDURE/FUNCTION/PACKAGE`
 - 触发器 `CREATE OR REPLACE TRIGGER`
 - 同义词 `CREATE OR REPLACE SYNONYM`
 - 表/视图/序列授权 `GRANT privilege ON object TO grantee`
@@ -230,7 +231,7 @@ DMDUL> exit;
 - 未显式指定 `dm.ctl` 时，如果 `SYSTEM.DBF` 同目录存在 `dm.ctl`，工具会自动尝试使用。
 - `bootstrap` 会扫描 `data_dir` 下的 DBF 页头，并生成 `control.dul`。
 - `control.dul` 用于记录表空间号、文件号、表空间名和数据文件路径。
-- `bootstrap` 会生成 `dmdul_dict\meta.tsv`、`users.tsv`、`tables.tsv`、`columns.tsv`。
+- `bootstrap` 会生成 `dmdul_dict\meta.tsv`、`users.tsv`、`tables.tsv`、`columns.tsv`、`views.tsv`、`sequences.tsv`、`routines.tsv`、`triggers.tsv`、`synonyms.tsv`、`tab_privs.tsv`。
 - 再次启动后可以用 `load dictionary;` 从文本字典恢复，`list user;` 也会显示字典来源和统计。
 - `unload table`、`unload user`、`unload database` 会优先使用 `dmdul_dict` 中修正后的用户、表、字段、类型、表空间和存储组织信息。
 - `tables.tsv` 支持补充 `DBA_SEGMENTS` 风格的 `header_file/header_block/bytes/blocks/extents`，用于按段页范围过滤数据页。

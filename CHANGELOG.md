@@ -6,6 +6,8 @@
 
 ### Added
 
+- `bootstrap` 新增存储过程、函数、包、包体字典落盘，生成 `routines.tsv`；DDL 导出新增 `CREATE OR REPLACE PROCEDURE/FUNCTION/PACKAGE/PACKAGE BODY`。
+
 - `bootstrap` 新增序列和触发器字典落盘，生成 `sequences.tsv`、`triggers.tsv`。
 - DDL 导出新增 `CREATE SEQUENCE`、`CREATE OR REPLACE TRIGGER`。
 - 同义词和对象授权恢复支持序列对象，例如 `GRANT SELECT ON owner.sequence TO grantee`。

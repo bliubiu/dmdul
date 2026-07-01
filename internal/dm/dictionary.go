@@ -33,6 +33,7 @@ type DictionaryInfo struct {
 	ColumnCount       int
 	ViewCount         int
 	SequenceCount     int
+	RoutineCount      int
 	TriggerCount      int
 	SynonymCount      int
 	TabPrivilegeCount int
@@ -41,6 +42,7 @@ type DictionaryInfo struct {
 	Columns           []DictionaryColumn
 	Views             []DictionaryView
 	Sequences         []DictionarySequence
+	Routines          []DictionaryRoutine
 	Triggers          []DictionaryTrigger
 	Synonyms          []DictionarySynonym
 	TabPrivileges     []DictionaryTabPrivilege
@@ -103,6 +105,16 @@ type DictionarySequence struct {
 	OrderFlag   string
 	CacheSize   uint32
 	SQL         string
+}
+
+type DictionaryRoutine struct {
+	ID         uint32
+	Owner      string
+	Name       string
+	ObjectType string
+	SeqNo      uint32
+	Valid      string
+	SQL        string
 }
 
 type DictionaryTrigger struct {
@@ -232,6 +244,7 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 	texts := scanDictionaryTexts(data, pageSize, decoder)
 	viewList := scanDictionaryViews(objects, texts, ownerMatcher)
 	sequenceList := scanDictionarySequences(objects, texts, ownerMatcher)
+	routineList := scanDictionaryRoutines(objects, texts, scanRawRoutineTexts(data, decoder), ownerMatcher)
 	triggerList := scanDictionaryTriggers(objects, texts, scanRawTriggerTexts(data, decoder), ownerMatcher)
 	synonymList := scanDictionarySynonyms(objects, ownerMatcher)
 	tabPrivilegeList := scanDictionaryTabPrivileges(data, pageSize, objects, userObjects, roleObjects, ownerMatcher, newTableNameMatcher("all"))
@@ -331,6 +344,7 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 		ColumnCount:       columnCount,
 		ViewCount:         len(viewList),
 		SequenceCount:     len(sequenceList),
+		RoutineCount:      len(routineList),
 		TriggerCount:      len(triggerList),
 		SynonymCount:      len(synonymList),
 		TabPrivilegeCount: len(tabPrivilegeList),
@@ -339,6 +353,7 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 		Columns:           columnList,
 		Views:             viewList,
 		Sequences:         sequenceList,
+		Routines:          routineList,
 		Triggers:          triggerList,
 		Synonyms:          synonymList,
 		TabPrivileges:     tabPrivilegeList,

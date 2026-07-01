@@ -226,6 +226,100 @@ func parseSequencePayload(payload []byte) sequencePayloadInfo {
 	return result
 }
 
+func scanDictionaryRoutines(objects map[uint32]dictionaryObject, texts map[uint32]map[uint32]string, rawTexts map[string]string, matcher ownerMatcher) []DictionaryRoutine {
+	var routines []DictionaryRoutine
+	for _, obj := range objects {
+		if obj.Type != "SCHOBJ" || obj.Valid == "N" || !matcher.allowed(obj.Owner) {
+			continue
+		}
+		if isSystemCatalogOwner(obj.Owner) || strings.HasPrefix(obj.Name, "##") {
+			continue
+		}
+		if isKnownGeneratedSYSDBARoutine(obj.Owner, obj.Name) {
+			continue
+		}
+		switch obj.Subtype {
+		case "PROC":
+			sql := routineTextSQL(texts[obj.ID], 0)
+			objectType := routineTypeFromSQL(sql)
+			if objectType == "" {
+				objectType = "PROCEDURE"
+			}
+			if raw, rawType := bestRawRoutineText(rawTexts, obj.Owner, obj.Name, objectType, "FUNCTION", "PROCEDURE"); len(raw) > len(sql) {
+				sql = raw
+				objectType = rawType
+			}
+			routines = append(routines, DictionaryRoutine{
+				ID:         obj.ID,
+				Owner:      obj.Owner,
+				Name:       obj.Name,
+				ObjectType: objectType,
+				SeqNo:      0,
+				Valid:      obj.Valid,
+				SQL:        sql,
+			})
+		case "PKG":
+			specSQL := routineTextSQL(texts[obj.ID], 0)
+			if raw, _ := bestRawRoutineText(rawTexts, obj.Owner, obj.Name, "PACKAGE"); len(raw) > len(specSQL) {
+				specSQL = raw
+			}
+			routines = append(routines, DictionaryRoutine{
+				ID:         obj.ID,
+				Owner:      obj.Owner,
+				Name:       obj.Name,
+				ObjectType: "PACKAGE",
+				SeqNo:      0,
+				Valid:      obj.Valid,
+				SQL:        specSQL,
+			})
+			bodySQL := routineTextSQL(texts[obj.ID], 1)
+			if raw, _ := bestRawRoutineText(rawTexts, obj.Owner, obj.Name, "PACKAGE BODY"); len(raw) > len(bodySQL) {
+				bodySQL = raw
+			}
+			if bodySQL != "" {
+				routines = append(routines, DictionaryRoutine{
+					ID:         obj.ID,
+					Owner:      obj.Owner,
+					Name:       obj.Name,
+					ObjectType: "PACKAGE BODY",
+					SeqNo:      1,
+					Valid:      obj.Valid,
+					SQL:        bodySQL,
+				})
+			}
+		}
+	}
+	sortDictionaryRoutines(routines)
+	return routines
+}
+
+func routineTextSQL(seqs map[uint32]string, seqNo uint32) string {
+	return strings.TrimSpace(seqs[seqNo])
+}
+
+func routineTypeFromSQL(sql string) string {
+	objectType, _, _ := parseCreateRoutineName(sql)
+	return objectType
+}
+
+func bestRawRoutineText(rawTexts map[string]string, owner string, name string, preferredTypes ...string) (string, string) {
+	for _, objectType := range preferredTypes {
+		objectType = normalizeRoutineObjectType(objectType)
+		if objectType == "" {
+			continue
+		}
+		if sql := rawTexts[routineKey(owner, name, objectType)]; sql != "" {
+			return sql, objectType
+		}
+	}
+	for _, objectType := range []string{"PACKAGE", "PACKAGE BODY", "FUNCTION", "PROCEDURE"} {
+		if sql := rawTexts[routineKey(owner, name, objectType)]; sql != "" {
+			return sql, objectType
+		}
+	}
+	return "", ""
+}
+
 func scanDictionaryTriggers(objects map[uint32]dictionaryObject, texts map[uint32]map[uint32]string, rawTexts map[string]string, matcher ownerMatcher) []DictionaryTrigger {
 	var triggers []DictionaryTrigger
 	for _, obj := range objects {
@@ -387,6 +481,23 @@ func isSystemCatalogOwner(owner string) bool {
 	}
 }
 
+func isKnownGeneratedSYSDBARoutine(owner string, name string) bool {
+	if !strings.EqualFold(strings.TrimSpace(owner), "SYSDBA") {
+		return false
+	}
+	switch strings.ToUpper(strings.TrimSpace(name)) {
+	case "SP_ARCH_BAKSET_REMOVE_BATCH",
+		"SP_DB_BAKSET_REMOVE_BATCH",
+		"SP_DROP_CONS_AND_OBJ_REFS_WHEN_DROP_SCHEMA",
+		"SP_TAB_BAKSET_REMOVE_BATCH",
+		"SP_TS_BAKSET_REMOVE_BATCH",
+		"SP_UPDATE_SYSHPARTTABLEINFO_RESVD1":
+		return true
+	default:
+		return false
+	}
+}
+
 func parseDDLObjectPrivilegeRow(page []byte, slotOff int, pageNo uint32, slotNo uint16, rawSlotOff uint16, pageSize uint32) (dictionaryObjectPrivilegeDef, bool) {
 	for delta := 0; delta < 4; delta++ {
 		base := slotOff + delta
@@ -494,6 +605,39 @@ func sortDictionarySequences(sequences []DictionarySequence) {
 	})
 }
 
+func sortDictionaryRoutines(routines []DictionaryRoutine) {
+	sort.Slice(routines, func(i, j int) bool {
+		if routines[i].Owner != routines[j].Owner {
+			return routines[i].Owner < routines[j].Owner
+		}
+		if routines[i].Name != routines[j].Name {
+			return routines[i].Name < routines[j].Name
+		}
+		if routines[i].ID != routines[j].ID {
+			return routines[i].ID < routines[j].ID
+		}
+		if routines[i].SeqNo != routines[j].SeqNo {
+			return routines[i].SeqNo < routines[j].SeqNo
+		}
+		return routineTypeOrder(routines[i].ObjectType) < routineTypeOrder(routines[j].ObjectType)
+	})
+}
+
+func routineTypeOrder(objectType string) int {
+	switch normalizeRoutineObjectType(objectType) {
+	case "PACKAGE":
+		return 1
+	case "PACKAGE BODY":
+		return 2
+	case "PROCEDURE":
+		return 3
+	case "FUNCTION":
+		return 4
+	default:
+		return 9
+	}
+}
+
 func sortDictionaryTriggers(triggers []DictionaryTrigger) {
 	sort.Slice(triggers, func(i, j int) bool {
 		if triggers[i].Owner != triggers[j].Owner {
@@ -549,6 +693,32 @@ func dictionarySequencesForDDL(dict *DictionaryInfo, matcher ownerMatcher) ([]Di
 	}
 	sortDictionarySequences(sequences)
 	return sequences, true
+}
+
+func dictionaryRoutinesForDDL(dict *DictionaryInfo, matcher ownerMatcher) ([]DictionaryRoutine, bool) {
+	if dict == nil || len(dict.Routines) == 0 {
+		return nil, false
+	}
+	routines := make([]DictionaryRoutine, 0, len(dict.Routines))
+	for _, routine := range dict.Routines {
+		if strings.TrimSpace(routine.Owner) == "" || strings.TrimSpace(routine.Name) == "" || !matcher.allowed(routine.Owner) {
+			continue
+		}
+		if isSystemCatalogOwner(routine.Owner) || strings.HasPrefix(routine.Name, "##") {
+			continue
+		}
+		if isKnownGeneratedSYSDBARoutine(routine.Owner, routine.Name) {
+			continue
+		}
+		objectType := normalizeRoutineObjectType(routine.ObjectType)
+		if objectType == "" {
+			continue
+		}
+		routine.ObjectType = objectType
+		routines = append(routines, routine)
+	}
+	sortDictionaryRoutines(routines)
+	return routines, true
 }
 
 func dictionaryTriggersForDDL(dict *DictionaryInfo, matcher ownerMatcher, tableMatcher tableNameMatcher) ([]DictionaryTrigger, bool) {
@@ -637,8 +807,49 @@ func qualifiedObjectKey(owner string, name string) string {
 	return strings.ToUpper(strings.TrimSpace(owner)) + "." + strings.ToUpper(strings.TrimSpace(name))
 }
 
+func routineKey(owner string, name string, objectType string) string {
+	return qualifiedObjectKey(owner, name) + "\x00" + normalizeRoutineObjectType(objectType)
+}
+
 var createTriggerNamePattern = regexp.MustCompile(`(?is)CREATE\s+OR\s+REPLACE\s+TRIGGER\s+((?:"[^"]+"|[A-Za-z_][A-Za-z0-9_$#]*)\.)?("[^"]+"|[A-Za-z_][A-Za-z0-9_$#]*)`)
 var triggerOnTablePattern = regexp.MustCompile(`(?is)\bON\s+((?:"[^"]+"|[A-Za-z_][A-Za-z0-9_$#]*)\.)?("[^"]+"|[A-Za-z_][A-Za-z0-9_$#]*)`)
+var createRoutineNamePattern = regexp.MustCompile(`(?is)CREATE\s+(?:OR\s+REPLACE\s+)?(PACKAGE\s+BODY|PACKAGE|PROCEDURE|FUNCTION)\s+((?:"[^"]+"|[A-Za-z_][A-Za-z0-9_$#]*)\.)?("[^"]+"|[A-Za-z_][A-Za-z0-9_$#]*)`)
+
+func scanRawRoutineTexts(data []byte, decoder textDecoder) map[string]string {
+	result := make(map[string]string)
+	for _, keyword := range [][]byte{
+		[]byte("CREATE OR REPLACE FUNCTION"),
+		[]byte("CREATE OR REPLACE PROCEDURE"),
+		[]byte("CREATE OR REPLACE PACKAGE"),
+	} {
+		for searchFrom := 0; searchFrom < len(data); {
+			rel := indexASCIIInsensitive(data[searchFrom:], keyword)
+			if rel < 0 {
+				break
+			}
+			start := searchFrom + rel
+			end := rawRoutineEnd(data, start)
+			if end <= start {
+				searchFrom = start + len(keyword)
+				continue
+			}
+			sql, ok := decoder.decode(data[start:end])
+			if !ok {
+				sql = string(data[start:end])
+			}
+			sql = strings.TrimSpace(sql)
+			objectType, owner, name := parseCreateRoutineName(sql)
+			if owner != "" && name != "" && objectType != "" {
+				key := routineKey(owner, name, objectType)
+				if len(sql) > len(result[key]) {
+					result[key] = sql
+				}
+			}
+			searchFrom = end
+		}
+	}
+	return result
+}
 
 func scanRawTriggerTexts(data []byte, decoder textDecoder) map[string]string {
 	result := make(map[string]string)
@@ -669,6 +880,64 @@ func scanRawTriggerTexts(data []byte, decoder textDecoder) map[string]string {
 		searchFrom = end
 	}
 	return result
+}
+
+func rawRoutineEnd(data []byte, start int) int {
+	maxEnd := start + 512*1024
+	if maxEnd > len(data) {
+		maxEnd = len(data)
+	}
+	window := data[start:maxEnd]
+	upper := bytes.ToUpper(window)
+	for search := 0; search < len(upper); {
+		rel := bytes.Index(upper[search:], []byte("END"))
+		if rel < 0 {
+			return 0
+		}
+		endKeyword := search + rel
+		if !isSQLWordBoundary(upper, endKeyword-1) || !isSQLWordBoundary(upper, endKeyword+3) {
+			search = endKeyword + 3
+			continue
+		}
+		semicolonLimit := endKeyword + 256
+		if semicolonLimit > len(upper) {
+			semicolonLimit = len(upper)
+		}
+		semicolonRel := bytes.IndexByte(upper[endKeyword+3:semicolonLimit], ';')
+		if semicolonRel < 0 {
+			return 0
+		}
+		semicolon := endKeyword + 3 + semicolonRel
+		tail := strings.TrimSpace(string(upper[endKeyword+3 : semicolon]))
+		if isNestedRoutineEndTail(tail) {
+			search = semicolon + 1
+			continue
+		}
+		end := semicolon + 1
+		if rawSQLBoundary(window, end) {
+			return start + end
+		}
+		search = end
+	}
+	return 0
+}
+
+func isSQLWordBoundary(data []byte, index int) bool {
+	if index < 0 || index >= len(data) {
+		return true
+	}
+	b := data[index]
+	return !((b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') || b == '_' || b == '$' || b == '#')
+}
+
+func isNestedRoutineEndTail(tail string) bool {
+	tail = strings.TrimSpace(strings.ToUpper(tail))
+	switch tail {
+	case "IF", "LOOP", "CASE", "WHILE", "FOR":
+		return true
+	default:
+		return false
+	}
 }
 
 func indexASCIIInsensitive(data []byte, needle []byte) int {
@@ -761,6 +1030,27 @@ func parseTriggerTargetTable(sql string) (string, string) {
 	owner := strings.TrimSuffix(matches[1], ".")
 	name := matches[2]
 	return unquoteIdentifier(owner), unquoteIdentifier(name)
+}
+
+func parseCreateRoutineName(sql string) (string, string, string) {
+	matches := createRoutineNamePattern.FindStringSubmatch(sql)
+	if len(matches) == 0 {
+		return "", "", ""
+	}
+	objectType := normalizeRoutineObjectType(matches[1])
+	owner := strings.TrimSuffix(matches[2], ".")
+	name := matches[3]
+	return objectType, unquoteIdentifier(owner), unquoteIdentifier(name)
+}
+
+func normalizeRoutineObjectType(objectType string) string {
+	objectType = strings.Join(strings.Fields(strings.ToUpper(strings.TrimSpace(objectType))), " ")
+	switch objectType {
+	case "PROCEDURE", "FUNCTION", "PACKAGE", "PACKAGE BODY":
+		return objectType
+	default:
+		return ""
+	}
 }
 
 func unquoteIdentifier(value string) string {

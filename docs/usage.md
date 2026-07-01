@@ -79,6 +79,7 @@ tables.tsv
 columns.tsv
 views.tsv
 sequences.tsv
+routines.tsv
 triggers.tsv
 synonyms.tsv
 tab_privs.tsv
@@ -91,7 +92,7 @@ DMDUL> load dictionary;
 ```
 
 加载后的 `dmdul_dict` 会真正参与后续恢复：DDL 和数据导出时，用户、表名、字段名、字段类型、
-默认值、表空间、存储组织、视图、序列、触发器、同义词和对象授权会优先使用文本字典中的内容；
+默认值、表空间、存储组织、视图、序列、存储过程/函数/包、触发器、同义词和对象授权会优先使用文本字典中的内容；
 `SYSTEM.DBF` 仍用于辅助定位索引、约束、分区和数据页等物理信息。Windows 下手工保存为带
 UTF-8 BOM 的 TSV 文件也可以正常读取。
 
@@ -204,7 +205,7 @@ DATABASE_ddl.sql
 DATABASE_data.sql
 ```
 
-`DATABASE_ddl.sql` 包含可识别用户、用户表、视图、同义词和表/视图授权 DDL；`DATABASE_data.sql`
+`DATABASE_ddl.sql` 包含可识别用户、用户表、视图、序列、存储过程/函数/包、触发器、同义词和表/视图/序列授权 DDL；`DATABASE_data.sql`
 包含所有可识别用户表的 INSERT 数据。
 
 如果 `data_format=csv`，`unload database` 会生成一个全库 DDL 文件，并按 owner/table
