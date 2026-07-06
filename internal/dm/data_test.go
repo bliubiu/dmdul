@@ -170,6 +170,105 @@ func TestCandidateMatchesFileKeepsMultiExtentPagesInSameFile(t *testing.T) {
 	}
 }
 
+func TestBuildStoragePagePlanWalksLeafChainFromRoot(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "MAIN.DBF")
+	raw := make([]byte, 32*8192)
+	putTestDMPageHeader(raw[16*8192:17*8192], 4, 0, 16, dmPageKindBTreeLeaf, 1038)
+	putTestDMPageRef(raw[16*8192:17*8192], dmPageNextRefOff, 0, 17)
+	putTestDMPageHeader(raw[17*8192:18*8192], 4, 0, 17, dmPageKindBTreeLeaf, 1038)
+	putTestDMNullPageRef(raw[17*8192:18*8192], dmPageNextRefOff)
+	if err := os.WriteFile(path, raw, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cache := newDataFilePageCache([]dataFileRef{{key: dataFileKey{groupID: 4, fileID: 0}, path: path}}, 8192)
+	plan := buildStoragePagePlan(indexDef{ID: 1038, GroupID: 4, RootFile: 0, RootPage: 16}, cache)
+	if len(plan) != 2 {
+		t.Fatalf("expected 2 planned pages, got %d", len(plan))
+	}
+	if !plan[dataPageRef{key: dataFileKey{groupID: 4, fileID: 0}, pageNo: 16}] || !plan[dataPageRef{key: dataFileKey{groupID: 4, fileID: 0}, pageNo: 17}] {
+		t.Fatalf("unexpected page plan: %+v", plan)
+	}
+}
+
+func TestBuildStoragePagePlanDescendsInternalRoot(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "MAIN.DBF")
+	raw := make([]byte, 64*8192)
+	putTestDMPageHeader(raw[16*8192:17*8192], 4, 0, 16, dmPageKindBTreeRoot, 1041)
+	binary.LittleEndian.PutUint32(raw[16*8192+dmBTreeLeftmostChildOff:], 20)
+	putTestDMPageHeader(raw[20*8192:21*8192], 4, 0, 20, dmPageKindBTreeLeaf, 1041)
+	putTestDMPageRef(raw[20*8192:21*8192], dmPageNextRefOff, 0, 21)
+	putTestDMPageHeader(raw[21*8192:22*8192], 4, 0, 21, dmPageKindBTreeLeaf, 1041)
+	putTestDMNullPageRef(raw[21*8192:22*8192], dmPageNextRefOff)
+	if err := os.WriteFile(path, raw, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cache := newDataFilePageCache([]dataFileRef{{key: dataFileKey{groupID: 4, fileID: 0}, path: path}}, 8192)
+	plan := buildStoragePagePlan(indexDef{ID: 1041, GroupID: 4, RootFile: 0, RootPage: 16}, cache)
+	if len(plan) != 2 {
+		t.Fatalf("expected 2 planned leaf pages, got %d", len(plan))
+	}
+	if plan[dataPageRef{key: dataFileKey{groupID: 4, fileID: 0}, pageNo: 16}] {
+		t.Fatalf("internal root should not be exported as a data page: %+v", plan)
+	}
+	if !plan[dataPageRef{key: dataFileKey{groupID: 4, fileID: 0}, pageNo: 20}] || !plan[dataPageRef{key: dataFileKey{groupID: 4, fileID: 0}, pageNo: 21}] {
+		t.Fatalf("unexpected page plan: %+v", plan)
+	}
+}
+
+func TestCandidateMatchesFileUsesPagePlanBeforeSegmentRange(t *testing.T) {
+	info := dataTableInfo{
+		table: dictionaryObject{ID: 1038, Owner: "SYSDBA", Name: "BIN_TEST2"},
+		pagePlan: map[dataPageRef]bool{
+			{key: dataFileKey{groupID: 5, fileID: 0}, pageNo: 144}: true,
+		},
+		pagePlanKnown: true,
+		segment: tableSegment{
+			fileID:       0,
+			headerPage:   16,
+			blocks:       16,
+			tablespaceID: 5,
+		},
+		segmentKnown: true,
+	}
+	file := dataFileRef{key: dataFileKey{groupID: 5, fileID: 0}}
+	if !candidateMatchesFile(info, file, 144) {
+		t.Fatal("exact page plan should take precedence over the old contiguous segment window")
+	}
+	if candidateMatchesFile(info, file, 145) {
+		t.Fatal("page outside the exact page plan should not match")
+	}
+	if candidateMatchesFile(info, dataFileRef{key: dataFileKey{groupID: 4, fileID: 0}}, 144) {
+		t.Fatal("segment identity check should still reject a different tablespace")
+	}
+}
+
+func TestCandidateMatchesFileRecoveryIgnoresCurrentSegmentWindow(t *testing.T) {
+	info := dataTableInfo{
+		table:           dictionaryObject{ID: 1066, Owner: "USERS1", Name: "T_TEST"},
+		recoveryMode:    true,
+		recoveryGroupID: 6,
+		segment: tableSegment{
+			fileID:       0,
+			headerPage:   16,
+			blocks:       16,
+			extents:      1,
+			tablespaceID: 6,
+		},
+		segmentKnown: true,
+	}
+	file := dataFileRef{key: dataFileKey{groupID: 6, fileID: 0}}
+	if !candidateMatchesFile(info, file, 180) {
+		t.Fatal("recovery mode should allow residual pages outside the current post-truncate segment window")
+	}
+	if candidateMatchesFile(info, dataFileRef{key: dataFileKey{groupID: 7, fileID: 0}}, 180) {
+		t.Fatal("recovery mode should still reject a different tablespace when group id is known")
+	}
+}
+
 func TestResolveDataFilesWithoutControlFileUsesPageHeaders(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "MAIN.DBF")
@@ -582,4 +681,23 @@ func putTestRow(page []byte, pos int, length int, flag byte) {
 func putTestDataPageSlot(page []byte, pageSize int, slotCount int, slotNo int, rowOff int) {
 	slotArrayStart := pageSize - pageSlotTrailerLen - slotCount*2
 	binary.LittleEndian.PutUint16(page[slotArrayStart+(slotNo-1)*2:], uint16(rowOff))
+}
+
+func putTestDMPageHeader(page []byte, groupID uint16, fileID uint16, pageNo uint32, kind uint32, storageID uint32) {
+	binary.LittleEndian.PutUint16(page[0:], groupID)
+	binary.LittleEndian.PutUint16(page[2:], fileID)
+	binary.LittleEndian.PutUint32(page[4:], pageNo)
+	binary.LittleEndian.PutUint32(page[dmPageKindOff:], kind)
+	binary.LittleEndian.PutUint32(page[dataPageAssistIndexOff:], storageID)
+}
+
+func putTestDMPageRef(page []byte, offset int, fileID uint16, pageNo uint32) {
+	binary.LittleEndian.PutUint16(page[offset:], fileID)
+	binary.LittleEndian.PutUint32(page[offset+2:], pageNo)
+}
+
+func putTestDMNullPageRef(page []byte, offset int) {
+	for i := 0; i < 6; i++ {
+		page[offset+i] = 0xFF
+	}
 }

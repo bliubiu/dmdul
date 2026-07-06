@@ -225,6 +225,15 @@ DMDUL> unload database;
 DMDUL> exit;
 ```
 
+DROP / TRUNCATE 后，如果原数据块还没有被新写入覆盖，可以用恢复扫描模式尝试抽取残留行：
+
+```text
+DMDUL> bootstrap;
+DMDUL> recover table USERS1.T_TEST;
+```
+
+DROP 后当前 `SYSTEM.DBF` 里可能已经没有表定义，需要先 `load dictionary;` 加载 DROP 前保存的 `dmdul_dict`，或人工在 `tables.tsv`、`columns.tsv` 中补齐表结构和 `storage_id/assist_ids`。
+
 说明：
 
 - `dm.ctl` 是可选增强文件。
@@ -296,6 +305,7 @@ dmdul export-ddl
 dmdul export-ddl -file oldpro\SYSTEM.DBF -ctl oldpro\dm.ctl -out oldpro\dm_offline_schema.sql
 dmdul export-ddl -file SYSTEM.DBF -ctl dm.ctl -out schema.sql -owner HR_TEST,SYSDBA -charset gb18030
 dmdul export-data -file oldpro\SYSTEM.DBF -ctl oldpro\dm.ctl -data-dir oldpro -out oldpro\dm_offline_data.sql
+dmdul export-data -file oldpro\SYSTEM.DBF -data-dir oldpro -table USERS1.T_TEST -recover -out oldpro\USERS1_T_TEST_recover.sql
 dmdul export-data -file SYSTEM.DBF -ctl dm.ctl -table SYSDBA.BIN_TEST2,SYSDBA.BIN_TEST2_CHILD
 dmdul scan-partitions -file SYSTEM.DBF -ctl dm.ctl -owner all
 ```

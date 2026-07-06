@@ -271,9 +271,13 @@ func writeDictionaryTables(path string, tables []DictionaryTable) error {
 			formatBoolField(table.Temporary),
 			table.Storage,
 			formatBoolField(table.Partitioned),
+			formatUint32Field(table.StorageID),
+			formatInt16Field(table.RootFile),
+			formatUint32Field(table.RootPage),
+			formatUint32ListField(table.AssistIDs),
 		})
 	}
-	return writeTSV(path, []string{"table_id", "owner", "table_name", "column_count", "tablespace", "group_id", "header_file", "header_block", "bytes", "blocks", "extents", "temporary", "storage", "partitioned"}, rows)
+	return writeTSV(path, []string{"table_id", "owner", "table_name", "column_count", "tablespace", "group_id", "header_file", "header_block", "bytes", "blocks", "extents", "temporary", "storage", "partitioned", "storage_id", "root_file", "root_page", "assist_ids"}, rows)
 }
 
 func writeDictionaryColumns(path string, columns []DictionaryColumn) error {
@@ -456,6 +460,12 @@ func readDictionaryTables(path string) ([]DictionaryTable, error) {
 			table.Temporary = parseBoolField(rec[11])
 			table.Storage = rec[12]
 			table.Partitioned = parseBoolField(rec[13])
+			if len(rec) >= 18 {
+				table.StorageID = parseUint32Field(rec[14])
+				table.RootFile = parseOptionalInt16Field(rec[15], -1)
+				table.RootPage = parseUint32Field(rec[16])
+				table.AssistIDs = parseUint32ListField(rec[17])
+			}
 			tables = append(tables, table)
 			continue
 		}
@@ -761,6 +771,29 @@ func formatUint32Field(value uint32) string {
 	return strconv.FormatUint(uint64(value), 10)
 }
 
+func formatInt16Field(value int16) string {
+	if value < 0 {
+		return ""
+	}
+	return strconv.FormatInt(int64(value), 10)
+}
+
+func formatUint32ListField(values []uint32) string {
+	if len(values) == 0 {
+		return ""
+	}
+	seen := make(map[uint32]bool, len(values))
+	var parts []string
+	for _, value := range values {
+		if value == 0 || seen[value] {
+			continue
+		}
+		seen[value] = true
+		parts = append(parts, strconv.FormatUint(uint64(value), 10))
+	}
+	return strings.Join(parts, ",")
+}
+
 func formatUint64Field(value uint64) string {
 	if value == 0 {
 		return ""
@@ -795,6 +828,26 @@ func parseUint32Field(value string) uint32 {
 	return uint32(parsed)
 }
 
+func parseUint32ListField(value string) []uint32 {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	seen := make(map[uint32]bool)
+	var result []uint32
+	for _, part := range strings.FieldsFunc(value, func(r rune) bool {
+		return r == ',' || r == ';' || r == ' ' || r == '\t'
+	}) {
+		id := parseUint32Field(part)
+		if id == 0 || seen[id] {
+			continue
+		}
+		seen[id] = true
+		result = append(result, id)
+	}
+	return result
+}
+
 func parseUint64Field(value string) uint64 {
 	value = strings.TrimSpace(value)
 	if value == "" {
@@ -817,6 +870,18 @@ func parseIntField(value string) int {
 		return 0
 	}
 	return parsed
+}
+
+func parseOptionalInt16Field(value string, emptyValue int16) int16 {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return emptyValue
+	}
+	parsed, err := strconv.ParseInt(value, 10, 16)
+	if err != nil {
+		return emptyValue
+	}
+	return int16(parsed)
 }
 
 func parseBoolField(value string) bool {

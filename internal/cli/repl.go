@@ -114,6 +114,8 @@ func (s *interactiveSession) execute(command string, stdout io.Writer) (bool, er
 		return false, s.executeList(fields[1:], stdout)
 	case "unload":
 		return false, s.executeUnload(fields[1:], stdout)
+	case "recover":
+		return false, s.executeRecover(fields[1:], stdout)
 	default:
 		return false, fmt.Errorf("unknown command %q", fields[0])
 	}
@@ -138,6 +140,8 @@ func printInteractiveHelp(stdout io.Writer) {
 	fmt.Fprintln(stdout, "      Export all tables for one owner to DDL plus SQL or per-table CSV data files.")
 	fmt.Fprintln(stdout, "  unload database;")
 	fmt.Fprintln(stdout, "      Export all recovered users and tables to DDL plus SQL or per-table CSV data files.")
+	fmt.Fprintln(stdout, "  recover table <owner.table_name>;")
+	fmt.Fprintln(stdout, "      Scan residual pages by storage/assist id for TRUNCATE/DROP table recovery.")
 	fmt.Fprintln(stdout, "  set system <SYSTEM.DBF path>;")
 	fmt.Fprintln(stdout, "  set data_dir <DBF directory>;")
 	fmt.Fprintln(stdout, "  set control <dm.ctl path>;")
@@ -147,6 +151,24 @@ func printInteractiveHelp(stdout io.Writer) {
 	fmt.Fprintln(stdout, "  set charset auto|utf-8|gb18030|gbk|euc-kr;")
 	fmt.Fprintln(stdout, "  show parameter;")
 	fmt.Fprintln(stdout, "  exit;")
+}
+
+func (s *interactiveSession) executeRecover(args []string, stdout io.Writer) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: recover table <owner.table_name>")
+	}
+	if err := s.ensureDictionaryLoaded(); err != nil {
+		return err
+	}
+	switch strings.ToLower(args[0]) {
+	case "table":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: recover table <owner.table_name>")
+		}
+		return s.recoverTable(args[1:], stdout)
+	default:
+		return fmt.Errorf("usage: recover table <owner.table_name>")
+	}
 }
 
 func (s *interactiveSession) executeSet(args []string, stdout io.Writer) error {
@@ -461,6 +483,72 @@ func (s *interactiveSession) unloadTable(args []string, stdout io.Writer) error 
 	fmt.Fprintf(stdout, "triggers exported: %d\n", ddl.TriggerCount)
 	fmt.Fprintf(stdout, "synonyms exported: %d\n", ddl.SynonymCount)
 	fmt.Fprintf(stdout, "tab privileges exported: %d\n", ddl.TabPrivilegeCount)
+	fmt.Fprintf(stdout, "rows exported: %d\n", data.RowsExported)
+	fmt.Fprintf(stdout, "rows failed: %d\n", data.RowsFailed)
+	return nil
+}
+
+func (s *interactiveSession) recoverTable(args []string, stdout io.Writer) error {
+	tableToken := args[0]
+	owner, tableName, ok := parseOwnerTableToken(tableToken)
+	if !ok {
+		return fmt.Errorf("usage: recover table <owner.table_name>")
+	}
+	table, ok := s.findTable(owner, tableName)
+	if !ok {
+		return fmt.Errorf("table %s not found in dictionary; load a pre-drop dictionary or add the table to dmdul_dict first", tableToken)
+	}
+	prefix := sanitizedFilePrefix(table.Owner + "_" + table.Name + "_recover")
+	if customPrefix, ok := optionalToPrefix(args[1:]); ok {
+		prefix = sanitizedFilePrefix(customPrefix)
+	}
+	ddlPath := s.outputPath(prefix + "_ddl.sql")
+	dataExt := "sql"
+	if s.dataFormat == "csv" {
+		dataExt = "csv"
+	}
+	dataPath := s.outputPath(prefix + "_data." + dataExt)
+	if err := s.ensureOutputDir(); err != nil {
+		return err
+	}
+	ddl, err := dm.ExportDDL(dm.DDLExportOptions{
+		SystemPath:     s.systemPath,
+		ControlPath:    s.controlPath,
+		ControlDULPath: s.effectiveControlDULPath(),
+		OutputPath:     ddlPath,
+		OwnerFilter:    table.Owner,
+		TableFilter:    table.Owner + "." + table.Name,
+		Charset:        s.charset,
+		Dictionary:     s.dictionary,
+	})
+	if err != nil {
+		return err
+	}
+	data, err := dm.ExportData(dm.DataExportOptions{
+		SystemPath:     s.systemPath,
+		ControlPath:    s.controlPath,
+		ControlDULPath: s.effectiveControlDULPath(),
+		DataDir:        s.effectiveDataDir(),
+		OutputPath:     dataPath,
+		OwnerFilter:    table.Owner,
+		TableFilter:    table.Owner + "." + table.Name,
+		ExcludeTables:  "",
+		Charset:        s.charset,
+		OutputFormat:   s.dataFormat,
+		RecoveryMode:   true,
+		Dictionary:     s.dictionary,
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(stdout, "recovery mode: on")
+	fmt.Fprintf(stdout, "ddl output: %s\n", ddl.OutputPath)
+	if s.dataFormat == "csv" && data.OutputPath == "" {
+		fmt.Fprintln(stdout, "data output: skipped (no rows)")
+	} else {
+		fmt.Fprintf(stdout, "data output: %s\n", data.OutputPath)
+	}
+	fmt.Fprintf(stdout, "tables exported: %d\n", ddl.TableCount)
 	fmt.Fprintf(stdout, "rows exported: %d\n", data.RowsExported)
 	fmt.Fprintf(stdout, "rows failed: %d\n", data.RowsFailed)
 	return nil

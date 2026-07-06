@@ -156,6 +156,15 @@ DMDUL> load dictionary;
 | `blocks`       | 段块数，对应 `DBA_SEGMENTS.BLOCKS`          |
 | `extents`      | extent 数量，对应 `DBA_SEGMENTS.EXTENTS`    |
 
+DROP / TRUNCATE 残留页恢复还会用到以下字段。新版本 `bootstrap` 会尽量自动写入；DROP 后如果只能从 trace 或人工记录中获得旧对象信息，也可以手工补齐：
+
+| 字段 | 含义 |
+| --- | --- |
+| `storage_id` | 主数据 storage/assist id，通常来自 `SYSINDEXES.ID` 或 trace 中的内部 index id |
+| `root_file` | storage root 所在文件号；未知时可留空 |
+| `root_page` | storage root 页号；未知时可留空 |
+| `assist_ids` | 候选 assist id 列表，多个值用逗号分隔，例如 `33555530,33555531` |
+
 v0.1.6 开始，`bootstrap` 会尝试通过 DBF 页头和 assist id 自动推断这些字段；如果自动推断不完整，可以人工参考在线 `DBA_SEGMENTS` 补齐。
 
 ## v0.1.6 对象字典文件

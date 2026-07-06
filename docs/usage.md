@@ -164,6 +164,30 @@ HR_TEST_EMP_INFO_ddl.sql
 HR_TEST_EMP_INFO_data.csv
 ```
 
+## DROP / TRUNCATE 残留页恢复
+
+`recover table` 用于在表被 `TRUNCATE` 或 `DROP` 后，数据块尚未被新写入覆盖时，扫描数据文件中的残留行。它会使用字典中的字段定义解码行，并按页头里的 storage/assist id 过滤候选页。
+
+TRUNCATE 场景中，表结构通常仍在当前 `SYSTEM.DBF` 中：
+
+```text
+DMDUL> bootstrap;
+DMDUL> recover table USERS1.T_TEST;
+```
+
+DROP 场景中，当前字典里可能已经没有表定义，需要先加载 DROP 前保存的 `dmdul_dict`，或人工在 `tables.tsv`、`columns.tsv` 中补齐表结构和 `storage_id/assist_ids`：
+
+```text
+DMDUL> load dictionary;
+DMDUL> recover table USERS1.T_TEST to users1_t_test_drop_recover;
+```
+
+一次性命令也支持恢复扫描：
+
+```powershell
+.\bin\dmdul.exe export-data -file D:\dm\SYSTEM.DBF -data-dir D:\dm -table USERS1.T_TEST -recover -out D:\dm\USERS1_T_TEST_recover.sql
+```
+
 ## 恢复一个用户
 
 ```text

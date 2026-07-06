@@ -35,6 +35,7 @@ type DataExportOptions struct {
 	OutputFormat        string
 	MaxRows             int
 	WriteFailedComments bool
+	RecoveryMode        bool
 	Dictionary          *DictionaryInfo
 }
 
@@ -77,13 +78,22 @@ type dataFileRef struct {
 	tablespaceName string
 }
 
+type dataPageRef struct {
+	key    dataFileKey
+	pageNo uint32
+}
+
 type dataTableInfo struct {
-	table        dictionaryObject
-	columns      []columnDef
-	storage      indexDef
-	storageKnown bool
-	segment      tableSegment
-	segmentKnown bool
+	table           dictionaryObject
+	columns         []columnDef
+	storage         indexDef
+	storageKnown    bool
+	pagePlan        map[dataPageRef]bool
+	pagePlanKnown   bool
+	recoveryMode    bool
+	recoveryGroupID uint32
+	segment         tableSegment
+	segmentKnown    bool
 }
 
 type tableSegment struct {
@@ -206,10 +216,18 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 
 	assistByParentID := assistIndexesByParentID(tables, indexObjects, indexes)
 	partitionsByTable := scanPartitionsByTable(systemData, pageSize, decoder, tables, ownerMatcher)
+	dataFiles, err := resolveDataFiles(opts.ControlPath, opts.ControlDULPath, dataDir)
+	if err != nil {
+		return nil, err
+	}
+	dataFilePages := newDataFilePageCache(dataFiles, pageSize)
 	selectedTables := make(map[uint32]dataTableInfo)
 	assistByID := make(map[uint32][]dataTableInfo)
 	neededFiles := make(map[dataFileKey]bool)
 	scanAllDataFiles := false
+	if opts.RecoveryMode {
+		scanAllDataFiles = true
+	}
 	for tableID, table := range tables {
 		if !ownerMatcher.allowed(table.Owner) || !tableMatcher.allowed(table.Owner, table.Name) || excludeMatcher.allowed(table.Owner, table.Name) {
 			continue
@@ -218,14 +236,21 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 			continue
 		}
 		baseInfo := dataTableInfo{
-			table:        table,
-			columns:      columnsByTable[tableID],
-			segment:      segmentByTableID(opts.Dictionary, tableID),
-			segmentKnown: hasSegmentRange(opts.Dictionary, tableID),
+			table:           table,
+			columns:         columnsByTable[tableID],
+			recoveryMode:    opts.RecoveryMode,
+			recoveryGroupID: dictionaryTableGroupID(dictionaryTables, tableID),
+			segment:         segmentByTableID(opts.Dictionary, tableID),
+			segmentKnown:    hasSegmentRange(opts.Dictionary, tableID),
 		}
 		selectedTables[tableID] = baseInfo
 		for _, storage := range assistByParentID[tableID] {
-			addKnownDataAssistID(assistByID, neededFiles, baseInfo, storage.ID, storage)
+			addKnownDataAssistID(assistByID, neededFiles, baseInfo, storage.ID, storage, buildStoragePagePlan(storage, dataFilePages))
+		}
+		if opts.RecoveryMode {
+			for _, assistID := range dictionaryDataAssistIDs(dictionaryTables, tableID) {
+				addRecoveryDataAssistID(assistByID, baseInfo, assistID)
+			}
 		}
 		if addHiddenIndexObjectAssistIDs(assistByID, baseInfo, tableID, indexObjects, indexes) {
 			scanAllDataFiles = true
@@ -235,7 +260,7 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 		}
 		for _, part := range partitionsByTable[tableID] {
 			for _, storage := range assistByParentID[part.PartTableID] {
-				addKnownDataAssistID(assistByID, neededFiles, baseInfo, storage.ID, storage)
+				addKnownDataAssistID(assistByID, neededFiles, baseInfo, storage.ID, storage, buildStoragePagePlan(storage, dataFilePages))
 			}
 			if addHiddenIndexObjectAssistIDs(assistByID, baseInfo, part.PartTableID, indexObjects, indexes) {
 				scanAllDataFiles = true
@@ -246,10 +271,6 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 		}
 	}
 
-	dataFiles, err := resolveDataFiles(opts.ControlPath, opts.ControlDULPath, dataDir)
-	if err != nil {
-		return nil, err
-	}
 	dataFiles = filterNeededDataFiles(dataFiles, neededFiles, scanAllDataFiles)
 
 	result := &DataExportResult{
@@ -403,19 +424,38 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 	return result, nil
 }
 
-func addKnownDataAssistID(assistByID map[uint32][]dataTableInfo, neededFiles map[dataFileKey]bool, info dataTableInfo, assistID uint32, storage indexDef) {
+func addKnownDataAssistID(assistByID map[uint32][]dataTableInfo, neededFiles map[dataFileKey]bool, info dataTableInfo, assistID uint32, storage indexDef, pagePlan map[dataPageRef]bool) {
 	if storage.RootFile < 0 {
 		return
 	}
 	info.storage = storage
 	info.storageKnown = true
+	if len(pagePlan) > 0 {
+		exactInfo := info
+		exactInfo.pagePlan = pagePlan
+		exactInfo.pagePlanKnown = true
+		addDataAssistCandidate(assistByID, assistID, exactInfo)
+		for ref := range pagePlan {
+			neededFiles[ref.key] = true
+		}
+	}
+	info.pagePlan = nil
+	info.pagePlanKnown = false
 	addDataAssistCandidate(assistByID, assistID, info)
-	key := dataFileKey{groupID: uint32(storage.GroupID), fileID: storage.RootFile}
-	neededFiles[key] = true
+	neededFiles[dataFileKey{groupID: uint32(storage.GroupID), fileID: storage.RootFile}] = true
 }
 
 func addUnknownDataAssistID(assistByID map[uint32][]dataTableInfo, info dataTableInfo, assistID uint32) bool {
 	info.storageKnown = false
+	before := len(assistByID[assistID])
+	addDataAssistCandidate(assistByID, assistID, info)
+	return len(assistByID[assistID]) > before
+}
+
+func addRecoveryDataAssistID(assistByID map[uint32][]dataTableInfo, info dataTableInfo, assistID uint32) bool {
+	info.recoveryMode = true
+	info.pagePlan = nil
+	info.pagePlanKnown = false
 	before := len(assistByID[assistID])
 	addDataAssistCandidate(assistByID, assistID, info)
 	return len(assistByID[assistID]) > before
@@ -426,7 +466,7 @@ func addDataAssistCandidate(assistByID map[uint32][]dataTableInfo, assistID uint
 		return
 	}
 	for _, existing := range assistByID[assistID] {
-		if existing.table.ID == info.table.ID && existing.storageKnown == info.storageKnown {
+		if existing.table.ID == info.table.ID && existing.storageKnown == info.storageKnown && existing.storage.ID == info.storage.ID && existing.pagePlanKnown == info.pagePlanKnown && existing.recoveryMode == info.recoveryMode {
 			return
 		}
 	}
@@ -499,7 +539,11 @@ func selectDataPageCandidate(candidates []dataTableInfo, file dataFileRef, pageN
 	if len(rows) == 0 {
 		return dataTableInfo{}, false
 	}
-	for _, candidate := range candidates {
+	ordered := append([]dataTableInfo(nil), candidates...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return dataCandidateRank(ordered[i]) < dataCandidateRank(ordered[j])
+	})
+	for _, candidate := range ordered {
 		if !candidateMatchesFile(candidate, file, pageNo) {
 			continue
 		}
@@ -522,12 +566,36 @@ func selectDataPageCandidate(candidates []dataTableInfo, file dataFileRef, pageN
 	return dataTableInfo{}, false
 }
 
+func dataCandidateRank(info dataTableInfo) int {
+	switch {
+	case info.pagePlanKnown:
+		return 0
+	case info.recoveryMode:
+		return 1
+	case info.segmentKnown:
+		return 2
+	case info.storageKnown:
+		return 3
+	default:
+		return 4
+	}
+}
+
 func candidateMatchesFile(info dataTableInfo, file dataFileRef, pageNo uint32) bool {
-	if info.segmentKnown {
-		if uint32(info.segment.fileID) != uint32(file.key.fileID) {
+	if info.pagePlanKnown {
+		if len(info.pagePlan) == 0 || !info.pagePlan[dataPageRef{key: file.key, pageNo: pageNo}] {
 			return false
 		}
-		if info.segment.tablespaceID != 0 && info.segment.tablespaceID != file.key.groupID {
+		if info.recoveryMode {
+			return candidateMatchesRecoveryFile(info, file)
+		}
+		return candidateMatchesSegmentIdentity(info, file)
+	}
+	if info.recoveryMode {
+		return candidateMatchesRecoveryFile(info, file)
+	}
+	if info.segmentKnown {
+		if !candidateMatchesSegmentIdentity(info, file) {
 			return false
 		}
 		if info.segment.blocks > 0 && info.segment.extents <= 1 {
@@ -542,6 +610,33 @@ func candidateMatchesFile(info dataTableInfo, file dataFileRef, pageNo uint32) b
 		return true
 	}
 	return uint32(info.storage.GroupID) == file.key.groupID && info.storage.RootFile == file.key.fileID
+}
+
+func candidateMatchesRecoveryFile(info dataTableInfo, file dataFileRef) bool {
+	groupID := info.recoveryGroupID
+	if groupID == 0 && info.segmentKnown {
+		groupID = info.segment.tablespaceID
+	}
+	if groupID == 0 && info.storageKnown {
+		groupID = uint32(info.storage.GroupID)
+	}
+	if groupID != 0 && file.key.groupID != groupID {
+		return false
+	}
+	return true
+}
+
+func candidateMatchesSegmentIdentity(info dataTableInfo, file dataFileRef) bool {
+	if !info.segmentKnown {
+		return true
+	}
+	if uint32(info.segment.fileID) != uint32(file.key.fileID) {
+		return false
+	}
+	if info.segment.tablespaceID != 0 && info.segment.tablespaceID != file.key.groupID {
+		return false
+	}
+	return true
 }
 
 func segmentByTableID(dict *DictionaryInfo, tableID uint32) tableSegment {
@@ -579,6 +674,36 @@ func hasSegmentRange(dict *DictionaryInfo, tableID uint32) bool {
 
 func dictionaryTableHasSegment(table DictionaryTable) bool {
 	return table.HeaderBlock > 0 && table.Blocks > 0
+}
+
+func dictionaryTableGroupID(tables map[uint32]DictionaryTable, tableID uint32) uint32 {
+	table, ok := tables[tableID]
+	if !ok {
+		return 0
+	}
+	return table.GroupID
+}
+
+func dictionaryDataAssistIDs(tables map[uint32]DictionaryTable, tableID uint32) []uint32 {
+	table, ok := tables[tableID]
+	if !ok {
+		return nil
+	}
+	seen := make(map[uint32]bool)
+	var result []uint32
+	add := func(id uint32) {
+		if id == 0 || seen[id] {
+			return
+		}
+		seen[id] = true
+		result = append(result, id)
+	}
+	add(table.StorageID)
+	for _, id := range table.AssistIDs {
+		add(id)
+	}
+	add(tableDataAssistID(tableID))
+	return result
 }
 
 func initDataTableRowStats(tables map[uint32]dataTableInfo) map[uint32]*DataTableRowCount {

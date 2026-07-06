@@ -48,7 +48,7 @@ func TestRunInteractiveHelpAndExit(t *testing.T) {
 		t.Fatalf("RunInteractive returned error: %v", err)
 	}
 	output := stdout.String()
-	for _, want := range []string{"dmdul: Release v0.1.2", "Copyright (c) 2026 greatfinish", "https://github.com/greatfinish/dmdul", "DMDUL>", "bootstrap;", "list user;", "unload table", "unload database", "bye"} {
+	for _, want := range []string{"dmdul: Release v0.1.2", "Copyright (c) 2026 greatfinish", "https://github.com/greatfinish/dmdul", "DMDUL>", "bootstrap;", "list user;", "unload table", "unload database", "recover table", "bye"} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("interactive output should contain %q, got %q", want, output)
 		}

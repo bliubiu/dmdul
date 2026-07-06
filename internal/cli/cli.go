@@ -299,6 +299,7 @@ func runExportData(args []string, stdout io.Writer, stderr io.Writer) error {
 	var charset string
 	var maxRows int
 	var failedComments bool
+	var recoveryMode bool
 	fs.StringVar(&systemPath, "file", defaultExportSystemPath, "SYSTEM.DBF path")
 	fs.StringVar(&ctlPath, "ctl", "", "optional dm.ctl path; uses SYSTEM.DBF directory default only when present")
 	fs.StringVar(&ignoredIniPath, "ini", "", "deprecated; ignored")
@@ -311,6 +312,7 @@ func runExportData(args []string, stdout io.Writer, stderr io.Writer) error {
 	fs.StringVar(&charset, "charset", "auto", "dictionary and row text charset: auto, utf-8, gb18030, gbk, euc-kr")
 	fs.IntVar(&maxRows, "max-rows", 0, "maximum rows to process; 0 means unlimited")
 	fs.BoolVar(&failedComments, "failed-comments", false, "write failed row diagnostics as SQL comments")
+	fs.BoolVar(&recoveryMode, "recover", false, "scan residual data pages for dropped/truncated table recovery")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -337,6 +339,7 @@ func runExportData(args []string, stdout io.Writer, stderr io.Writer) error {
 		Charset:             charset,
 		MaxRows:             maxRows,
 		WriteFailedComments: failedComments,
+		RecoveryMode:        recoveryMode,
 	})
 	if err != nil {
 		return err
@@ -352,6 +355,9 @@ func runExportData(args []string, stdout io.Writer, stderr io.Writer) error {
 	fmt.Fprintf(stdout, "assist indexes selected: %d\n", result.AssistIndexCount)
 	fmt.Fprintf(stdout, "data files scanned: %d\n", result.DataFileCount)
 	fmt.Fprintf(stdout, "pages scanned: %d\n", result.PagesScanned)
+	if recoveryMode {
+		fmt.Fprintln(stdout, "recovery mode: on")
+	}
 	fmt.Fprintf(stdout, "rows located: %d\n", result.RowsLocated)
 	fmt.Fprintf(stdout, "rows exported: %d\n", result.RowsExported)
 	fmt.Fprintf(stdout, "rows failed: %d\n", result.RowsFailed)

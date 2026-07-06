@@ -68,6 +68,10 @@ type DictionaryTable struct {
 	Temporary   bool
 	Storage     string
 	Partitioned bool
+	StorageID   uint32
+	RootFile    int16
+	RootPage    uint32
+	AssistIDs   []uint32
 }
 
 type DictionaryColumn struct {
@@ -251,6 +255,7 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 
 	tablespaces := loadTablespaceNames(opts.ControlPath, opts.ControlDULPath)
 	tableStorage := tableStorageByID(tables, indexObjects, indexes, tablespaces)
+	assistByParentID := assistIndexesByParentID(tables, indexObjects, indexes)
 	partitionsByTable := scanPartitionsByTable(data, pageSize, decoder, tables, ownerMatcher)
 	var tableList []DictionaryTable
 	userNamesByName := make(map[string]DictionaryUser)
@@ -267,6 +272,7 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 			groupID = uint32(storage.GroupID)
 			tablespace = tablespaces[groupID]
 		}
+		storageID, rootFile, rootPage, assistIDs := dictionaryTableStorageSnapshot(id, tableStorage, assistByParentID)
 		tableList = append(tableList, DictionaryTable{
 			ID:          table.ID,
 			Owner:       table.Owner,
@@ -277,6 +283,10 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 			Temporary:   table.isTemporaryTable(),
 			Storage:     table.tableStorageOrganization(),
 			Partitioned: len(partitionsByTable[id]) > 0,
+			StorageID:   storageID,
+			RootFile:    rootFile,
+			RootPage:    rootPage,
+			AssistIDs:   assistIDs,
 		})
 		if _, ok := userNamesByName[strings.ToUpper(table.Owner)]; !ok {
 			userNamesByName[strings.ToUpper(table.Owner)] = DictionaryUser{Name: table.Owner}
@@ -358,4 +368,36 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 		Synonyms:          synonymList,
 		TabPrivileges:     tabPrivilegeList,
 	}, nil
+}
+
+func dictionaryTableStorageSnapshot(tableID uint32, tableStorage map[uint32]indexDef, assistByParentID map[uint32][]indexDef) (uint32, int16, uint32, []uint32) {
+	var primary indexDef
+	if storage, ok := tableStorage[tableID]; ok {
+		primary = storage
+	} else if assists := assistByParentID[tableID]; len(assists) > 0 {
+		primary = assists[0]
+	}
+	rootFile := int16(-1)
+	if primary.RootFile >= 0 {
+		rootFile = primary.RootFile
+	}
+	var rootPage uint32
+	if primary.RootPage >= 0 {
+		rootPage = uint32(primary.RootPage)
+	}
+	seen := make(map[uint32]bool)
+	var assistIDs []uint32
+	add := func(id uint32) {
+		if id == 0 || seen[id] {
+			return
+		}
+		seen[id] = true
+		assistIDs = append(assistIDs, id)
+	}
+	add(primary.ID)
+	for _, storage := range assistByParentID[tableID] {
+		add(storage.ID)
+	}
+	add(tableDataAssistID(tableID))
+	return primary.ID, rootFile, rootPage, assistIDs
 }
