@@ -202,7 +202,7 @@ unload database
 导入测试库验证
 ```
 
-详细流程见：[离线恢复流程](https://chatgpt.com/c/docs/recovery-workflow.md)。
+详细流程见：[离线恢复流程](https://github.com/greatfinish/dmdul/blob/main/docs/recovery-workflow.md)。
 
 ------
 
@@ -414,14 +414,14 @@ go build -ldflags "-s -w" -o bin/dmdul ./cmd/dmdul
 
 ## 文档
 
-- [安装方式](https://chatgpt.com/c/docs/install.md)
-- [使用示例](https://chatgpt.com/c/docs/usage.md)
-- [配置和参数说明](https://chatgpt.com/c/docs/config.md)
-- [离线恢复流程](https://chatgpt.com/c/docs/recovery-workflow.md)
-- [本地开发、测试、构建说明](https://chatgpt.com/c/docs/development.md)
-- [版本变更记录](https://chatgpt.com/c/CHANGELOG.md)
-- [逆向扫描笔记](https://chatgpt.com/c/docs/offline-system-scan.md)
-- [系统字典字段笔记](https://chatgpt.com/c/docs/system-dictionary-fields.md)
+- [安装方式](https://github.com/greatfinish/dmdul/blob/main/docs/install.md)
+- [使用示例](https://github.com/greatfinish/dmdul/blob/main/docs/usage.md)
+- [配置和参数说明](https://github.com/greatfinish/dmdul/blob/main/docs/config.md)
+- [离线恢复流程](https://github.com/greatfinish/dmdul/blob/main/docs/recovery-workflow.md)
+- [本地开发、测试、构建说明](https://github.com/greatfinish/dmdul/blob/main/docs/development.md)
+- [版本变更记录](https://github.com/greatfinish/dmdul/blob/main/CHANGELOG.md)
+- [逆向扫描笔记](https://github.com/greatfinish/dmdul/blob/main/docs/offline-system-scan.md)
+- [系统字典字段笔记](https://github.com/greatfinish/dmdul/blob/main/docs/system-dictionary-fields.md)
 
 ------
 
