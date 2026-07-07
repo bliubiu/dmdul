@@ -24,6 +24,11 @@
 - 支持 DROP / TRUNCATE 后残留页扫描：`recover table <owner.table_name>;`
 - 支持 Windows 和 Linux x86_64 发布包。
 - 表数据定位优先使用 `storage root -> internal page refs -> leaf chain`，再回退到段范围扫描和全文件救援扫描。
+- 支持 `STORAGE(USING LONG ROW)` 表的初步恢复。
+- 支持 21 字节 LOB locator 解析。
+- 支持从当前活动行出发追踪 `0x20` LOB 页和 `0x22` Long Row 页。
+- 行 NULL metadata 优先使用显式 2-bit 解码，旧启发式解析作为兜底。
+- 初步增强 `REAL`、`FLOAT`、`DOUBLE`、`TIME`、带时区时间、`INTERVAL`、`ROWID` 等基础类型解析。
 
 ------
 
@@ -42,29 +47,32 @@
 
 ## 支持能力概览
 
-| 能力                        | 状态       | 说明                                                        |
-| --------------------------- | ---------- | ----------------------------------------------------------- |
-| `SYSTEM.DBF` 基础解析       | ✅ 支持     | 页大小、簇大小、页数、字符集标记                            |
-| `dm.ctl` 解析               | ✅ 支持     | 数据库名、表空间名、数据文件路径                            |
-| `control.dul` 生成          | ✅ 支持     | 自动记录表空间号、文件号、表空间名和数据文件路径            |
-| `dmdul_dict` 字典落盘       | ✅ 支持     | 生成可人工修正的 TSV 文本字典                               |
-| 用户和角色授权              | ✅ 支持     | `CREATE USER`、`GRANT role TO user`                         |
-| 表结构                      | ✅ 支持     | 字段、类型、默认值、临时表、堆表、树表                      |
-| 索引和约束                  | ✅ 支持     | 主键、唯一、外键、CHECK、普通索引                           |
-| 注释                        | ✅ 支持     | 表注释、字段注释                                            |
-| 分区表 DDL                  | ✅ 初步支持 | RANGE / LIST / HASH 分区表                                  |
-| 视图                        | ✅ 支持     | `CREATE OR REPLACE VIEW`                                    |
-| 序列                        | ✅ 支持     | `CREATE SEQUENCE`                                           |
-| 存储过程 / 函数 / 包 / 包体 | ✅ 支持     | `CREATE OR REPLACE PROCEDURE/FUNCTION/PACKAGE/PACKAGE BODY` |
-| 触发器                      | ✅ 支持     | `CREATE OR REPLACE TRIGGER`                                 |
-| 同义词                      | ✅ 支持     | `CREATE OR REPLACE SYNONYM`                                 |
-| 对象授权                    | ✅ 支持     | 表、视图、序列授权                                          |
-| 表数据导出                  | ✅ 支持     | INSERT SQL 或 CSV                                           |
-| 行内小 LOB                  | ✅ 初步支持 | 小 CLOB/TEXT、BLOB/IMAGE                                    |
-| ALTER TABLE 后历史行        | ✅ 支持     | 新增尾列可补 `NULL`                                         |
-| DROP / TRUNCATE 残留页恢复  | ✅ 初步支持 | 前提是原数据页未被覆盖                                      |
-| 行外大 LOB                  | 🚧 验证中   | 后续版本继续增强                                            |
-| 迁移行 / 链式行             | 🚧 验证中   | 复杂场景仍需继续验证                                        |
+| 能力                        | 状态       | 说明                                                         |
+| --------------------------- | ---------- | ------------------------------------------------------------ |
+| `SYSTEM.DBF` 基础解析       | ✅ 支持     | 页大小、簇大小、页数、字符集标记                             |
+| `dm.ctl` 解析               | ✅ 支持     | 数据库名、表空间名、数据文件路径                             |
+| `control.dul` 生成          | ✅ 支持     | 自动记录表空间号、文件号、表空间名和数据文件路径             |
+| `dmdul_dict` 字典落盘       | ✅ 支持     | 生成可人工修正的 TSV 文本字典                                |
+| 用户和角色授权              | ✅ 支持     | `CREATE USER`、`GRANT role TO user`                          |
+| 表结构                      | ✅ 支持     | 字段、类型、默认值、临时表、堆表、树表                       |
+| 索引和约束                  | ✅ 支持     | 主键、唯一、外键、CHECK、普通索引                            |
+| 注释                        | ✅ 支持     | 表注释、字段注释                                             |
+| 分区表 DDL                  | ✅ 初步支持 | RANGE / LIST / HASH 分区表                                   |
+| 视图                        | ✅ 支持     | `CREATE OR REPLACE VIEW`                                     |
+| 序列                        | ✅ 支持     | `CREATE SEQUENCE`                                            |
+| 存储过程 / 函数 / 包 / 包体 | ✅ 支持     | `CREATE OR REPLACE PROCEDURE/FUNCTION/PACKAGE/PACKAGE BODY`  |
+| 触发器                      | ✅ 支持     | `CREATE OR REPLACE TRIGGER`                                  |
+| 同义词                      | ✅ 支持     | `CREATE OR REPLACE SYNONYM`                                  |
+| 对象授权                    | ✅ 支持     | 表、视图、序列授权                                           |
+| 表数据导出                  | ✅ 支持     | INSERT SQL 或 CSV                                            |
+| 行内小 LOB                  | ✅ 初步支持 | 小 CLOB/TEXT、BLOB/IMAGE                                     |
+| ALTER TABLE 后历史行        | ✅ 支持     | 新增尾列可补 `NULL`                                          |
+| DROP / TRUNCATE 残留页恢复  | ✅ 初步支持 | 前提是原数据页未被覆盖                                       |
+| 行外 LOB / Long Row         | ✅ 初步支持 | 支持 21 字节 locator，按当前行追踪 `0x20` LOB 页和 `0x22` Long Row 页 |
+| 行 NULL metadata            | ✅ 支持     | 优先使用显式 2-bit metadata 解码，失败后回退旧启发式路径     |
+| 基础类型解析                | ✅ 增强     | 初步支持 REAL/FLOAT/DOUBLE、TIME、带时区时间、INTERVAL、ROWID |
+
+
 
 ------
 
@@ -470,6 +478,7 @@ dul.log
 - DROP / TRUNCATE 残留页恢复依赖原数据页是否被覆盖，不能保证一定成功。
 - 行外大 LOB、迁移行、链式行、复杂损坏页仍在持续验证。
 - 不保证恢复结果与故障前数据库在事务一致性层面完全一致。
+- Long Row / 行外 LOB 当前为初步支持，复杂 LOB 页链、损坏页、多版本残留页、特殊字符集和更多数据类型样例仍需继续验证。
 
 ------
 
