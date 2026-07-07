@@ -1,223 +1,145 @@
 # dmdul
 
-**达梦数据库离线抽取工具 / Offline Dameng Database Extraction Helper**
+**Dameng Database Offline Recovery & Data Unloader**
+**达梦数据库离线恢复与数据抽取工具**
 
-用于数据库实例无法正常启动时，基于 `SYSTEM.DBF`、`dm.ctl` 和用户表空间 DBF 文件，离线解析系统字典、导出建表 DDL，并尽量从数据文件中抽取用户表数据。
+`dmdul` 是一个使用 Go 编写的达梦数据库离线恢复工具。它面向数据库实例无法正常启动、常规恢复手段不可用、但仍能取得 `SYSTEM.DBF`、`dm.ctl` 和用户表空间 DBF 文件的场景，用于离线解析系统字典、恢复对象 DDL，并尽量从数据文件中抽取用户表数据。
 
 ![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go)
 ![License](https://img.shields.io/github/license/greatfinish/dmdul)
 ![Release](https://img.shields.io/github/v/release/greatfinish/dmdul)
 ![Stars](https://img.shields.io/github/stars/greatfinish/dmdul?style=social)
 
+> `dmdul` 不是常规备份恢复工具，也不能替代 DMRMAN、归档恢复、闪回或专业数据恢复流程。它更适合作为极端故障场景下的最后手段。所有导出的 SQL 和数据都必须先在测试库验证。
+
 ------
 
-## 项目定位
+## 核心能力
 
-`dmdul` 是一个使用 Go 编写的达梦数据库离线救援工具，目标是在数据库实例无法正常 `open`、常规恢复手段不可用、但仍能取得 DBF 文件的情况下，尽量从离线数据文件中恢复元数据和业务数据。
-
-它不是常规备份恢复工具，也不能替代 DMRMAN、归档日志恢复、数据库闪回或专业数据恢复流程。它更适合在极端故障场景下作为最后手段，用于辅助恢复 DDL 和部分用户表数据。
-
-> 当前项目仍处于逆向验证和早期可用阶段。请先在测试环境验证导出的 SQL 和数据，再用于正式恢复流程。离线抽取结果可能存在逻辑不一致，不能保证 100% 成功。
+- 离线解析 `SYSTEM.DBF`、`dm.ctl` 和用户表空间 DBF 文件。
+- 生成 `dmdul_dict` 文本字典，支持人工修正后再次参与恢复。
+- 支持整库恢复命令：`unload database;`
+- 支持单用户恢复：`unload user <owner>;`
+- 支持单表恢复：`unload table <owner.table_name>;`
+- 支持 DROP / TRUNCATE 后残留页扫描：`recover table <owner.table_name>;`
+- 支持 Windows 和 Linux x86_64 发布包。
+- 表数据定位优先使用 `storage root -> internal page refs -> leaf chain`，再回退到段范围扫描和全文件救援扫描。
 
 ------
 
 ## 适用场景
 
-常见适用场景：
-
-| 场景               | 说明                                           |
-| ------------------ | ---------------------------------------------- |
-| 数据库无法 `open`  | 实例无法正常启动，但数据文件仍可读取           |
-| SYSTEM 表空间仍在  | 可以尝试解析系统字典和对象元数据               |
-| 控制文件或日志异常 | `dm.ctl`、REDO、ROLL 等异常导致常规恢复失败    |
-| 只剩 DBF 文件      | 需要尽量从数据文件中抽取业务表数据             |
-| 部分数据块损坏     | 大部分数据页仍可读时，可尝试按页扫描恢复       |
-| 需要恢复 DDL       | 离线生成用户、表、字段、索引、约束、注释等 DDL |
+| 场景                   | 说明                                                         |
+| ---------------------- | ------------------------------------------------------------ |
+| 数据库无法 `open`      | 实例无法正常启动，但 DBF 文件仍可读取                        |
+| 常规恢复失败           | 控制文件、ROLL、REDO、归档链路异常，DMRMAN 无法完成恢复      |
+| 只剩数据文件           | 仍可尝试从 `SYSTEM.DBF` 和用户表空间文件恢复对象和数据       |
+| 部分数据块损坏         | 大部分页仍可读时，可尝试按页扫描恢复                         |
+| DROP / TRUNCATE 后救援 | 原数据块未被覆盖时，可尝试残留页恢复                         |
+| 需要恢复 DDL           | 可离线导出用户、表、视图、序列、过程、函数、包、触发器、同义词、授权等对象 |
 
 ------
 
-## 功能预览
+## 支持能力概览
 
-~~~markdown
-## 当前核心能力
-
-- 支持 `unload database;` 整库离线导出。
-- 支持从 `dmdul_dict` 字典文件驱动 DDL 和数据恢复。
-- `bootstrap` 可生成并补充 `tables.tsv` 段定位字段，并落盘视图、序列、存储过程/函数/包、触发器、同义词和对象授权字典。
-- 支持基于 `header_file/header_block/blocks` 缩小数据页扫描范围。
-- 支持恢复视图、序列、存储过程/函数/包、触发器、同义词和对象授权。
-- 修复相同表名不同 owner 时可能串表的问题。
-~~~
-
-| 能力                  | 状态       | 说明                                 |
-| --------------------- | ---------- | ------------------------------------ |
-| `SYSTEM.DBF` 基础解析 | ✅ 支持     | 识别页大小、簇大小、页数、字符集标记 |
-| `dm.ctl` 解析         | ✅ 支持     | 识别数据库名、表空间名、数据文件路径 |
-| 用户 DDL 导出         | ✅ 支持     | 用户、表、字段、序列、存储过程/函数/包、触发器、索引、约束、注释 |
-| 普通表数据导出        | ✅ 支持     | 导出为 INSERT SQL 或 CSV             |
-| 字符集处理            | ✅ 支持     | UTF-8、GB18030/GBK、EUC-KR           |
-| 交互式 DUL 模式       | ✅ 支持     | 提供类似 Oracle DUL 的交互式命令     |
-| 分区表识别            | ✅ 初步支持 | RANGE / LIST / HASH 分区表 DDL       |
-| 行内小 LOB            | ✅ 初步支持 | 小 CLOB/TEXT、BLOB/IMAGE 行内值      |
-| 行外大 LOB            | 🚧 验证中   | 后续版本继续增强                     |
-| 迁移行 / 链式行       | 🚧 验证中   | 复杂场景仍需继续验证                 |
+| 能力                        | 状态       | 说明                                                        |
+| --------------------------- | ---------- | ----------------------------------------------------------- |
+| `SYSTEM.DBF` 基础解析       | ✅ 支持     | 页大小、簇大小、页数、字符集标记                            |
+| `dm.ctl` 解析               | ✅ 支持     | 数据库名、表空间名、数据文件路径                            |
+| `control.dul` 生成          | ✅ 支持     | 自动记录表空间号、文件号、表空间名和数据文件路径            |
+| `dmdul_dict` 字典落盘       | ✅ 支持     | 生成可人工修正的 TSV 文本字典                               |
+| 用户和角色授权              | ✅ 支持     | `CREATE USER`、`GRANT role TO user`                         |
+| 表结构                      | ✅ 支持     | 字段、类型、默认值、临时表、堆表、树表                      |
+| 索引和约束                  | ✅ 支持     | 主键、唯一、外键、CHECK、普通索引                           |
+| 注释                        | ✅ 支持     | 表注释、字段注释                                            |
+| 分区表 DDL                  | ✅ 初步支持 | RANGE / LIST / HASH 分区表                                  |
+| 视图                        | ✅ 支持     | `CREATE OR REPLACE VIEW`                                    |
+| 序列                        | ✅ 支持     | `CREATE SEQUENCE`                                           |
+| 存储过程 / 函数 / 包 / 包体 | ✅ 支持     | `CREATE OR REPLACE PROCEDURE/FUNCTION/PACKAGE/PACKAGE BODY` |
+| 触发器                      | ✅ 支持     | `CREATE OR REPLACE TRIGGER`                                 |
+| 同义词                      | ✅ 支持     | `CREATE OR REPLACE SYNONYM`                                 |
+| 对象授权                    | ✅ 支持     | 表、视图、序列授权                                          |
+| 表数据导出                  | ✅ 支持     | INSERT SQL 或 CSV                                           |
+| 行内小 LOB                  | ✅ 初步支持 | 小 CLOB/TEXT、BLOB/IMAGE                                    |
+| ALTER TABLE 后历史行        | ✅ 支持     | 新增尾列可补 `NULL`                                         |
+| DROP / TRUNCATE 残留页恢复  | ✅ 初步支持 | 前提是原数据页未被覆盖                                      |
+| 行外大 LOB                  | 🚧 验证中   | 后续版本继续增强                                            |
+| 迁移行 / 链式行             | 🚧 验证中   | 复杂场景仍需继续验证                                        |
 
 ------
 
 ## 下载
 
-| Platform    | Package                                     |
-| ----------- | ------------------------------------------- |
-| Windows x64 | Releases -> dmdul_windows_amd64_v0.2.0.zip  |
-| Linux x64   | Releases -> dmdul_linux_amd64_v0.2.0.tar.gz |
+请从 [Releases](https://github.com/greatfinish/dmdul/releases) 下载最新版本。
 
-## 当前能力
+| 平台        | 包名                                 |
+| ----------- | ------------------------------------ |
+| Windows x64 | `dmdul_windows_amd64_<version>.zip`  |
+| Linux x64   | `dmdul_linux_amd64_<version>.tar.gz` |
 
-### 离线字典解析
-
-- 读取 `SYSTEM.DBF` 基础信息：
-  - 页大小
-  - 簇大小
-  - 页数
-  - 字符集标记
-- 可选解析 `dm.ctl`：
-  - 数据库名
-  - 表空间名
-  - 数据文件路径
-- 扫描 `data_dir` 下 DBF 页头，辅助生成 `control.dul`。
-- `bootstrap` 会把字典摘要写入 `dmdul_dict` 文本目录，便于再次启动快速加载和人工修正；修正后的文本字典会参与后续 DDL 和数据导出。当前会落盘 `users.tsv`、`tables.tsv`、`columns.tsv`、`views.tsv`、`sequences.tsv`、`routines.tsv`、`triggers.tsv`、`synonyms.tsv`、`tab_privs.tsv`。
-- `bootstrap` 会把识别到的数据库字符集回写到 `init.dul` 的 `charset` 参数。
-
-### DDL 导出
-
-支持离线导出用户表 DDL：
-
-- 普通用户 `CREATE USER`
-- 角色授权 `GRANT role TO user`
-- 表结构
-- 视图 `CREATE OR REPLACE VIEW`
-- 序列 `CREATE SEQUENCE`
-- 存储过程、函数、包、包体 `CREATE OR REPLACE PROCEDURE/FUNCTION/PACKAGE`
-- 触发器 `CREATE OR REPLACE TRIGGER`
-- 同义词 `CREATE OR REPLACE SYNONYM`
-- 表/视图/序列授权 `GRANT privilege ON object TO grantee`
-- 字段名、字段类型、默认值
-- 索引
-- 主键
-- 唯一约束
-- 外键
-- CHECK 约束
-- 表注释
-- 字段注释
-- 临时表
-- 堆表 / NOBRANCH
-- 树表 / CLUSTERBTR
-- RANGE / LIST / HASH 分区表建表语句
-
-### 数据导出
-
-支持离线导出普通用户表数据：
-
-- 输出为 `INSERT INTO`
-- 输出为 CSV
-- 支持常见整数类型
-- 支持 `NUMBER` / `DECIMAL`
-- 支持 `DATE`
-- 支持 `DATETIME` / `TIMESTAMP`
-- 支持 `VARCHAR` / `VARCHAR2`
-- 支持行内小 `CLOB` / `TEXT`
-- 支持行内小 `BLOB` / `IMAGE`
-- `BLOB` 导出为 `HEXTORAW('...')`
-- 支持 CLUSTERBTR 树表和 NOBRANCH 堆表的普通行
-
-### 交互式命令
-
-提供类似 Oracle DUL 的交互式命令行：
-
-```text
-bootstrap;
-load dictionary;
-list user;
-list table <owner>;
-unload table <owner.table_name>;
-unload user <owner>;
-unload database;
-exit;
-```
-
-### 研究辅助命令
-
-提供以下辅助命令：
-
-```text
-inspect
-inspect-ctl
-scan-system
-scan-partitions
-export-ddl
-export-data
-version
-help
-```
-
-------
-
-## 安装与构建
-
-### 环境要求
-
-- Go 1.22+
-- Windows / Linux / macOS
-- 可读取的达梦 DBF 文件
-- 可选：`dm.ctl`
-
-### 从源码构建
-
-```powershell
-git clone https://github.com/greatfinish/dmdul.git
-cd dmdul
-
-go test ./...
-go build -o .\bin\dmdul.exe .\cmd\dmdul
-```
-
-Linux / macOS：
-
-```bash
-git clone https://github.com/greatfinish/dmdul.git
-cd dmdul
-
-go test ./...
-go build -o ./bin/dmdul ./cmd/dmdul
-```
-
-### 查看帮助
+下载后建议校验 Release 页面提供的 SHA256。
 
 Windows：
 
 ```powershell
-.\bin\dmdul.exe --help
+Get-FileHash .\dmdul_windows_amd64_<version>.zip -Algorithm SHA256
 ```
 
-Linux / macOS：
+Linux：
 
 ```bash
-./bin/dmdul --help
+sha256sum dmdul_linux_amd64_<version>.tar.gz
+```
+
+查看版本：
+
+```bash
+./dmdul version
+```
+
+或 Windows：
+
+```powershell
+.\dmdul.exe version
 ```
 
 ------
 
 ## 快速开始
 
-### 方式一：交互式模式
+### 1. 准备离线文件
 
-启动交互式 DMDUL：
+建议把相关文件放在同一个目录中：
 
-```powershell
-.\bin\dmdul.exe
+```text
+D:\temp\oldpro\
+├── SYSTEM.DBF
+├── dm.ctl
+├── MAIN.DBF
+├── ROLL.DBF
+├── TEMP.DBF
+└── TBS_*.DBF
 ```
 
-交互式抽取示例：
+`dm.ctl` 是可选增强文件，但强烈建议提供。没有 `dm.ctl` 时，工具会尝试通过 `control.dul` 和 DBF 页头识别数据文件。
+
+------
+
+### 2. 启动交互式 DUL Shell
+
+Windows：
+
+```powershell
+.\dmdul.exe
+```
+
+Linux：
+
+```bash
+./dmdul
+```
+
+示例：
 
 ```text
 DMDUL> set system D:\temp\oldpro\SYSTEM.DBF;
@@ -225,110 +147,281 @@ DMDUL> set data_dir D:\temp\oldpro;
 DMDUL> bootstrap;
 DMDUL> list user;
 DMDUL> list table HR_TEST;
-DMDUL> unload table HR_TEST.EMP_INFO;
-DMDUL> set data_format csv;
-DMDUL> unload user HR_TEST;
 DMDUL> unload database;
 DMDUL> exit;
 ```
 
-DROP / TRUNCATE 后，如果原数据块还没有被新写入覆盖，可以用恢复扫描模式尝试抽取残留行：
+`bootstrap;` 会生成：
 
 ```text
-DMDUL> bootstrap;
+control.dul
+init.dul
+dul.log
+dmdul_dict/
+```
+
+`unload database;` 默认生成：
+
+```text
+DATABASE_ddl.sql
+DATABASE_data.sql
+```
+
+------
+
+## 推荐恢复流程
+
+```text
+准备 SYSTEM.DBF、dm.ctl、用户表空间 DBF
+        |
+        v
+启动 dmdul
+        |
+        v
+set system / set data_dir
+        |
+        v
+bootstrap
+        |
+        v
+检查 dmdul_dict
+        |
+        v
+必要时人工修正 users.tsv / tables.tsv / columns.tsv / routines.tsv 等
+        |
+        v
+load dictionary
+        |
+        v
+unload database
+        |
+        v
+审核 DDL 和数据 SQL
+        |
+        v
+导入测试库验证
+```
+
+详细流程见：[离线恢复流程](https://chatgpt.com/c/docs/recovery-workflow.md)。
+
+------
+
+## dmdul_dict 字典目录
+
+`bootstrap;` 会在输出目录生成 `dmdul_dict`。这些 TSV 文件可以人工修正，修正后执行：
+
+```text
+DMDUL> load dictionary;
+```
+
+后续 `unload table`、`unload user`、`unload database` 会优先使用文本字典中的修正结果。
+
+| 文件            | 说明                                       |
+| --------------- | ------------------------------------------ |
+| `meta.tsv`      | SYSTEM.DBF、页大小、字符集、对象数量等摘要 |
+| `users.tsv`     | 用户 / owner 列表                          |
+| `tables.tsv`    | 表摘要、表空间、段信息、storage 信息       |
+| `columns.tsv`   | 字段定义、字段类型、长度、默认值、nullable |
+| `views.tsv`     | 视图定义                                   |
+| `sequences.tsv` | 序列定义                                   |
+| `routines.tsv`  | 存储过程、函数、包、包体源码               |
+| `triggers.tsv`  | 触发器定义                                 |
+| `synonyms.tsv`  | 同义词定义                                 |
+| `tab_privs.tsv` | 表、视图、序列等对象授权                   |
+
+`tables.tsv` 中的重要恢复字段：
+
+| 字段           | 说明                       |
+| -------------- | -------------------------- |
+| `header_file`  | 段头文件号                 |
+| `header_block` | 段头块号                   |
+| `bytes`        | 段大小                     |
+| `blocks`       | 段块数                     |
+| `extents`      | extent 数量                |
+| `storage_id`   | 主数据 storage / assist id |
+| `root_file`    | storage root 文件号        |
+| `root_page`    | storage root 页号          |
+| `assist_ids`   | 辅助 storage id 列表       |
+
+------
+
+## 表数据定位策略
+
+`dmdul` 当前采用分层定位策略：
+
+```text
+优先级 1：storage root / internal refs / leaf chain
+优先级 2：header_file / header_block / blocks 段范围校验
+优先级 3：段范围扫描
+优先级 4：全文件残留页扫描
+```
+
+正常表数据导出时，优先通过 storage root 和 leaf chain 精确定位数据页，减少同名表、相似行格式、索引页误识别带来的误导出。
+
+当 root 损坏、leaf 链断裂或 TRUNCATE / DROP 后当前字典范围已经变化时，可以使用恢复扫描模式进行兜底救援。
+
+------
+
+## DROP / TRUNCATE 残留页恢复
+
+如果表被 `TRUNCATE` 或 `DROP` 后，原数据块尚未被新写入覆盖，可以尝试：
+
+```text
 DMDUL> recover table USERS1.T_TEST;
 ```
 
-DROP 后当前 `SYSTEM.DBF` 里可能已经没有表定义，需要先 `load dictionary;` 加载 DROP 前保存的 `dmdul_dict`，或人工在 `tables.tsv`、`columns.tsv` 中补齐表结构和 `storage_id/assist_ids`。
+也可以指定输出前缀：
 
-说明：
-
-- `dm.ctl` 是可选增强文件。
-- 未显式指定 `dm.ctl` 时，如果 `SYSTEM.DBF` 同目录存在 `dm.ctl`，工具会自动尝试使用。
-- `bootstrap` 会扫描 `data_dir` 下的 DBF 页头，并生成 `control.dul`。
-- `control.dul` 用于记录表空间号、文件号、表空间名和数据文件路径。
-- `bootstrap` 会生成 `dmdul_dict\meta.tsv`、`users.tsv`、`tables.tsv`、`columns.tsv`、`views.tsv`、`sequences.tsv`、`routines.tsv`、`triggers.tsv`、`synonyms.tsv`、`tab_privs.tsv`。
-- 再次启动后可以用 `load dictionary;` 从文本字典恢复，`list user;` 也会显示字典来源和统计。
-- `unload table`、`unload user`、`unload database` 会优先使用 `dmdul_dict` 中修正后的用户、表、字段、类型、表空间和存储组织信息。
-- `tables.tsv` 支持补充 `DBA_SEGMENTS` 风格的 `header_file/header_block/bytes/blocks/extents`，用于按段页范围过滤数据页。
-- 交互模式会自动生成 `init.dul` 参数文件；未设置 `data_dir` 时写在当前目录，
-  设置 `data_dir` 后写到 `data_dir` 目录。
-- `init.dul` 可以人工修改，交互界面中执行 `load init;` 可重新加载参数。
-- `unload table` 用于抽取单表。
-- `unload user` 用于抽取指定用户下的表。
-- `unload database` 用于抽取整库所有用户、所有用户表 DDL 和数据。
-- 数据默认导出为 INSERT SQL。
-- 可通过 `set data_format csv;` 导出 CSV；空表不会生成空 CSV 文件。
-
-### 方式二：命令行直接导出 DDL
-
-```powershell
-.\bin\dmdul.exe export-ddl `
-  -file D:\temp\oldpro\SYSTEM.DBF `
-  -ctl D:\temp\oldpro\dm.ctl `
-  -out D:\temp\oldpro\dm_offline_schema.sql
+```text
+DMDUL> recover table USERS1.T_TEST to users1_t_test_recover;
 ```
 
-指定用户和字符集：
+命令行模式：
 
 ```powershell
-.\bin\dmdul.exe export-ddl `
-  -file D:\temp\oldpro\SYSTEM.DBF `
-  -ctl D:\temp\oldpro\dm.ctl `
-  -out D:\temp\oldpro\schema.sql `
-  -owner HR_TEST,SYSDBA `
-  -charset gb18030
+.\dmdul.exe export-data `
+  -file D:\dm\SYSTEM.DBF `
+  -data-dir D:\dm `
+  -table USERS1.T_TEST `
+  -recover `
+  -out D:\dm\USERS1_T_TEST_recover.sql
 ```
 
-### 方式三：命令行直接导出数据
+DROP 场景中，当前 `SYSTEM.DBF` 里可能已经没有表定义。此时需要：
 
-```powershell
-.\bin\dmdul.exe export-data `
-  -file D:\temp\oldpro\SYSTEM.DBF `
-  -ctl D:\temp\oldpro\dm.ctl `
-  -data-dir D:\temp\oldpro `
-  -out D:\temp\oldpro\dm_offline_data.sql
-```
-
-指定表：
-
-```powershell
-.\bin\dmdul.exe export-data `
-  -file D:\temp\oldpro\SYSTEM.DBF `
-  -ctl D:\temp\oldpro\dm.ctl `
-  -table SYSDBA.BIN_TEST2,SYSDBA.BIN_TEST2_CHILD
-```
+1. 加载 DROP 前保存的 `dmdul_dict`；
+2. 或人工在 `tables.tsv`、`columns.tsv` 中补齐表结构；
+3. 必要时补充 `storage_id`、`root_file`、`root_page`、`assist_ids` 等恢复辅助字段。
 
 ------
 
 ## 常用命令
 
+### 交互式命令
+
 ```text
+bootstrap;
+load init;
+load dictionary;
+show parameter;
+list user;
+list table <owner>;
+unload table <owner.table_name>;
+unload user <owner>;
+unload database;
+recover table <owner.table_name>;
+set data_format sql;
+set data_format csv;
+exit;
+```
+
+### 命令行模式
+
+```bash
 dmdul inspect -file SYSTEM.DBF
-dmdul inspect -file MAIN.DBF -sample 256
-dmdul scan-system -file oldpro\SYSTEM.DBF -ctl oldpro\dm.ctl
-dmdul inspect-ctl -ctl oldpro\dm.ctl
-dmdul export-ddl
-dmdul export-ddl -file oldpro\SYSTEM.DBF -ctl oldpro\dm.ctl -out oldpro\dm_offline_schema.sql
-dmdul export-ddl -file SYSTEM.DBF -ctl dm.ctl -out schema.sql -owner HR_TEST,SYSDBA -charset gb18030
-dmdul export-data -file oldpro\SYSTEM.DBF -ctl oldpro\dm.ctl -data-dir oldpro -out oldpro\dm_offline_data.sql
-dmdul export-data -file oldpro\SYSTEM.DBF -data-dir oldpro -table USERS1.T_TEST -recover -out oldpro\USERS1_T_TEST_recover.sql
-dmdul export-data -file SYSTEM.DBF -ctl dm.ctl -table SYSDBA.BIN_TEST2,SYSDBA.BIN_TEST2_CHILD
+dmdul inspect-ctl -ctl dm.ctl
+dmdul scan-system -file SYSTEM.DBF -ctl dm.ctl
 dmdul scan-partitions -file SYSTEM.DBF -ctl dm.ctl -owner all
+```
+
+导出 DDL：
+
+```bash
+dmdul export-ddl \
+  -file SYSTEM.DBF \
+  -ctl dm.ctl \
+  -out schema.sql \
+  -owner HR_TEST,SYSDBA \
+  -charset utf-8
+```
+
+导出数据：
+
+```bash
+dmdul export-data \
+  -file SYSTEM.DBF \
+  -ctl dm.ctl \
+  -data-dir . \
+  -table HR_TEST.EMP_INFO \
+  -out data.sql
+```
+
+残留页恢复：
+
+```bash
+dmdul export-data \
+  -file SYSTEM.DBF \
+  -data-dir . \
+  -table USERS1.T_TEST \
+  -recover \
+  -out USERS1_T_TEST_recover.sql
+```
+
+------
+
+## 从源码构建
+
+### 环境要求
+
+- Go 1.22+
+- Windows / Linux / macOS
+
+克隆并测试：
+
+```bash
+git clone https://github.com/greatfinish/dmdul.git
+cd dmdul
+go test ./...
+```
+
+Windows 构建：
+
+```powershell
+$ver = "v0.2.1"
+$commit = git rev-parse --short HEAD
+
+go build `
+  -ldflags "-X dmdul/internal/version.Version=$ver -X dmdul/internal/version.Commit=$commit" `
+  -o bin\dmdul.exe `
+  ./cmd/dmdul
+```
+
+Linux x64 交叉编译：
+
+```powershell
+$env:CGO_ENABLED="0"
+$env:GOOS="linux"
+$env:GOARCH="amd64"
+
+go build `
+  -ldflags "-s -w -X dmdul/internal/version.Version=$ver -X dmdul/internal/version.Commit=$commit" `
+  -o bin\dmdul_linux_amd64 `
+  ./cmd/dmdul
+
+Remove-Item Env:\GOOS
+Remove-Item Env:\GOARCH
+Remove-Item Env:\CGO_ENABLED
+```
+
+Linux 本机编译：
+
+```bash
+go test ./...
+go build -ldflags "-s -w" -o bin/dmdul ./cmd/dmdul
 ```
 
 ------
 
 ## 文档
 
-- [安装方式](docs/install.md)
-- [使用示例](docs/usage.md)
-- [配置和参数说明](docs/config.md)
-- [本地开发、测试、构建说明](docs/development.md)
-- [版本变更记录](CHANGELOG.md)
-- [逆向扫描笔记](docs/offline-system-scan.md)
-- [系统字典字段笔记](docs/system-dictionary-fields.md)
-- [离线恢复流程](docs/recovery-workflow.md)
+- [安装方式](https://chatgpt.com/c/docs/install.md)
+- [使用示例](https://chatgpt.com/c/docs/usage.md)
+- [配置和参数说明](https://chatgpt.com/c/docs/config.md)
+- [离线恢复流程](https://chatgpt.com/c/docs/recovery-workflow.md)
+- [本地开发、测试、构建说明](https://chatgpt.com/c/docs/development.md)
+- [版本变更记录](https://chatgpt.com/c/CHANGELOG.md)
+- [逆向扫描笔记](https://chatgpt.com/c/docs/offline-system-scan.md)
+- [系统字典字段笔记](https://chatgpt.com/c/docs/system-dictionary-fields.md)
 
 ------
 
@@ -348,76 +441,63 @@ research/           临时研究脚本和实验记录
 
 ## 安全提醒
 
-请不要把以下文件提交到公开仓库：
+请不要把生产库文件、导出结果或敏感数据提交到公开仓库：
 
 ```text
-*.DBF
-dm.ctl
-dm.ini
-*.log
-*.sql
-*.csv
-dmdul_dict/
-真实生产数据
-导出的业务数据
-```
-
-建议在 `.gitignore` 中明确排除：
-
-```gitignore
 *.DBF
 *.dbf
 dm.ctl
 dm.ini
-*.log
+init.dul
+control.dul
+dmdul_dict/
+dul.log
 *.sql
 *.csv
-dmdul_dict/
-bin/
-dist/
-tmp/
+真实生产数据
+导出的业务数据
 ```
 
-------
-
-## 限制说明
-
-当前版本仍存在以下限制：
-
-- 只读取离线文件，不会修改数据库文件。
-- 离线恢复结果受达梦版本、页大小、字符集、表类型、行格式影响。
-- 导出的 SQL 必须人工审核后再导入目标库。
-- 行外大 LOB、迁移行、链式行、复杂损坏页等场景仍需要继续验证。
-- 严重损坏的数据文件可能只能恢复部分对象或部分数据。
-- 不保证恢复结果与故障前数据库在事务层面完全一致。
+建议在隔离目录中放置待恢复文件，并把导出的 SQL、CSV、日志都按敏感数据处理。
 
 ------
 
-## 版本规划
+## 当前限制
 
-| 版本   | 方向                         |
-| ------ | ---------------------------- |
-| v0.1.x | 修复问题、完善文档、增强测试 |
-| v0.2.x | 增强 DDL 导出能力            |
-| v0.3.x | 增强数据导出能力             |
-| v0.4.x | 增强达梦系统字典解析         |
-| v1.0.0 | 功能稳定后发布正式版本       |
+- 工具只读取离线文件，不会修改原始 DBF 文件。
+- 离线恢复结果受达梦版本、页大小、字符集、表类型、行格式和损坏程度影响。
+- 导出的 SQL 必须人工审核，并先导入测试库验证。
+- DROP / TRUNCATE 残留页恢复依赖原数据页是否被覆盖，不能保证一定成功。
+- 行外大 LOB、迁移行、链式行、复杂损坏页仍在持续验证。
+- 不保证恢复结果与故障前数据库在事务一致性层面完全一致。
+
+------
+
+## 版本路线
+
+| 版本   | 方向                                           |
+| ------ | ---------------------------------------------- |
+| v0.2.x | 稳定整库恢复、增强数据页定位、修复真实样例问题 |
+| v0.3.x | 增强数据导出能力，继续完善 LOB、迁移行、链式行 |
+| v0.4.x | 增强达梦系统字典解析和更多对象类型恢复         |
+| v1.0.0 | 功能稳定后发布正式版本                         |
 
 ------
 
 ## 贡献
 
-欢迎提交 Issue、测试样例和改进建议。
+欢迎提交 Issue、测试样例、失败案例和改进建议。
 
-如果你要提交 Pull Request，建议先执行：
+提交 Pull Request 前建议执行：
 
-```powershell
+```bash
 go test ./...
-go build -o .\bin\dmdul.exe .\cmd\dmdul
 ```
+
+如果涉及数据导出逻辑，请尽量补充最小化测试样例。
 
 ------
 
 ## 开源协议
 
-本项目使用 [MIT License](LICENSE)。
+本项目使用 [MIT License](https://chatgpt.com/c/LICENSE)。
