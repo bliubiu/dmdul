@@ -340,6 +340,76 @@ func TestRenderInsertForMixedDateAndVariableRow(t *testing.T) {
 	}
 }
 
+func TestRenderInsertForRowBeforeTrailingColumnsWereAdded(t *testing.T) {
+	row := []byte{
+		0x00, 0x07, 0x00,
+		0x0A, 0x00, 0x00, 0x00,
+	}
+	info := dataTableInfo{
+		table:          dictionaryObject{Owner: "JYC", Name: "t"},
+		historicalRows: true,
+		columns: []columnDef{
+			{ColID: 1, Name: "id", DataType: "INT", Nullable: "Y"},
+			{ColID: 2, Name: "name", DataType: "VARCHAR(20)", Nullable: "Y"},
+			{ColID: 3, Name: "birth", DataType: "DATE", Nullable: "Y"},
+		},
+	}
+	sql, start, end, err := renderInsertForDataRow(info, row, textDecoder{preferred: "utf-8"})
+	if err != nil {
+		t.Fatalf("renderInsertForDataRow returned error: %v", err)
+	}
+	if start != 3 || end != len(row) {
+		t.Fatalf("unexpected data bounds: %d..%d", start, end)
+	}
+	want := `INSERT INTO JYC."t" ("id", "name", "birth") VALUES (10, NULL, NULL);`
+	if !strings.Contains(sql, want) {
+		t.Fatalf("unexpected insert sql: %s", sql)
+	}
+}
+
+func TestRenderInsertForRowBeforeTrailingFixedColumnWasAdded(t *testing.T) {
+	row := []byte{
+		0x00, 0x0B, 0x00,
+		0x0A, 0x00, 0x00, 0x00,
+		0x83, 'j', 'i', 'e',
+	}
+	info := dataTableInfo{
+		table:          dictionaryObject{Owner: "JYC", Name: "t"},
+		historicalRows: true,
+		columns: []columnDef{
+			{ColID: 1, Name: "id", DataType: "INT", Nullable: "Y"},
+			{ColID: 2, Name: "name", DataType: "VARCHAR(20)", Nullable: "Y"},
+			{ColID: 3, Name: "birth", DataType: "DATE", Nullable: "Y"},
+		},
+	}
+	sql, _, _, err := renderInsertForDataRow(info, row, textDecoder{preferred: "utf-8"})
+	if err != nil {
+		t.Fatalf("renderInsertForDataRow returned error: %v", err)
+	}
+	want := `INSERT INTO JYC."t" ("id", "name", "birth") VALUES (10, 'jie', NULL);`
+	if !strings.Contains(sql, want) {
+		t.Fatalf("unexpected insert sql: %s", sql)
+	}
+}
+
+func TestRenderInsertForIndexLikeRowDoesNotUseHistoricalColumnFallback(t *testing.T) {
+	row := []byte{
+		0x00, 0x07, 0x00,
+		0x01, 0x00, 0x00, 0x00,
+	}
+	info := dataTableInfo{
+		table: dictionaryObject{Owner: "JYC", Name: "t"},
+		columns: []columnDef{
+			{ColID: 1, Name: "id", DataType: "INT", Nullable: "Y"},
+			{ColID: 2, Name: "name", DataType: "VARCHAR(20)", Nullable: "Y"},
+			{ColID: 3, Name: "birth", DataType: "DATE", Nullable: "Y"},
+		},
+	}
+	if _, _, _, err := renderInsertForDataRow(info, row, textDecoder{preferred: "utf-8"}); err == nil {
+		t.Fatal("index-like single-key row should not be decoded via historical column fallback")
+	}
+}
+
 func TestRenderInsertForTrailingNullVariableRow(t *testing.T) {
 	row := make([]byte, 141)
 	row[0] = 0x00

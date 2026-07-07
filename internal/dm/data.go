@@ -88,6 +88,8 @@ type dataTableInfo struct {
 	columns         []columnDef
 	storage         indexDef
 	storageKnown    bool
+	dataStorageID   uint32
+	historicalRows  bool
 	pagePlan        map[dataPageRef]bool
 	pagePlanKnown   bool
 	recoveryMode    bool
@@ -112,6 +114,22 @@ type dataValue struct {
 
 type dmNumber string
 type dmBinary []byte
+
+type dataRowRenderMeta struct {
+	partial       bool
+	prefixKey     string
+	weakPrefixKey string
+	coverageKeys  []string
+	presentColIDs []uint16
+}
+
+type pendingPartialDataRow struct {
+	tableID uint32
+	line    string
+	record  []string
+	stats   *DataTableRowCount
+	meta    dataRowRenderMeta
+}
 
 func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 	if opts.SystemPath == "" {
@@ -216,6 +234,7 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 
 	assistByParentID := assistIndexesByParentID(tables, indexObjects, indexes)
 	partitionsByTable := scanPartitionsByTable(systemData, pageSize, decoder, tables, ownerMatcher)
+	dataStorageByTable := tableStorageByID(tables, indexObjects, indexes, nil)
 	dataFiles, err := resolveDataFiles(opts.ControlPath, opts.ControlDULPath, dataDir)
 	if err != nil {
 		return nil, err
@@ -238,6 +257,7 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 		baseInfo := dataTableInfo{
 			table:           table,
 			columns:         columnsByTable[tableID],
+			dataStorageID:   dataStorageIDForTable(dictionaryTables, dataStorageByTable, tableID),
 			recoveryMode:    opts.RecoveryMode,
 			recoveryGroupID: dictionaryTableGroupID(dictionaryTables, tableID),
 			segment:         segmentByTableID(opts.Dictionary, tableID),
@@ -246,6 +266,9 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 		selectedTables[tableID] = baseInfo
 		for _, storage := range assistByParentID[tableID] {
 			addKnownDataAssistID(assistByID, neededFiles, baseInfo, storage.ID, storage, buildStoragePagePlan(storage, dataFilePages))
+		}
+		for _, assistID := range dictionaryDataAssistIDs(dictionaryTables, tableID) {
+			addHistoricalDataAssistID(assistByID, baseInfo, assistID)
 		}
 		if opts.RecoveryMode {
 			for _, assistID := range dictionaryDataAssistIDs(dictionaryTables, tableID) {
@@ -330,6 +353,8 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 	}
 
 	stop := false
+	coveredRowPrefixes := make(map[uint32]map[string]bool)
+	var pendingPartialRows []pendingPartialDataRow
 	for _, file := range dataFiles {
 		if stop {
 			break
@@ -374,14 +399,15 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 				rowBytes := append([]byte(nil), page[rowStart:rowEnd]...)
 				var line string
 				var record []string
+				var meta dataRowRenderMeta
 				var err error
 				if outputFormat == "csv" {
 					if info.table.ID != csvTable.table.ID {
 						continue
 					}
-					record, _, _, err = renderCSVForDataRow(info, rowBytes, decoder)
+					record, _, _, meta, err = renderCSVForDataRowWithMeta(info, rowBytes, decoder)
 				} else {
-					line, _, _, err = renderInsertForDataRow(info, rowBytes, decoder)
+					line, _, _, meta, err = renderInsertForDataRowWithMeta(info, rowBytes, decoder)
 				}
 				stats := rowStats[info.table.ID]
 				if stats != nil {
@@ -398,6 +424,17 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 					}
 					continue
 				}
+				if meta.partial {
+					pendingPartialRows = append(pendingPartialRows, pendingPartialDataRow{
+						tableID: info.table.ID,
+						line:    line,
+						record:  record,
+						stats:   stats,
+						meta:    meta,
+					})
+					continue
+				}
+				markCoveredRowPrefixes(coveredRowPrefixes, info.table.ID, meta.coverageKeys)
 				result.RowsExported++
 				if stats != nil {
 					stats.RowsExported++
@@ -410,6 +447,23 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 					fmt.Fprintln(writer, line)
 				}
 			}
+		}
+	}
+	for _, pending := range pendingPartialRows {
+		if coveredRowPrefixes[pending.tableID][pending.meta.prefixKey] || coveredRowPrefixes[pending.tableID][pending.meta.weakPrefixKey] {
+			continue
+		}
+		markCoveredRowPrefixes(coveredRowPrefixes, pending.tableID, pending.meta.coverageKeys)
+		result.RowsExported++
+		if pending.stats != nil {
+			pending.stats.RowsExported++
+		}
+		if outputFormat == "csv" {
+			if err := csvWriter.Write(pending.record); err != nil {
+				return nil, fmt.Errorf("write csv row: %w", err)
+			}
+		} else {
+			fmt.Fprintln(writer, pending.line)
 		}
 	}
 
@@ -430,8 +484,10 @@ func addKnownDataAssistID(assistByID map[uint32][]dataTableInfo, neededFiles map
 	}
 	info.storage = storage
 	info.storageKnown = true
+	allowHistoricalRows := shouldAllowHistoricalRows(info, storage.ID)
 	if len(pagePlan) > 0 {
 		exactInfo := info
+		exactInfo.historicalRows = allowHistoricalRows
 		exactInfo.pagePlan = pagePlan
 		exactInfo.pagePlanKnown = true
 		addDataAssistCandidate(assistByID, assistID, exactInfo)
@@ -441,6 +497,7 @@ func addKnownDataAssistID(assistByID map[uint32][]dataTableInfo, neededFiles map
 	}
 	info.pagePlan = nil
 	info.pagePlanKnown = false
+	info.historicalRows = allowHistoricalRows
 	addDataAssistCandidate(assistByID, assistID, info)
 	neededFiles[dataFileKey{groupID: uint32(storage.GroupID), fileID: storage.RootFile}] = true
 }
@@ -454,8 +511,22 @@ func addUnknownDataAssistID(assistByID map[uint32][]dataTableInfo, info dataTabl
 
 func addRecoveryDataAssistID(assistByID map[uint32][]dataTableInfo, info dataTableInfo, assistID uint32) bool {
 	info.recoveryMode = true
+	info.historicalRows = shouldAllowHistoricalRows(info, assistID)
 	info.pagePlan = nil
 	info.pagePlanKnown = false
+	before := len(assistByID[assistID])
+	addDataAssistCandidate(assistByID, assistID, info)
+	return len(assistByID[assistID]) > before
+}
+
+func addHistoricalDataAssistID(assistByID map[uint32][]dataTableInfo, info dataTableInfo, assistID uint32) bool {
+	if info.dataStorageID == 0 {
+		return false
+	}
+	info.historicalRows = shouldAllowHistoricalRows(info, assistID)
+	info.pagePlan = nil
+	info.pagePlanKnown = false
+	info.storageKnown = false
 	before := len(assistByID[assistID])
 	addDataAssistCandidate(assistByID, assistID, info)
 	return len(assistByID[assistID]) > before
@@ -466,7 +537,7 @@ func addDataAssistCandidate(assistByID map[uint32][]dataTableInfo, assistID uint
 		return
 	}
 	for _, existing := range assistByID[assistID] {
-		if existing.table.ID == info.table.ID && existing.storageKnown == info.storageKnown && existing.storage.ID == info.storage.ID && existing.pagePlanKnown == info.pagePlanKnown && existing.recoveryMode == info.recoveryMode {
+		if existing.table.ID == info.table.ID && existing.storageKnown == info.storageKnown && existing.storage.ID == info.storage.ID && existing.pagePlanKnown == info.pagePlanKnown && existing.recoveryMode == info.recoveryMode && existing.historicalRows == info.historicalRows {
 			return
 		}
 	}
@@ -682,6 +753,20 @@ func dictionaryTableGroupID(tables map[uint32]DictionaryTable, tableID uint32) u
 		return 0
 	}
 	return table.GroupID
+}
+
+func dataStorageIDForTable(dictionaryTables map[uint32]DictionaryTable, dataStorageByTable map[uint32]indexDef, tableID uint32) uint32 {
+	if table, ok := dictionaryTables[tableID]; ok && table.StorageID != 0 {
+		return table.StorageID
+	}
+	if storage, ok := dataStorageByTable[tableID]; ok {
+		return storage.ID
+	}
+	return 0
+}
+
+func shouldAllowHistoricalRows(info dataTableInfo, assistID uint32) bool {
+	return info.dataStorageID != 0 && assistID != 0
 }
 
 func dictionaryDataAssistIDs(tables map[uint32]DictionaryTable, tableID uint32) []uint32 {
@@ -1104,9 +1189,14 @@ func isLiveDataRow(page []byte, rowOff uint16) bool {
 }
 
 func renderInsertForDataRow(info dataTableInfo, row []byte, decoder textDecoder) (string, int, int, error) {
-	values, dataStart, dataEnd, err := parseDataRowValues(row, info.columns, decoder)
+	line, dataStart, dataEnd, _, err := renderInsertForDataRowWithMeta(info, row, decoder)
+	return line, dataStart, dataEnd, err
+}
+
+func renderInsertForDataRowWithMeta(info dataTableInfo, row []byte, decoder textDecoder) (string, int, int, dataRowRenderMeta, error) {
+	values, dataStart, dataEnd, err := parseDataRowValues(row, info.columns, decoder, info.historicalRows)
 	if err != nil {
-		return "", 0, 0, err
+		return "", 0, 0, dataRowRenderMeta{}, err
 	}
 	cols := make([]string, 0, len(info.columns))
 	vals := make([]string, 0, len(info.columns))
@@ -1119,7 +1209,7 @@ func renderInsertForDataRow(info dataTableInfo, row []byte, decoder textDecoder)
 		}
 		sqlValue, err := sqlValueForDataColumn(col, value.value)
 		if err != nil {
-			return "", 0, 0, err
+			return "", 0, 0, dataRowRenderMeta{}, err
 		}
 		vals = append(vals, sqlValue)
 	}
@@ -1129,13 +1219,18 @@ func renderInsertForDataRow(info dataTableInfo, row []byte, decoder textDecoder)
 		strings.Join(cols, ", "),
 		strings.Join(vals, ", "),
 	)
-	return sql, dataStart, dataEnd, nil
+	return sql, dataStart, dataEnd, dataRowRenderMetaForValues(info.columns, values), nil
 }
 
 func renderCSVForDataRow(info dataTableInfo, row []byte, decoder textDecoder) ([]string, int, int, error) {
-	values, dataStart, dataEnd, err := parseDataRowValues(row, info.columns, decoder)
+	record, dataStart, dataEnd, _, err := renderCSVForDataRowWithMeta(info, row, decoder)
+	return record, dataStart, dataEnd, err
+}
+
+func renderCSVForDataRowWithMeta(info dataTableInfo, row []byte, decoder textDecoder) ([]string, int, int, dataRowRenderMeta, error) {
+	values, dataStart, dataEnd, err := parseDataRowValues(row, info.columns, decoder, info.historicalRows)
 	if err != nil {
-		return nil, 0, 0, err
+		return nil, 0, 0, dataRowRenderMeta{}, err
 	}
 	record := make([]string, 0, len(info.columns))
 	for _, col := range info.columns {
@@ -1146,11 +1241,11 @@ func renderCSVForDataRow(info dataTableInfo, row []byte, decoder textDecoder) ([
 		}
 		csvValue, err := csvValueForDataColumn(col, value.value)
 		if err != nil {
-			return nil, 0, 0, err
+			return nil, 0, 0, dataRowRenderMeta{}, err
 		}
 		record = append(record, csvValue)
 	}
-	return record, dataStart, dataEnd, nil
+	return record, dataStart, dataEnd, dataRowRenderMetaForValues(info.columns, values), nil
 }
 
 func csvHeaderForDataTable(info dataTableInfo) []string {
@@ -1159,6 +1254,71 @@ func csvHeaderForDataTable(info dataTableInfo) []string {
 		header = append(header, col.Name)
 	}
 	return header
+}
+
+func dataRowRenderMetaForValues(columns []columnDef, values map[uint16]dataValue) dataRowRenderMeta {
+	ordered := append([]columnDef(nil), columns...)
+	sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].ColID < ordered[j].ColID })
+	var present []columnDef
+	for _, col := range ordered {
+		if _, ok := values[col.ColID]; !ok {
+			break
+		}
+		present = append(present, col)
+	}
+	meta := dataRowRenderMeta{
+		partial: len(present) < len(ordered),
+	}
+	for _, col := range present {
+		meta.presentColIDs = append(meta.presentColIDs, col.ColID)
+	}
+	if len(present) > 0 {
+		meta.prefixKey = dataRowPrefixKey(present, values)
+		meta.weakPrefixKey = dataRowPrefixKey(present[:1], values)
+	}
+	for keep := 1; keep <= len(present); keep++ {
+		meta.coverageKeys = append(meta.coverageKeys, dataRowPrefixKey(present[:keep], values))
+	}
+	return meta
+}
+
+func dataRowPrefixKey(columns []columnDef, values map[uint16]dataValue) string {
+	var parts []string
+	for _, col := range columns {
+		value, ok := values[col.ColID]
+		if !ok {
+			break
+		}
+		parts = append(parts, fmt.Sprintf("%d=%s", col.ColID, dataValueSignature(value.value)))
+	}
+	return strings.Join(parts, "|")
+}
+
+func dataValueSignature(value any) string {
+	switch v := value.(type) {
+	case nil:
+		return "NULL"
+	case dmBinary:
+		return "BIN:" + hex.EncodeToString(v)
+	default:
+		return fmt.Sprintf("%T:%v", value, value)
+	}
+}
+
+func markCoveredRowPrefixes(covered map[uint32]map[string]bool, tableID uint32, keys []string) {
+	if len(keys) == 0 {
+		return
+	}
+	tableKeys := covered[tableID]
+	if tableKeys == nil {
+		tableKeys = make(map[string]bool)
+		covered[tableID] = tableKeys
+	}
+	for _, key := range keys {
+		if key != "" {
+			tableKeys[key] = true
+		}
+	}
 }
 
 func singleSelectedDataTable(tables map[uint32]dataTableInfo) (dataTableInfo, bool) {
@@ -1184,7 +1344,53 @@ func normalizeDataOutputFormat(value string) string {
 	}
 }
 
-func parseDataRowValues(row []byte, columns []columnDef, decoder textDecoder) (map[uint16]dataValue, int, int, error) {
+func parseDataRowValues(row []byte, columns []columnDef, decoder textDecoder, allowHistoricalRows bool) (map[uint16]dataValue, int, int, error) {
+	values, start, end, err := parseDataRowValuesForColumns(row, columns, decoder)
+	if err == nil {
+		return values, start, end, nil
+	}
+	if !allowHistoricalRows {
+		return nil, 0, 0, err
+	}
+	firstErr := err
+	for _, historicalColumns := range historicalColumnPrefixes(columns) {
+		values, start, end, err = parseDataRowValuesForColumns(row, historicalColumns, decoder)
+		if err == nil {
+			return values, start, end, nil
+		}
+	}
+	return nil, 0, 0, firstErr
+}
+
+func historicalColumnPrefixes(columns []columnDef) [][]columnDef {
+	if len(columns) <= 1 {
+		return nil
+	}
+	ordered := append([]columnDef(nil), columns...)
+	sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].ColID < ordered[j].ColID })
+	var result [][]columnDef
+	for keep := len(ordered) - 1; keep >= 1; keep-- {
+		if !canOmitHistoricalColumns(ordered[keep:]) {
+			break
+		}
+		result = append(result, append([]columnDef(nil), ordered[:keep]...))
+	}
+	return result
+}
+
+func canOmitHistoricalColumns(columns []columnDef) bool {
+	if len(columns) == 0 {
+		return false
+	}
+	for _, col := range columns {
+		if !isNullableColumn(col) && strings.TrimSpace(col.Default) == "" {
+			return false
+		}
+	}
+	return true
+}
+
+func parseDataRowValuesForColumns(row []byte, columns []columnDef, decoder textDecoder) (map[uint16]dataValue, int, int, error) {
 	var fixedCols []columnDef
 	var varCols []columnDef
 	for _, col := range columns {
@@ -1250,6 +1456,10 @@ func parseDataRowValues(row []byte, columns []columnDef, decoder textDecoder) (m
 		trailing := len(row) - pos
 		if trailing < 0 || trailing > 64 {
 			errors = append(errors, fmt.Sprintf("start=%d bad trailing length %d", start, trailing))
+			continue
+		}
+		if trailing > 0 && trailing < 8 {
+			errors = append(errors, fmt.Sprintf("start=%d short trailing length %d", start, trailing))
 			continue
 		}
 		score := 100 - trailing - start*4

@@ -64,6 +64,13 @@
 
 ------
 
+## 下载
+
+| Platform    | Package                                     |
+| ----------- | ------------------------------------------- |
+| Windows x64 | Releases -> dmdul_windows_amd64_v0.2.0.zip  |
+| Linux x64   | Releases -> dmdul_linux_amd64_v0.2.0.tar.gz |
+
 ## 当前能力
 
 ### 离线字典解析
