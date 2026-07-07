@@ -144,15 +144,41 @@ func descendLeftmostLeaf(cache *dataFilePageCache, start dataPageRef, storageID 
 			return current, true
 		case dmPageKindBTreeRoot:
 			childPage, ok := btreeLeftmostChildPage(page)
+			if ok {
+				childRef := dataPageRef{key: current.key, pageNo: childPage}
+				if childPage, childOK := cache.readPage(childRef); childOK && pageHeaderMatchesRef(childPage, childRef) && dataPageStorageID(childPage) == storageID && isBTreePlanPageKind(dataPageKind(childPage)) {
+					current = childRef
+					continue
+				}
+			}
+			nextRef, ok := btreeNextInternalPage(page, current.key.groupID)
 			if !ok {
 				return dataPageRef{}, false
 			}
-			current = dataPageRef{key: current.key, pageNo: childPage}
+			current = nextRef
 		default:
 			return dataPageRef{}, false
 		}
 	}
 	return dataPageRef{}, false
+}
+
+func isBTreePlanPageKind(kind uint32) bool {
+	return kind == dmPageKindBTreeLeaf || kind == dmPageKindBTreeRoot
+}
+
+func btreeNextInternalPage(page []byte, groupID uint32) (dataPageRef, bool) {
+	nextFileID, nextPageNo, ok := readDMPageRef(page, dmPageNextRefOff)
+	if !ok {
+		return dataPageRef{}, false
+	}
+	return dataPageRef{
+		key: dataFileKey{
+			groupID: groupID,
+			fileID:  nextFileID,
+		},
+		pageNo: nextPageNo,
+	}, true
 }
 
 func walkLeafChain(cache *dataFilePageCache, start dataPageRef, storageID uint32) map[dataPageRef]bool {

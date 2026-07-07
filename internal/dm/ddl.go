@@ -1928,7 +1928,7 @@ func storageClause(groupID uint32, tablespaces map[uint32]string, organization s
 
 func formatColumnType(dataType string, length uint32, scale int16) string {
 	dt := strings.TrimSpace(dataType)
-	upper := strings.ToUpper(dt)
+	upper := normalizeDataType(dt)
 	charTypes := map[string]bool{
 		"CHAR": true, "CHARACTER": true, "VARCHAR": true, "VARCHAR2": true,
 		"NCHAR": true, "NVARCHAR": true, "NVARCHAR2": true, "VARCHARACTER": true,
@@ -1939,8 +1939,13 @@ func formatColumnType(dataType string, length uint32, scale int16) string {
 		"TEXT": true, "LONGVARCHAR": true, "CLOB": true, "BLOB": true, "IMAGE": true,
 		"BIT": true, "BOOLEAN": true, "BOOL": true,
 		"REAL": true, "FLOAT": true, "DOUBLE": true, "DOUBLE PRECISION": true,
+		"ROWID": true, "INTERVAL DAY TO SECOND": true,
 	}
-	timePrecisionTypes := map[string]bool{"DATETIME": true, "TIME": true, "TIMESTAMP": true}
+	timePrecisionTypes := map[string]bool{
+		"DATETIME": true, "TIME": true, "TIMESTAMP": true,
+		"DATETIME WITH TIME ZONE": true, "TIME WITH TIME ZONE": true,
+		"TIMESTAMP WITH TIME ZONE": true, "TIMESTAMP WITH LOCAL TIME ZONE": true,
+	}
 	numberTypes := map[string]bool{"NUMBER": true, "NUMERIC": true, "DEC": true, "DECIMAL": true}
 	switch {
 	case charTypes[upper]:
@@ -1951,7 +1956,12 @@ func formatColumnType(dataType string, length uint32, scale int16) string {
 	case noLengthTypes[upper]:
 		return dt
 	case timePrecisionTypes[upper]:
-		if scale > 0 && scale <= 9 {
+		if scale > 0 && scale <= 6 {
+			if idx := strings.Index(strings.ToUpper(dt), " WITH "); idx >= 0 {
+				base := strings.TrimSpace(dt[:idx])
+				suffix := strings.TrimSpace(dt[idx+6:])
+				return fmt.Sprintf("%s(%d) WITH %s", base, scale, suffix)
+			}
 			return fmt.Sprintf("%s(%d)", dt, scale)
 		}
 		return dt

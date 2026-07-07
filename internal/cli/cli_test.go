@@ -408,11 +408,14 @@ func writeMinimalMainDBFWithOneIntRow(t *testing.T, path string, tableID uint32,
 		dataFilePageGroupIDOff = 0
 		dataFilePageFileIDOff  = 2
 		dataFilePagePageNoOff  = 4
+		dmPageKindOff          = 0x14
+		dmPageKindRowData      = 0x14
 	)
 	page := make([]byte, pageSize)
 	binary.LittleEndian.PutUint16(page[dataFilePageGroupIDOff:], 4)
 	binary.LittleEndian.PutUint16(page[dataFilePageFileIDOff:], 0)
 	binary.LittleEndian.PutUint32(page[dataFilePagePageNoOff:], 0)
+	binary.LittleEndian.PutUint32(page[dmPageKindOff:], dmPageKindRowData)
 	binary.LittleEndian.PutUint16(page[dataPageSlotCountOff:], 1)
 	binary.LittleEndian.PutUint16(page[dataPageFreeEndOff:], dataRowAreaStart+7)
 	binary.LittleEndian.PutUint16(page[dataPageRecordCountOff:], 1)

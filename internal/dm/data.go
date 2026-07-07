@@ -6,6 +6,7 @@ import (
 	"encoding/csv"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"os"
 	pathpkg "path"
 	"path/filepath"
@@ -20,6 +21,14 @@ const (
 	dataPageRecordCountOff = 0x2C
 	dataPageTreeLevelOff   = 0x38
 	dataPageAssistIndexOff = 0x3A
+	dmPageKindLOBData      = 0x20
+	dmPageKindLongRowData  = 0x22
+	dmPageKindRowData      = 0x14
+	dmPageKindRowOverflow  = 0x16
+	dmLOBPagePayloadOff    = 0x38
+	dmLOBPageIDOff         = 0x24
+	dmLOBPagePayloadLenOff = 0x2C
+	dmLOBLocatorSize       = 21
 )
 
 type DataExportOptions struct {
@@ -90,6 +99,7 @@ type dataTableInfo struct {
 	storageKnown    bool
 	dataStorageID   uint32
 	historicalRows  bool
+	lobReader       *dmLOBReader
 	pagePlan        map[dataPageRef]bool
 	pagePlanKnown   bool
 	recoveryMode    bool
@@ -114,6 +124,19 @@ type dataValue struct {
 
 type dmNumber string
 type dmBinary []byte
+type dmRowID string
+
+type dmLOBReader struct {
+	cache *dataFilePageCache
+}
+
+type dmLOBLocator struct {
+	raw       []byte
+	lobID     uint32
+	byteLen   uint32
+	groupID   uint32
+	firstPage uint32
+}
 
 type dataRowRenderMeta struct {
 	partial       bool
@@ -240,6 +263,7 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 		return nil, err
 	}
 	dataFilePages := newDataFilePageCache(dataFiles, pageSize)
+	lobReader := &dmLOBReader{cache: dataFilePages}
 	selectedTables := make(map[uint32]dataTableInfo)
 	assistByID := make(map[uint32][]dataTableInfo)
 	neededFiles := make(map[dataFileKey]bool)
@@ -258,6 +282,7 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 			table:           table,
 			columns:         columnsByTable[tableID],
 			dataStorageID:   dataStorageIDForTable(dictionaryTables, dataStorageByTable, tableID),
+			lobReader:       lobReader,
 			recoveryMode:    opts.RecoveryMode,
 			recoveryGroupID: dictionaryTableGroupID(dictionaryTables, tableID),
 			segment:         segmentByTableID(opts.Dictionary, tableID),
@@ -610,11 +635,19 @@ func selectDataPageCandidate(candidates []dataTableInfo, file dataFileRef, pageN
 	if len(rows) == 0 {
 		return dataTableInfo{}, false
 	}
+	pageKind := dataPageKind(page)
+	pageStorageID := dataPageStorageID(page)
 	ordered := append([]dataTableInfo(nil), candidates...)
 	sort.SliceStable(ordered, func(i, j int) bool {
 		return dataCandidateRank(ordered[i]) < dataCandidateRank(ordered[j])
 	})
 	for _, candidate := range ordered {
+		if isTableDataAssistHeaderCandidate(candidate, pageStorageID, pageKind) {
+			continue
+		}
+		if isLooseHistoricalCandidate(candidate) && pageKind == dmPageKindRowData {
+			continue
+		}
 		if !candidateMatchesFile(candidate, file, pageNo) {
 			continue
 		}
@@ -635,6 +668,18 @@ func selectDataPageCandidate(candidates []dataTableInfo, file dataFileRef, pageN
 		}
 	}
 	return dataTableInfo{}, false
+}
+
+func isTableDataAssistHeaderCandidate(info dataTableInfo, pageStorageID uint32, pageKind uint32) bool {
+	if info.recoveryMode || info.dataStorageID == 0 || pageKind != dmPageKindRowData {
+		return false
+	}
+	tableAssistID := tableDataAssistID(info.table.ID)
+	return pageStorageID == tableAssistID && pageStorageID != info.dataStorageID
+}
+
+func isLooseHistoricalCandidate(info dataTableInfo) bool {
+	return info.historicalRows && !info.recoveryMode && !info.pagePlanKnown && !info.storageKnown
 }
 
 func dataCandidateRank(info dataTableInfo) int {
@@ -1110,6 +1155,7 @@ func isProbableDMDataPage(page []byte, pageSize uint32) bool {
 	freeEnd := binary.LittleEndian.Uint16(page[dataPageFreeEndOff:])
 	nRec := binary.LittleEndian.Uint16(page[dataPageRecordCountOff:])
 	treeLevel := binary.LittleEndian.Uint16(page[dataPageTreeLevelOff:])
+	kind := dataPageKind(page)
 	if nSlot >= 2048 {
 		return false
 	}
@@ -1117,6 +1163,9 @@ func isProbableDMDataPage(page []byte, pageSize uint32) bool {
 		return false
 	}
 	if treeLevel != 0 {
+		return false
+	}
+	if kind != dmPageKindRowData && kind != dmPageKindRowOverflow {
 		return false
 	}
 	return freeEnd >= dataRowAreaStart && uint32(freeEnd) <= pageSize
@@ -1194,7 +1243,7 @@ func renderInsertForDataRow(info dataTableInfo, row []byte, decoder textDecoder)
 }
 
 func renderInsertForDataRowWithMeta(info dataTableInfo, row []byte, decoder textDecoder) (string, int, int, dataRowRenderMeta, error) {
-	values, dataStart, dataEnd, err := parseDataRowValues(row, info.columns, decoder, info.historicalRows)
+	values, dataStart, dataEnd, err := parseDataRowValues(row, info.columns, decoder, info.historicalRows, info.lobReader)
 	if err != nil {
 		return "", 0, 0, dataRowRenderMeta{}, err
 	}
@@ -1228,7 +1277,7 @@ func renderCSVForDataRow(info dataTableInfo, row []byte, decoder textDecoder) ([
 }
 
 func renderCSVForDataRowWithMeta(info dataTableInfo, row []byte, decoder textDecoder) ([]string, int, int, dataRowRenderMeta, error) {
-	values, dataStart, dataEnd, err := parseDataRowValues(row, info.columns, decoder, info.historicalRows)
+	values, dataStart, dataEnd, err := parseDataRowValues(row, info.columns, decoder, info.historicalRows, info.lobReader)
 	if err != nil {
 		return nil, 0, 0, dataRowRenderMeta{}, err
 	}
@@ -1344,8 +1393,8 @@ func normalizeDataOutputFormat(value string) string {
 	}
 }
 
-func parseDataRowValues(row []byte, columns []columnDef, decoder textDecoder, allowHistoricalRows bool) (map[uint16]dataValue, int, int, error) {
-	values, start, end, err := parseDataRowValuesForColumns(row, columns, decoder)
+func parseDataRowValues(row []byte, columns []columnDef, decoder textDecoder, allowHistoricalRows bool, lobReader *dmLOBReader) (map[uint16]dataValue, int, int, error) {
+	values, start, end, err := parseDataRowValuesForColumns(row, columns, decoder, lobReader)
 	if err == nil {
 		return values, start, end, nil
 	}
@@ -1354,7 +1403,7 @@ func parseDataRowValues(row []byte, columns []columnDef, decoder textDecoder, al
 	}
 	firstErr := err
 	for _, historicalColumns := range historicalColumnPrefixes(columns) {
-		values, start, end, err = parseDataRowValuesForColumns(row, historicalColumns, decoder)
+		values, start, end, err = parseDataRowValuesForColumns(row, historicalColumns, decoder, lobReader)
 		if err == nil {
 			return values, start, end, nil
 		}
@@ -1390,14 +1439,163 @@ func canOmitHistoricalColumns(columns []columnDef) bool {
 	return true
 }
 
-func parseDataRowValuesForColumns(row []byte, columns []columnDef, decoder textDecoder) (map[uint16]dataValue, int, int, error) {
+func dataStorageColumns(columns []columnDef) []columnDef {
+	ordered := append([]columnDef(nil), columns...)
+	sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].ColID < ordered[j].ColID })
+	var fixedCols []columnDef
+	var varCols []columnDef
+	for _, col := range ordered {
+		switch {
+		case isVariableDataType(col.DataType):
+			varCols = append(varCols, col)
+		case fixedDataSizeForColumn(col) > 0:
+			fixedCols = append(fixedCols, col)
+		default:
+			varCols = append(varCols, col)
+		}
+	}
+	return append(fixedCols, varCols...)
+}
+
+func rowMetadataLength(columnCount int) int {
+	if columnCount <= 0 {
+		return 0
+	}
+	return (columnCount + 3) / 4
+}
+
+func decodeRowColumnStates(raw []byte, columnCount int) []byte {
+	states := make([]byte, columnCount)
+	for i := 0; i < columnCount; i++ {
+		b := raw[i/4]
+		states[i] = (b >> uint((i%4)*2)) & 0x03
+	}
+	return states
+}
+
+func isRowColumnNull(state byte) bool {
+	return state == 0x03
+}
+
+func isRowColumnOutOfLine(state byte) bool {
+	return state == 0x01
+}
+
+func readInRowDataValue(col columnDef, row []byte, pos int, decoder textDecoder, lobReader *dmLOBReader) (any, int, error) {
+	if fixedDataSizeForColumn(col) > 0 {
+		return parseFixedDataValue(col, row, pos)
+	}
+	return readVariableDataValue(col, row, pos, decoder, lobReader)
+}
+
+func readOutOfLineDataValue(col columnDef, row []byte, pos int, decoder textDecoder, lobReader *dmLOBReader) (any, int, error) {
+	locator, next, err := readDMLOBLocator(row, pos)
+	if err != nil {
+		return nil, pos, fmt.Errorf("%s: %w", col.Name, err)
+	}
+	if lobReader == nil {
+		return nil, pos, fmt.Errorf("%s: out-of-line locator cannot be resolved without data files", col.Name)
+	}
+	if isBinaryDataType(col.DataType) {
+		payload, err := lobReader.readLOBPayload(locator, dmPageKindLOBData)
+		if err != nil {
+			return nil, pos, fmt.Errorf("%s: %w", col.Name, err)
+		}
+		return dmBinary(payload), next, nil
+	}
+	if isCharacterLOBDataType(col.DataType) {
+		payload, err := lobReader.readTextLOBOrLongRowPayload(locator)
+		if err != nil {
+			return nil, pos, fmt.Errorf("%s: %w", col.Name, err)
+		}
+		value, ok := decoder.decode(payload)
+		if !ok || strings.ContainsRune(value, '\uFFFD') || containsBadControl(value) {
+			return nil, pos, fmt.Errorf("%s: cannot decode out-of-line text LOB", col.Name)
+		}
+		return value, next, nil
+	}
+	if isCharacterDataType(col.DataType) {
+		payload, err := lobReader.readLongRowPayload(locator)
+		if err != nil {
+			return nil, pos, fmt.Errorf("%s: %w", col.Name, err)
+		}
+		value, ok := decoder.decode(payload)
+		if !ok || strings.ContainsRune(value, '\uFFFD') || containsBadControl(value) {
+			return nil, pos, fmt.Errorf("%s: cannot decode out-of-line long row text", col.Name)
+		}
+		return value, next, nil
+	}
+	return nil, pos, fmt.Errorf("%s: unsupported out-of-line data type %s", col.Name, col.DataType)
+}
+
+func parseDataRowValuesForColumns(row []byte, columns []columnDef, decoder textDecoder, lobReader *dmLOBReader) (map[uint16]dataValue, int, int, error) {
+	values, start, end, err := parseDataRowValuesWithMetadata(row, columns, decoder, lobReader)
+	if err == nil {
+		return values, start, end, nil
+	}
+	metadataErr := err
+	values, start, end, err = parseDataRowValuesHeuristic(row, columns, decoder, lobReader)
+	if err == nil {
+		return values, start, end, nil
+	}
+	return nil, 0, 0, fmt.Errorf("%v; heuristic: %w", metadataErr, err)
+}
+
+func parseDataRowValuesWithMetadata(row []byte, columns []columnDef, decoder textDecoder, lobReader *dmLOBReader) (map[uint16]dataValue, int, int, error) {
+	if len(columns) == 0 {
+		return nil, 0, 0, fmt.Errorf("no columns")
+	}
+	storageColumns := dataStorageColumns(columns)
+	metaLen := rowMetadataLength(len(storageColumns))
+	start := 2 + metaLen
+	if len(row) < start {
+		return nil, 0, 0, fmt.Errorf("row too short for metadata: len=%d metadata=%d", len(row), metaLen)
+	}
+	states := decodeRowColumnStates(row[2:start], len(storageColumns))
+	pos := start
+	values := make(map[uint16]dataValue, len(columns))
+	for i, col := range storageColumns {
+		state := states[i]
+		switch {
+		case isRowColumnNull(state):
+			if fixedDataSizeForColumn(col) > 0 {
+				pos += fixedDataSizeForColumn(col)
+				if pos > len(row) {
+					return nil, 0, 0, fmt.Errorf("%s fixed NULL out of range", col.Name)
+				}
+			}
+			values[col.ColID] = dataValue{value: nil}
+		case isRowColumnOutOfLine(state):
+			value, next, err := readOutOfLineDataValue(col, row, pos, decoder, lobReader)
+			if err != nil {
+				return nil, 0, 0, err
+			}
+			values[col.ColID] = dataValue{value: value}
+			pos = next
+		default:
+			value, next, err := readInRowDataValue(col, row, pos, decoder, lobReader)
+			if err != nil {
+				return nil, 0, 0, err
+			}
+			values[col.ColID] = dataValue{value: value}
+			pos = next
+		}
+	}
+	trailing := len(row) - pos
+	if trailing < 0 || trailing > 64 {
+		return nil, 0, 0, fmt.Errorf("bad trailing length %d", trailing)
+	}
+	return values, start, pos, nil
+}
+
+func parseDataRowValuesHeuristic(row []byte, columns []columnDef, decoder textDecoder, lobReader *dmLOBReader) (map[uint16]dataValue, int, int, error) {
 	var fixedCols []columnDef
 	var varCols []columnDef
 	for _, col := range columns {
 		switch {
 		case isVariableDataType(col.DataType):
 			varCols = append(varCols, col)
-		case fixedDataSize(col.DataType) > 0:
+		case fixedDataSizeForColumn(col) > 0:
 			fixedCols = append(fixedCols, col)
 		}
 	}
@@ -1434,7 +1632,7 @@ func parseDataRowValuesForColumns(row []byte, columns []columnDef, decoder textD
 		}
 		omittedTrailingNullValue := false
 		for i, col := range varCols {
-			value, next, err := readVariableDataValue(col, row, pos, decoder)
+			value, next, err := readVariableDataValue(col, row, pos, decoder, lobReader)
 			if err != nil {
 				if canOmitTrailingNullVars(row, pos, varCols[i:]) {
 					for _, nullCol := range varCols[i:] {
@@ -1562,7 +1760,15 @@ func isNumberDataType(dataType string) bool {
 }
 
 func fixedDataSize(dataType string) int {
-	switch normalizeDataType(dataType) {
+	return fixedDataSizeForType(normalizeDataType(dataType), 0)
+}
+
+func fixedDataSizeForColumn(col columnDef) int {
+	return fixedDataSizeForType(normalizeDataType(col.DataType), col.Length)
+}
+
+func fixedDataSizeForType(dataType string, length uint32) int {
+	switch dataType {
 	case "TINYINT":
 		return 1
 	case "SMALLINT":
@@ -1571,10 +1777,29 @@ func fixedDataSize(dataType string) int {
 		return 4
 	case "BIGINT":
 		return 8
+	case "REAL":
+		return 4
+	case "FLOAT":
+		if length == 4 {
+			return 4
+		}
+		return 8
+	case "DOUBLE", "DOUBLE PRECISION":
+		return 8
 	case "DATE":
 		return 3
-	case "DATETIME", "TIMESTAMP", "TIME":
+	case "TIME":
+		return 5
+	case "TIME WITH TIME ZONE":
+		return 7
+	case "DATETIME", "TIMESTAMP", "TIMESTAMP WITH LOCAL TIME ZONE":
 		return 8
+	case "DATETIME WITH TIME ZONE", "TIMESTAMP WITH TIME ZONE":
+		return 10
+	case "INTERVAL DAY TO SECOND":
+		return 24
+	case "ROWID":
+		return 12
 	default:
 		return 0
 	}
@@ -1583,14 +1808,18 @@ func fixedDataSize(dataType string) int {
 func normalizeDataType(dataType string) string {
 	upper := strings.ToUpper(strings.TrimSpace(dataType))
 	if idx := strings.IndexByte(upper, '('); idx >= 0 {
-		upper = strings.TrimSpace(upper[:idx])
+		if end := strings.IndexByte(upper[idx:], ')'); end >= 0 {
+			upper = strings.TrimSpace(upper[:idx] + " " + upper[idx+end+1:])
+		} else {
+			upper = strings.TrimSpace(upper[:idx])
+		}
 	}
-	return upper
+	return strings.Join(strings.Fields(upper), " ")
 }
 
 func parseFixedDataValue(col columnDef, row []byte, pos int) (any, int, error) {
 	dataType := normalizeDataType(col.DataType)
-	size := fixedDataSize(dataType)
+	size := fixedDataSizeForColumn(col)
 	if size > 0 && pos+size <= len(row) && isNullableColumn(col) && isFixedNullSentinel(dataType, row[pos:pos+size]) {
 		return nil, pos + size, nil
 	}
@@ -1615,6 +1844,27 @@ func parseFixedDataValue(col columnDef, row []byte, pos int) (any, int, error) {
 			return nil, pos, fmt.Errorf("BIGINT out of range")
 		}
 		return int64(binary.LittleEndian.Uint64(row[pos:])), pos + 8, nil
+	case "REAL":
+		if pos+4 > len(row) {
+			return nil, pos, fmt.Errorf("REAL out of range")
+		}
+		return math.Float32frombits(binary.LittleEndian.Uint32(row[pos:])), pos + 4, nil
+	case "FLOAT":
+		if size == 4 {
+			if pos+4 > len(row) {
+				return nil, pos, fmt.Errorf("FLOAT out of range")
+			}
+			return math.Float32frombits(binary.LittleEndian.Uint32(row[pos:])), pos + 4, nil
+		}
+		if pos+8 > len(row) {
+			return nil, pos, fmt.Errorf("FLOAT out of range")
+		}
+		return math.Float64frombits(binary.LittleEndian.Uint64(row[pos:])), pos + 8, nil
+	case "DOUBLE", "DOUBLE PRECISION":
+		if pos+8 > len(row) {
+			return nil, pos, fmt.Errorf("%s out of range", dataType)
+		}
+		return math.Float64frombits(binary.LittleEndian.Uint64(row[pos:])), pos + 8, nil
 	case "DATE":
 		if pos+3 > len(row) {
 			return nil, pos, fmt.Errorf("DATE out of range")
@@ -1624,7 +1874,25 @@ func parseFixedDataValue(col columnDef, row []byte, pos int) (any, int, error) {
 			return nil, pos, err
 		}
 		return value, pos + 3, nil
-	case "DATETIME", "TIMESTAMP", "TIME":
+	case "TIME":
+		if pos+5 > len(row) {
+			return nil, pos, fmt.Errorf("TIME out of range")
+		}
+		value, err := decodeDMTime(row[pos : pos+5])
+		if err != nil {
+			return nil, pos, err
+		}
+		return value, pos + 5, nil
+	case "TIME WITH TIME ZONE":
+		if pos+7 > len(row) {
+			return nil, pos, fmt.Errorf("TIME WITH TIME ZONE out of range")
+		}
+		value, err := decodeDMTime(row[pos : pos+5])
+		if err != nil {
+			return nil, pos, err
+		}
+		return value + " " + decodeDMTimezone(row[pos+5:pos+7]), pos + 7, nil
+	case "DATETIME", "TIMESTAMP", "TIMESTAMP WITH LOCAL TIME ZONE":
 		if pos+8 > len(row) {
 			return nil, pos, fmt.Errorf("%s out of range", dataType)
 		}
@@ -1633,6 +1901,25 @@ func parseFixedDataValue(col columnDef, row []byte, pos int) (any, int, error) {
 			return nil, pos, err
 		}
 		return value, pos + 8, nil
+	case "DATETIME WITH TIME ZONE", "TIMESTAMP WITH TIME ZONE":
+		if pos+10 > len(row) {
+			return nil, pos, fmt.Errorf("%s out of range", dataType)
+		}
+		value, err := decodeDMDateTime(row[pos : pos+8])
+		if err != nil {
+			return nil, pos, err
+		}
+		return value + " " + decodeDMTimezone(row[pos+8:pos+10]), pos + 10, nil
+	case "INTERVAL DAY TO SECOND":
+		if pos+24 > len(row) {
+			return nil, pos, fmt.Errorf("INTERVAL DAY TO SECOND out of range")
+		}
+		return decodeDMIntervalDayToSecond(row[pos : pos+24]), pos + 24, nil
+	case "ROWID":
+		if pos+12 > len(row) {
+			return nil, pos, fmt.Errorf("ROWID out of range")
+		}
+		return dmRowID(strings.ToUpper(hex.EncodeToString(row[pos : pos+12]))), pos + 12, nil
 	default:
 		return nil, pos, fmt.Errorf("unsupported fixed type: %s", dataType)
 	}
@@ -1645,7 +1932,23 @@ func isFixedNullSentinel(dataType string, raw []byte) bool {
 			return false
 		}
 		return raw[0] == 0 && raw[1] == 0 && raw[2] != 0
-	case "DATETIME", "TIMESTAMP", "TIME":
+	case "TIME":
+		if len(raw) != 5 {
+			return false
+		}
+		if isAllBytes(raw, 0x00) {
+			return true
+		}
+		if raw[0] == 0 && raw[1] == 0 {
+			return true
+		}
+		return raw[0] == 0xFF && raw[1] == 0xFF && raw[4] == 0x7F
+	case "TIME WITH TIME ZONE":
+		if len(raw) != 7 {
+			return false
+		}
+		return isFixedNullSentinel("TIME", raw[:5])
+	case "DATETIME", "TIMESTAMP", "TIMESTAMP WITH LOCAL TIME ZONE":
 		if len(raw) != 8 {
 			return false
 		}
@@ -1656,6 +1959,11 @@ func isFixedNullSentinel(dataType string, raw []byte) bool {
 			return true
 		}
 		return raw[0] == 0xFF && raw[1] == 0xFF && raw[4] == 0x7F
+	case "DATETIME WITH TIME ZONE", "TIMESTAMP WITH TIME ZONE":
+		if len(raw) != 10 {
+			return false
+		}
+		return isFixedNullSentinel("DATETIME", raw[:8])
 	default:
 		return false
 	}
@@ -1673,7 +1981,7 @@ func isAllBytes(raw []byte, value byte) bool {
 	return true
 }
 
-func readVariableDataValue(col columnDef, row []byte, pos int, decoder textDecoder) (any, int, error) {
+func readVariableDataValue(col columnDef, row []byte, pos int, decoder textDecoder, lobReader *dmLOBReader) (any, int, error) {
 	if isNumberDataType(col.DataType) {
 		value, next, err := readDMNumber(row, pos)
 		if err != nil {
@@ -1688,30 +1996,62 @@ func readVariableDataValue(col columnDef, row []byte, pos int, decoder textDecod
 		}
 		if payload, ok := unwrapInlineLOBPayload(value); ok {
 			value = payload
+		} else if locator, ok := parseDMLOBLocatorRaw(value); ok {
+			if lobReader == nil {
+				return nil, pos, fmt.Errorf("%s: out-of-line binary LOB locator cannot be resolved without data files", col.Name)
+			}
+			value, err = lobReader.readLOBPayload(locator, dmPageKindLOBData)
+			if err != nil {
+				return nil, pos, fmt.Errorf("%s: %w", col.Name, err)
+			}
 		}
 		return dmBinary(value), next, nil
 	}
 	if isCharacterLOBDataType(col.DataType) {
-		value, next, err := readInlineTextLOB(row, pos, decoder)
+		value, next, err := readInlineTextLOB(row, pos, decoder, lobReader)
 		if err != nil {
 			return nil, pos, fmt.Errorf("%s: %w", col.Name, err)
 		}
 		return value, next, nil
 	}
-	value, next, err := readShortDataVarchar(row, pos, decoder)
+	raw, next, marker, err := readShortDataBytesWithMarker(row, pos)
 	if err != nil {
 		return nil, pos, fmt.Errorf("%s: %w", col.Name, err)
+	}
+	if locator, ok := parseDMLOBLocatorRaw(raw); ok {
+		if lobReader == nil {
+			return nil, pos, fmt.Errorf("%s: out-of-line long row locator cannot be resolved without data files", col.Name)
+		}
+		raw, err = lobReader.readLongRowPayload(locator)
+		if err != nil {
+			return nil, pos, fmt.Errorf("%s: %w", col.Name, err)
+		}
+	}
+	value, ok := decoder.decode(raw)
+	if !ok {
+		return nil, pos, fmt.Errorf("%s: cannot decode varchar marker=0x%02X raw=%s", col.Name, marker, strings.ToUpper(hex.EncodeToString(raw)))
+	}
+	if strings.ContainsRune(value, '\uFFFD') || containsBadControl(value) {
+		return nil, pos, fmt.Errorf("%s: decoded varchar contains invalid characters marker=0x%02X raw=%s", col.Name, marker, strings.ToUpper(hex.EncodeToString(raw)))
 	}
 	return value, next, nil
 }
 
-func readInlineTextLOB(row []byte, pos int, decoder textDecoder) (string, int, error) {
+func readInlineTextLOB(row []byte, pos int, decoder textDecoder, lobReader *dmLOBReader) (string, int, error) {
 	raw, next, marker, err := readShortDataBytesWithMarker(row, pos)
 	if err != nil {
 		return "", pos, fmt.Errorf("%s", strings.Replace(err.Error(), "raw value", "text LOB", 1))
 	}
 	if payload, ok := unwrapInlineLOBPayload(raw); ok {
 		raw = payload
+	} else if locator, ok := parseDMLOBLocatorRaw(raw); ok {
+		if lobReader == nil {
+			return "", pos, fmt.Errorf("out-of-line text LOB locator cannot be resolved without data files")
+		}
+		raw, err = lobReader.readTextLOBOrLongRowPayload(locator)
+		if err != nil {
+			return "", pos, err
+		}
 	}
 	value, ok := decoder.decode(raw)
 	if !ok {
@@ -1782,7 +2122,7 @@ func unwrapInlineLOBPayload(raw []byte) ([]byte, bool) {
 	if len(raw) < 13 {
 		return nil, false
 	}
-	if raw[0] != 0x01 || raw[1] != 0x27 || raw[2] != 0x04 {
+	if raw[0] != 0x01 || raw[2] != 0x04 {
 		return nil, false
 	}
 	payloadLen := int(binary.LittleEndian.Uint32(raw[9:13]))
@@ -1790,6 +2130,198 @@ func unwrapInlineLOBPayload(raw []byte) ([]byte, bool) {
 		return nil, false
 	}
 	return append([]byte(nil), raw[13:]...), true
+}
+
+func readDMLOBLocator(row []byte, pos int) (dmLOBLocator, int, error) {
+	if pos < 0 || pos+dmLOBLocatorSize > len(row) {
+		return dmLOBLocator{}, pos, fmt.Errorf("LOB locator out of range")
+	}
+	raw := append([]byte(nil), row[pos:pos+dmLOBLocatorSize]...)
+	locator, ok := parseDMLOBLocatorRaw(raw)
+	if !ok {
+		return dmLOBLocator{}, pos, fmt.Errorf("invalid LOB locator %s", strings.ToUpper(hex.EncodeToString(raw)))
+	}
+	return locator, pos + dmLOBLocatorSize, nil
+}
+
+func parseDMLOBLocatorRaw(raw []byte) (dmLOBLocator, bool) {
+	if len(raw) != dmLOBLocatorSize || raw[0] != 0x02 {
+		return dmLOBLocator{}, false
+	}
+	locator := dmLOBLocator{
+		raw:       append([]byte(nil), raw...),
+		lobID:     binary.LittleEndian.Uint32(raw[1:5]),
+		byteLen:   binary.LittleEndian.Uint32(raw[9:13]),
+		groupID:   binary.LittleEndian.Uint32(raw[13:17]),
+		firstPage: binary.LittleEndian.Uint32(raw[17:21]),
+	}
+	if locator.lobID == 0 || locator.groupID == 0 || locator.firstPage == 0 {
+		return dmLOBLocator{}, false
+	}
+	return locator, true
+}
+
+func (r *dmLOBReader) readLOBPayload(locator dmLOBLocator, kind uint32) ([]byte, error) {
+	if r == nil || r.cache == nil {
+		return nil, fmt.Errorf("LOB reader is not available")
+	}
+	start, ok := r.findFirstLOBPage(locator, kind)
+	if !ok {
+		return nil, fmt.Errorf("LOB page not found: lob_id=%d group=%d page=%d kind=0x%X", locator.lobID, locator.groupID, locator.firstPage, kind)
+	}
+	var out []byte
+	current := start
+	seen := make(map[dataPageRef]bool)
+	maxSteps := r.cache.totalPageCount() * maxLeafChainWalkMultiplier
+	if maxSteps <= 0 {
+		maxSteps = 1
+	}
+	for steps := 0; steps < maxSteps && len(out) < int(locator.byteLen); steps++ {
+		if seen[current] {
+			break
+		}
+		seen[current] = true
+		page, ok := r.cache.readPage(current)
+		if !ok || !pageHeaderMatchesRef(page, current) || dataPageKind(page) != kind || lobPageID(page) != locator.lobID {
+			break
+		}
+		payloadLen := int(lobPagePayloadLen(page))
+		if payloadLen < 0 || dmLOBPagePayloadOff+payloadLen > len(page) {
+			return nil, fmt.Errorf("bad LOB payload length %d at page %d", payloadLen, current.pageNo)
+		}
+		out = append(out, page[dmLOBPagePayloadOff:dmLOBPagePayloadOff+payloadLen]...)
+		nextFileID, nextPageNo, ok := readDMPageRef(page, dmPageNextRefOff)
+		if !ok {
+			break
+		}
+		current = dataPageRef{
+			key: dataFileKey{
+				groupID: locator.groupID,
+				fileID:  nextFileID,
+			},
+			pageNo: nextPageNo,
+		}
+	}
+	if len(out) < int(locator.byteLen) {
+		return nil, fmt.Errorf("LOB payload incomplete: got=%d want=%d", len(out), locator.byteLen)
+	}
+	return append([]byte(nil), out[:int(locator.byteLen)]...), nil
+}
+
+func (r *dmLOBReader) readTextLOBOrLongRowPayload(locator dmLOBLocator) ([]byte, error) {
+	payload, err := r.readLOBPayload(locator, dmPageKindLOBData)
+	if err == nil {
+		return payload, nil
+	}
+	longPayload, longErr := r.readLongRowPayload(locator)
+	if longErr == nil {
+		return longPayload, nil
+	}
+	return nil, err
+}
+
+func (r *dmLOBReader) readLongRowPayload(locator dmLOBLocator) ([]byte, error) {
+	if r == nil || r.cache == nil {
+		return nil, fmt.Errorf("LOB reader is not available")
+	}
+	start, ok := r.findFirstLOBPage(locator, dmPageKindLongRowData)
+	if !ok {
+		return nil, fmt.Errorf("long-row page not found: lob_id=%d group=%d page=%d", locator.lobID, locator.groupID, locator.firstPage)
+	}
+	current := start
+	seen := make(map[dataPageRef]bool)
+	maxSteps := r.cache.totalPageCount() * maxLeafChainWalkMultiplier
+	if maxSteps <= 0 {
+		maxSteps = 1
+	}
+	for steps := 0; steps < maxSteps; steps++ {
+		if seen[current] {
+			break
+		}
+		seen[current] = true
+		page, ok := r.cache.readPage(current)
+		if !ok || !pageHeaderMatchesRef(page, current) || dataPageKind(page) != dmPageKindLongRowData {
+			break
+		}
+		if payload, ok := longRowPayloadFromPage(page, locator); ok {
+			return payload, nil
+		}
+		nextFileID, nextPageNo, ok := readDMPageRef(page, dmPageNextRefOff)
+		if !ok {
+			break
+		}
+		current = dataPageRef{
+			key: dataFileKey{
+				groupID: locator.groupID,
+				fileID:  nextFileID,
+			},
+			pageNo: nextPageNo,
+		}
+	}
+	return nil, fmt.Errorf("long-row payload not found: lob_id=%d", locator.lobID)
+}
+
+func (r *dmLOBReader) findFirstLOBPage(locator dmLOBLocator, kind uint32) (dataPageRef, bool) {
+	if r == nil || r.cache == nil {
+		return dataPageRef{}, false
+	}
+	for key := range r.cache.refs {
+		if key.groupID != locator.groupID {
+			continue
+		}
+		ref := dataPageRef{key: key, pageNo: locator.firstPage}
+		page, ok := r.cache.readPage(ref)
+		if !ok || !pageHeaderMatchesRef(page, ref) || dataPageKind(page) != kind {
+			continue
+		}
+		if kind == dmPageKindLOBData && lobPageID(page) != locator.lobID {
+			continue
+		}
+		if kind == dmPageKindLongRowData {
+			if _, ok := longRowPayloadFromPage(page, locator); !ok {
+				continue
+			}
+		}
+		return ref, true
+	}
+	return dataPageRef{}, false
+}
+
+func lobPageID(page []byte) uint32 {
+	if len(page) < dmLOBPageIDOff+4 {
+		return 0
+	}
+	return binary.LittleEndian.Uint32(page[dmLOBPageIDOff:])
+}
+
+func lobPagePayloadLen(page []byte) uint16 {
+	if len(page) < dmLOBPagePayloadLenOff+2 {
+		return 0
+	}
+	return binary.LittleEndian.Uint16(page[dmLOBPagePayloadLenOff:])
+}
+
+func longRowPayloadFromPage(page []byte, locator dmLOBLocator) ([]byte, bool) {
+	for off := dmLOBPagePayloadOff; off+0x0E <= len(page); off++ {
+		recordLen := int(binary.BigEndian.Uint16(page[off:]))
+		if recordLen < 0x0E || off+recordLen > len(page) {
+			continue
+		}
+		if binary.LittleEndian.Uint32(page[off+0x02:off+0x06]) != locator.lobID {
+			continue
+		}
+		payloadLen1 := int(binary.LittleEndian.Uint16(page[off+0x0A:]))
+		payloadLen2 := int(binary.LittleEndian.Uint16(page[off+0x0C:]))
+		payloadLen := payloadLen1
+		if payloadLen2 > 0 && payloadLen2 < payloadLen {
+			payloadLen = payloadLen2
+		}
+		if payloadLen <= 0 || payloadLen > int(locator.byteLen) || off+0x0E+payloadLen > off+recordLen {
+			continue
+		}
+		return append([]byte(nil), page[off+0x0E:off+0x0E+payloadLen]...), true
+	}
+	return nil, false
 }
 
 func readDMNumber(row []byte, pos int) (any, int, error) {
@@ -1916,21 +2448,55 @@ func decodeDMDateTime(raw []byte) (string, error) {
 	if len(raw) != 8 {
 		return "", fmt.Errorf("datetime needs 8 bytes")
 	}
-	v := binary.LittleEndian.Uint64(raw)
-	year := int(v & ((1 << 15) - 1))
-	month := int((v >> 15) & 0xF)
-	day := int((v >> 19) & 0x1F)
-	hour := int((v >> 24) & 0x1F)
-	minute := int((v >> 29) & 0x3F)
-	second := int((v >> 35) & 0x3F)
-	micro := int((v >> 41) & ((1 << 23) - 1))
-	if year < 1 || year > 9999 || month < 1 || month > 12 || day < 1 || day > daysInMonth(year, month) {
-		return "", fmt.Errorf("invalid datetime date bits: %04d-%02d-%02d", year, month, day)
+	date, err := decodeDMDate(raw[:3])
+	if err != nil {
+		return "", fmt.Errorf("%s", strings.Replace(err.Error(), "date", "datetime date", 1))
 	}
+	timeValue, err := decodeDMTime(raw[3:8])
+	if err != nil {
+		return "", fmt.Errorf("%s", strings.Replace(err.Error(), "time", "datetime time", 1))
+	}
+	return date + " " + timeValue, nil
+}
+
+func decodeDMTime(raw []byte) (string, error) {
+	if len(raw) != 5 {
+		return "", fmt.Errorf("time needs 5 bytes")
+	}
+	v := uint64(raw[0]) | uint64(raw[1])<<8 | uint64(raw[2])<<16 | uint64(raw[3])<<24 | uint64(raw[4])<<32
+	hour := int(v & 0x1F)
+	minute := int((v >> 5) & 0x3F)
+	second := int((v >> 11) & 0x3F)
+	micro := int((v >> 17) & ((1 << 23) - 1))
 	if hour > 23 || minute > 59 || second > 59 || micro > 999999 {
 		return "", fmt.Errorf("invalid datetime time bits: %02d:%02d:%02d.%06d", hour, minute, second, micro)
 	}
-	return fmt.Sprintf("%04d-%02d-%02d %02d:%02d:%02d.%06d", year, month, day, hour, minute, second, micro), nil
+	return fmt.Sprintf("%02d:%02d:%02d.%06d", hour, minute, second, micro), nil
+}
+
+func decodeDMTimezone(raw []byte) string {
+	if len(raw) != 2 {
+		return "+00:00"
+	}
+	minutes := int(int16(binary.LittleEndian.Uint16(raw)))
+	sign := "+"
+	if minutes < 0 {
+		sign = "-"
+		minutes = -minutes
+	}
+	return fmt.Sprintf("%s%02d:%02d", sign, minutes/60, minutes%60)
+}
+
+func decodeDMIntervalDayToSecond(raw []byte) string {
+	if len(raw) < 20 {
+		return ""
+	}
+	day := int32(binary.LittleEndian.Uint32(raw[0:4]))
+	hour := int32(binary.LittleEndian.Uint32(raw[4:8]))
+	minute := int32(binary.LittleEndian.Uint32(raw[8:12]))
+	second := int32(binary.LittleEndian.Uint32(raw[12:16]))
+	micro := int32(binary.LittleEndian.Uint32(raw[16:20]))
+	return fmt.Sprintf("%d %02d:%02d:%02d.%06d", day, hour, minute, second, micro)
 }
 
 func sqlValueForDataColumn(col columnDef, value any) (string, error) {
@@ -1941,22 +2507,28 @@ func sqlValueForDataColumn(col columnDef, value any) (string, error) {
 	switch typ {
 	case "TINYINT", "SMALLINT", "INT", "INTEGER", "BIGINT":
 		return fmt.Sprintf("%v", value), nil
+	case "REAL", "FLOAT", "DOUBLE", "DOUBLE PRECISION":
+		return fmt.Sprintf("%v", value), nil
 	case "NUMBER", "NUMERIC", "DEC", "DECIMAL":
 		return fmt.Sprintf("%v", value), nil
-	case "DATETIME", "TIMESTAMP":
-		return "DATETIME " + sqlLiteral(fmt.Sprintf("%v", value)), nil
+	case "DATETIME", "TIMESTAMP", "DATETIME WITH TIME ZONE", "TIMESTAMP WITH TIME ZONE", "TIMESTAMP WITH LOCAL TIME ZONE":
+		prefix := "DATETIME "
+		if strings.HasPrefix(typ, "TIMESTAMP") {
+			prefix = "TIMESTAMP "
+		}
+		return prefix + sqlLiteral(fmt.Sprintf("%v", value)), nil
 	case "DATE":
 		text := fmt.Sprintf("%v", value)
 		if len(text) >= 10 {
 			text = text[:10]
 		}
 		return "DATE " + sqlLiteral(text), nil
-	case "TIME":
-		text := fmt.Sprintf("%v", value)
-		if len(text) >= 19 {
-			text = text[11:]
-		}
-		return "TIME " + sqlLiteral(text), nil
+	case "TIME", "TIME WITH TIME ZONE":
+		return "TIME " + sqlLiteral(fmt.Sprintf("%v", value)), nil
+	case "INTERVAL DAY TO SECOND":
+		return "INTERVAL " + sqlLiteral(fmt.Sprintf("%v", value)) + " DAY TO SECOND", nil
+	case "ROWID":
+		return sqlLiteral(fmt.Sprintf("%v", value)), nil
 	default:
 		if raw, ok := value.(dmBinary); ok {
 			return "HEXTORAW('" + strings.ToUpper(hex.EncodeToString(raw)) + "')", nil

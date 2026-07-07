@@ -2,6 +2,7 @@ package dm
 
 import (
 	"encoding/binary"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,7 @@ import (
 
 func TestLocateRowsInDataPage(t *testing.T) {
 	page := make([]byte, 8192)
+	binary.LittleEndian.PutUint32(page[dmPageKindOff:], dmPageKindRowData)
 	pos := dataRowAreaStart
 	putTestRow(page, pos, 5, 0x00)
 	pos += 5
@@ -46,6 +48,7 @@ func TestLocateRowsInDataPage(t *testing.T) {
 
 func TestLocateRowsInHeapDataPageUsesSlotArray(t *testing.T) {
 	page := make([]byte, 8192)
+	binary.LittleEndian.PutUint32(page[dmPageKindOff:], dmPageKindRowData)
 	offsets := []int{0x4FA, 0x3D4, 0x2AE, 0x188, 0x62}
 	for i, off := range offsets {
 		putTestRow(page, off, 0x126, 0x00)
@@ -100,6 +103,24 @@ func TestDecodeDMDate(t *testing.T) {
 	}
 	if got != "2000-10-06" {
 		t.Fatalf("decodeDMDate = %q, want %q", got, "2000-10-06")
+	}
+}
+
+func TestDecodeDMTime(t *testing.T) {
+	var raw [5]byte
+	v := uint64(15) |
+		uint64(56)<<5 |
+		uint64(5)<<11 |
+		uint64(123456)<<17
+	for i := 0; i < len(raw); i++ {
+		raw[i] = byte(v >> (8 * i))
+	}
+	got, err := decodeDMTime(raw[:])
+	if err != nil {
+		t.Fatalf("decodeDMTime returned error: %v", err)
+	}
+	if got != "15:56:05.123456" {
+		t.Fatalf("decodeDMTime = %q", got)
 	}
 }
 
@@ -213,6 +234,36 @@ func TestBuildStoragePagePlanDescendsInternalRoot(t *testing.T) {
 	}
 	if plan[dataPageRef{key: dataFileKey{groupID: 4, fileID: 0}, pageNo: 16}] {
 		t.Fatalf("internal root should not be exported as a data page: %+v", plan)
+	}
+	if !plan[dataPageRef{key: dataFileKey{groupID: 4, fileID: 0}, pageNo: 20}] || !plan[dataPageRef{key: dataFileKey{groupID: 4, fileID: 0}, pageNo: 21}] {
+		t.Fatalf("unexpected page plan: %+v", plan)
+	}
+}
+
+func TestBuildStoragePagePlanUsesInternalNextWhenLeftmostChildIsMissing(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "MAIN.DBF")
+	raw := make([]byte, 64*8192)
+	putTestDMPageHeader(raw[16*8192:17*8192], 4, 0, 16, dmPageKindBTreeRoot, 1041)
+	binary.LittleEndian.PutUint32(raw[16*8192+dmBTreeLeftmostChildOff:], 99)
+	putTestDMPageRef(raw[16*8192:17*8192], dmPageNextRefOff, 0, 18)
+	putTestDMPageHeader(raw[18*8192:19*8192], 4, 0, 18, dmPageKindBTreeRoot, 1041)
+	binary.LittleEndian.PutUint32(raw[18*8192+dmBTreeLeftmostChildOff:], 20)
+	putTestDMPageHeader(raw[20*8192:21*8192], 4, 0, 20, dmPageKindBTreeLeaf, 1041)
+	putTestDMPageRef(raw[20*8192:21*8192], dmPageNextRefOff, 0, 21)
+	putTestDMPageHeader(raw[21*8192:22*8192], 4, 0, 21, dmPageKindBTreeLeaf, 1041)
+	putTestDMNullPageRef(raw[21*8192:22*8192], dmPageNextRefOff)
+	if err := os.WriteFile(path, raw, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cache := newDataFilePageCache([]dataFileRef{{key: dataFileKey{groupID: 4, fileID: 0}, path: path}}, 8192)
+	plan := buildStoragePagePlan(indexDef{ID: 1041, GroupID: 4, RootFile: 0, RootPage: 16}, cache)
+	if len(plan) != 2 {
+		t.Fatalf("expected 2 planned leaf pages, got %d", len(plan))
+	}
+	if plan[dataPageRef{key: dataFileKey{groupID: 4, fileID: 0}, pageNo: 16}] || plan[dataPageRef{key: dataFileKey{groupID: 4, fileID: 0}, pageNo: 18}] {
+		t.Fatalf("internal pages should not be exported as data pages: %+v", plan)
 	}
 	if !plan[dataPageRef{key: dataFileKey{groupID: 4, fileID: 0}, pageNo: 20}] || !plan[dataPageRef{key: dataFileKey{groupID: 4, fileID: 0}, pageNo: 21}] {
 		t.Fatalf("unexpected page plan: %+v", plan)
@@ -340,6 +391,107 @@ func TestRenderInsertForMixedDateAndVariableRow(t *testing.T) {
 	}
 }
 
+func TestRenderInsertUsesExplicitNullMetadata(t *testing.T) {
+	row := []byte{
+		0x00, 0x0D,
+		0xCC,
+		0x0A, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00,
+		0x85, 'A', 'l', 'i', 'c', 'e',
+	}
+	info := dataTableInfo{
+		table: dictionaryObject{Owner: "APP", Name: "T_NULL_META"},
+		columns: []columnDef{
+			{ColID: 1, Name: "ID", DataType: "INT", Nullable: "N"},
+			{ColID: 2, Name: "N1", DataType: "INT", Nullable: "Y"},
+			{ColID: 3, Name: "NAME", DataType: "VARCHAR", Nullable: "Y"},
+			{ColID: 4, Name: "NOTE", DataType: "VARCHAR", Nullable: "Y"},
+		},
+	}
+	sql, start, _, err := renderInsertForDataRow(info, row, textDecoder{preferred: "utf-8"})
+	if err != nil {
+		t.Fatalf("renderInsertForDataRow returned error: %v", err)
+	}
+	if start != 3 {
+		t.Fatalf("data start = %d, want 3", start)
+	}
+	want := `INSERT INTO APP.T_NULL_META (ID, N1, NAME, NOTE) VALUES (10, NULL, 'Alice', NULL);`
+	if !strings.Contains(sql, want) {
+		t.Fatalf("unexpected insert sql: %s", sql)
+	}
+}
+
+func TestRenderInsertForScalarTypes(t *testing.T) {
+	var timeRaw [5]byte
+	tv := uint64(15) | uint64(56)<<5 | uint64(5)<<11 | uint64(123456)<<17
+	for i := 0; i < len(timeRaw); i++ {
+		timeRaw[i] = byte(tv >> (8 * i))
+	}
+	row := []byte{0x00, 0x16, 0x00}
+	var buf [8]byte
+	binary.LittleEndian.PutUint32(buf[:4], math.Float32bits(float32(1.25)))
+	row = append(row, buf[:4]...)
+	binary.LittleEndian.PutUint64(buf[:8], math.Float64bits(3.5))
+	row = append(row, buf[:8]...)
+	row = append(row, timeRaw[:]...)
+	info := dataTableInfo{
+		table: dictionaryObject{Owner: "APP", Name: "T_TYPES"},
+		columns: []columnDef{
+			{ColID: 1, Name: "R", DataType: "REAL", Nullable: "N"},
+			{ColID: 2, Name: "D", DataType: "DOUBLE", Nullable: "N"},
+			{ColID: 3, Name: "T", DataType: "TIME", Nullable: "N"},
+		},
+	}
+	sql, _, _, err := renderInsertForDataRow(info, row, textDecoder{preferred: "utf-8"})
+	if err != nil {
+		t.Fatalf("renderInsertForDataRow returned error: %v", err)
+	}
+	if !strings.Contains(sql, "VALUES (1.25, 3.5, TIME '15:56:05.123456');") {
+		t.Fatalf("unexpected insert sql: %s", sql)
+	}
+}
+
+func TestRenderInsertResolvesLongRowLocator(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "MAIN.DBF")
+	raw := make([]byte, 128*8192)
+	page := raw[120*8192 : 121*8192]
+	putTestDMPageHeader(page, 4, 0, 120, dmPageKindLongRowData, 0)
+	putTestDMNullPageRef(page, dmPageNextRefOff)
+	payload := []byte("LONG_ROW_PAYLOAD")
+	recordOff := dmLOBPagePayloadOff
+	recordLen := 0x0E + len(payload)
+	binary.BigEndian.PutUint16(page[recordOff:], uint16(recordLen))
+	binary.LittleEndian.PutUint32(page[recordOff+0x02:], 77)
+	binary.LittleEndian.PutUint16(page[recordOff+0x0A:], uint16(len(payload)))
+	binary.LittleEndian.PutUint16(page[recordOff+0x0C:], uint16(len(payload)))
+	copy(page[recordOff+0x0E:], payload)
+	if err := os.WriteFile(path, raw, 0644); err != nil {
+		t.Fatal(err)
+	}
+	cache := newDataFilePageCache([]dataFileRef{{key: dataFileKey{groupID: 4, fileID: 0}, path: path}}, 8192)
+	row := []byte{0x00, 0x1C, 0x04}
+	var id [4]byte
+	binary.LittleEndian.PutUint32(id[:], 1)
+	row = append(row, id[:]...)
+	row = append(row, makeTestLOBLocator(77, uint32(len(payload)), 4, 120)...)
+	info := dataTableInfo{
+		table:     dictionaryObject{Owner: "APP", Name: "T_LONG"},
+		lobReader: &dmLOBReader{cache: cache},
+		columns: []columnDef{
+			{ColID: 1, Name: "ID", DataType: "INT", Nullable: "N"},
+			{ColID: 2, Name: "V", DataType: "VARCHAR", Nullable: "Y"},
+		},
+	}
+	sql, _, _, err := renderInsertForDataRow(info, row, textDecoder{preferred: "utf-8"})
+	if err != nil {
+		t.Fatalf("renderInsertForDataRow returned error: %v", err)
+	}
+	if !strings.Contains(sql, "VALUES (1, 'LONG_ROW_PAYLOAD');") {
+		t.Fatalf("unexpected insert sql: %s", sql)
+	}
+}
+
 func TestRenderInsertForRowBeforeTrailingColumnsWereAdded(t *testing.T) {
 	row := []byte{
 		0x00, 0x07, 0x00,
@@ -407,6 +559,100 @@ func TestRenderInsertForIndexLikeRowDoesNotUseHistoricalColumnFallback(t *testin
 	}
 	if _, _, _, err := renderInsertForDataRow(info, row, textDecoder{preferred: "utf-8"}); err == nil {
 		t.Fatal("index-like single-key row should not be decoded via historical column fallback")
+	}
+}
+
+func TestSelectDataPageCandidateSkipsLooseHistoricalRowLeaf(t *testing.T) {
+	row := []byte{
+		0x00, 0x07, 0x00,
+		0x0A, 0x00, 0x00, 0x00,
+	}
+	page := make([]byte, 8192)
+	putTestDMPageHeader(page, 4, 0, 336, dmPageKindRowData, 33555517)
+	copy(page[dataRowAreaStart:], row)
+	candidate := dataTableInfo{
+		table:          dictionaryObject{Owner: "JYC", Name: "t", ID: 1069},
+		historicalRows: true,
+		columns: []columnDef{
+			{ColID: 1, Name: "id", DataType: "INT", Nullable: "Y"},
+			{ColID: 2, Name: "name", DataType: "VARCHAR(20)", Nullable: "Y"},
+			{ColID: 3, Name: "birth", DataType: "DATE", Nullable: "Y"},
+		},
+	}
+	_, ok := selectDataPageCandidate(
+		[]dataTableInfo{candidate},
+		dataFileRef{key: dataFileKey{groupID: 4, fileID: 0}},
+		336,
+		page,
+		8192,
+		[]locatedDataRow{{slotNo: 1, offset: dataRowAreaStart, length: uint16(len(row))}},
+		textDecoder{preferred: "utf-8"},
+	)
+	if ok {
+		t.Fatal("loose historical candidate should not be selected on ordinary row/index leaf page")
+	}
+
+	putTestDMPageHeader(page, 4, 0, 592, dmPageKindRowOverflow, 33555536)
+	_, ok = selectDataPageCandidate(
+		[]dataTableInfo{candidate},
+		dataFileRef{key: dataFileKey{groupID: 4, fileID: 0}},
+		592,
+		page,
+		8192,
+		[]locatedDataRow{{slotNo: 1, offset: dataRowAreaStart, length: uint16(len(row))}},
+		textDecoder{preferred: "utf-8"},
+	)
+	if !ok {
+		t.Fatal("loose historical candidate should remain available on row overflow/residual page")
+	}
+}
+
+func TestSelectDataPageCandidateSkipsTableAssistHeaderWhenStorageIsKnown(t *testing.T) {
+	row := []byte{
+		0x00, 0x0A,
+		0x3C,
+		0x0A, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x01,
+	}
+	page := make([]byte, 8192)
+	tableID := uint32(1069)
+	candidate := dataTableInfo{
+		table:          dictionaryObject{Owner: "JYC", Name: "t", ID: tableID},
+		dataStorageID:  33555535,
+		historicalRows: true,
+		columns: []columnDef{
+			{ColID: 1, Name: "id", DataType: "INT", Nullable: "Y"},
+			{ColID: 2, Name: "name", DataType: "VARCHAR(20)", Nullable: "Y"},
+			{ColID: 3, Name: "birth", DataType: "DATE", Nullable: "Y"},
+		},
+	}
+	putTestDMPageHeader(page, 4, 0, 576, dmPageKindRowData, tableDataAssistID(tableID))
+	copy(page[dataRowAreaStart:], row)
+	_, ok := selectDataPageCandidate(
+		[]dataTableInfo{candidate},
+		dataFileRef{key: dataFileKey{groupID: 4, fileID: 0}},
+		576,
+		page,
+		8192,
+		[]locatedDataRow{{slotNo: 1, offset: dataRowAreaStart, length: uint16(len(row))}},
+		textDecoder{preferred: "utf-8"},
+	)
+	if ok {
+		t.Fatal("tableDataAssist row page should be skipped when dictionary already knows the real data storage")
+	}
+
+	putTestDMPageHeader(page, 4, 0, 592, dmPageKindRowOverflow, 33555536)
+	_, ok = selectDataPageCandidate(
+		[]dataTableInfo{candidate},
+		dataFileRef{key: dataFileKey{groupID: 4, fileID: 0}},
+		592,
+		page,
+		8192,
+		[]locatedDataRow{{slotNo: 1, offset: dataRowAreaStart, length: uint16(len(row))}},
+		textDecoder{preferred: "utf-8"},
+	)
+	if !ok {
+		t.Fatal("row overflow/residual page should remain selectable for historical rows")
 	}
 }
 
@@ -577,6 +823,16 @@ func testInlineLOBEnvelope(seq byte, payload []byte) []byte {
 	raw[3] = seq
 	binary.LittleEndian.PutUint32(raw[9:13], uint32(len(payload)))
 	copy(raw[13:], payload)
+	return raw
+}
+
+func makeTestLOBLocator(lobID uint32, byteLen uint32, groupID uint32, firstPage uint32) []byte {
+	raw := make([]byte, dmLOBLocatorSize)
+	raw[0] = 0x02
+	binary.LittleEndian.PutUint32(raw[1:5], lobID)
+	binary.LittleEndian.PutUint32(raw[9:13], byteLen)
+	binary.LittleEndian.PutUint32(raw[13:17], groupID)
+	binary.LittleEndian.PutUint32(raw[17:21], firstPage)
 	return raw
 }
 
