@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"time"
 	"unicode"
@@ -44,7 +45,7 @@ func RunInteractive(input io.Reader, stdout io.Writer, stderr io.Writer) error {
 	}
 	defer session.closeLog()
 
-	fmt.Fprintf(stdout, "dmdul: Release %s - Dameng Data Unloader Tool\n", version.Version)
+	fmt.Fprintf(stdout, "dmdul: Release %s - Dameng Database Offline Recovery & Data Unloader\n", version.Version)
 	fmt.Fprintln(stdout, "Copyright (c) 2026 greatfinish. All rights reserved.")
 	fmt.Fprintln(stdout, "https://github.com/greatfinish/dmdul")
 	fmt.Fprintln(stdout, "Type help; for available commands.")
@@ -317,6 +318,7 @@ func (s *interactiveSession) bootstrap(stdout io.Writer) error {
 	if detectedCharset, ok := charsetParameterFromDictionary(dict.Charset); ok {
 		s.charset = detectedCharset
 	}
+	debug.FreeOSMemory()
 
 	fmt.Fprintln(stdout, "bootstrap completed")
 	fmt.Fprintf(stdout, "system file: %s\n", dict.SystemPath)
@@ -365,14 +367,88 @@ func (s *interactiveSession) printParameters(stdout io.Writer) {
 
 func (s *interactiveSession) printUsers(stdout io.Writer) {
 	s.printDictionarySummary(stdout)
-	counts := make(map[string]int)
-	for _, table := range s.dictionary.Tables {
-		counts[strings.ToUpper(table.Owner)]++
-	}
-	fmt.Fprintf(stdout, "%-22s %-10s\n", "user", "tables")
+	counts := dictionaryUserObjectCounts(s.dictionary)
+	fmt.Fprintf(stdout, "%-22s %8s %8s %10s %10s %9s %10s %11s %9s\n",
+		"user", "tables", "views", "synonyms", "sequences", "triggers", "functions", "procedures", "packages")
 	for _, user := range s.dictionary.Users {
-		fmt.Fprintf(stdout, "%-22s %-10d\n", user.Name, counts[strings.ToUpper(user.Name)])
+		count := counts[strings.ToUpper(user.Name)]
+		fmt.Fprintf(stdout, "%-22s %8d %8d %10d %10d %9d %10d %11d %9d\n",
+			user.Name,
+			count.Tables,
+			count.Views,
+			count.Synonyms,
+			count.Sequences,
+			count.Triggers,
+			count.Functions,
+			count.Procedures,
+			count.Packages,
+		)
 	}
+}
+
+type userObjectCounts struct {
+	Tables     int
+	Views      int
+	Synonyms   int
+	Sequences  int
+	Triggers   int
+	Functions  int
+	Procedures int
+	Packages   int
+}
+
+func dictionaryUserObjectCounts(dict *dm.DictionaryInfo) map[string]userObjectCounts {
+	result := make(map[string]userObjectCounts)
+	increment := func(owner string, apply func(*userObjectCounts)) {
+		key := strings.ToUpper(strings.TrimSpace(owner))
+		if key == "" {
+			return
+		}
+		count := result[key]
+		apply(&count)
+		result[key] = count
+	}
+	for _, table := range dict.Tables {
+		increment(table.Owner, func(count *userObjectCounts) { count.Tables++ })
+	}
+	for _, view := range dict.Views {
+		increment(view.Owner, func(count *userObjectCounts) { count.Views++ })
+	}
+	for _, syn := range dict.Synonyms {
+		increment(syn.Owner, func(count *userObjectCounts) { count.Synonyms++ })
+	}
+	for _, seq := range dict.Sequences {
+		increment(seq.Owner, func(count *userObjectCounts) { count.Sequences++ })
+	}
+	for _, trigger := range dict.Triggers {
+		increment(trigger.Owner, func(count *userObjectCounts) { count.Triggers++ })
+	}
+	packageNamesByOwner := make(map[string]map[string]bool)
+	for _, routine := range dict.Routines {
+		owner := strings.ToUpper(strings.TrimSpace(routine.Owner))
+		if owner == "" {
+			continue
+		}
+		switch strings.Join(strings.Fields(strings.ToUpper(strings.TrimSpace(routine.ObjectType))), " ") {
+		case "FUNCTION":
+			increment(owner, func(count *userObjectCounts) { count.Functions++ })
+		case "PROCEDURE":
+			increment(owner, func(count *userObjectCounts) { count.Procedures++ })
+		case "PACKAGE", "PACKAGE BODY":
+			names := packageNamesByOwner[owner]
+			if names == nil {
+				names = make(map[string]bool)
+				packageNamesByOwner[owner] = names
+			}
+			names[strings.ToUpper(strings.TrimSpace(routine.Name))] = true
+		}
+	}
+	for owner, names := range packageNamesByOwner {
+		count := result[owner]
+		count.Packages = len(names)
+		result[owner] = count
+	}
+	return result
 }
 
 func (s *interactiveSession) printDictionarySummary(stdout io.Writer) {
@@ -810,6 +886,7 @@ func (s *interactiveSession) loadDictionaryFiles(stdout io.Writer) error {
 	if detectedCharset, ok := charsetParameterFromDictionary(dict.Charset); ok && (s.charset == "" || strings.EqualFold(s.charset, "auto")) {
 		s.charset = detectedCharset
 	}
+	debug.FreeOSMemory()
 	if stdout != io.Discard {
 		fmt.Fprintf(stdout, "dictionary loaded: %s\n", files.Dir)
 		fmt.Fprintf(stdout, "users=%d tables=%d columns=%d views=%d sequences=%d routines=%d triggers=%d synonyms=%d tab_privs=%d\n",

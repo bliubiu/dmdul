@@ -307,8 +307,8 @@ func writeDictionaryViews(path string, views []DictionaryView) error {
 			view.Owner,
 			view.Name,
 			view.Valid,
-			view.SQL,
-			view.QuerySQL,
+			cleanRecoveredSQLText(view.SQL),
+			cleanRecoveredSQLText(view.QuerySQL),
 		})
 	}
 	return writeTSV(path, []string{"view_id", "owner", "view_name", "valid", "sql", "query_sql"}, rows)
@@ -329,7 +329,7 @@ func writeDictionarySequences(path string, sequences []DictionarySequence) error
 			seq.CycleFlag,
 			seq.OrderFlag,
 			formatUint32Field(seq.CacheSize),
-			seq.SQL,
+			cleanRecoveredSQLText(seq.SQL),
 		})
 	}
 	return writeTSV(path, []string{"sequence_id", "owner", "sequence_name", "valid", "start_with", "min_value", "max_value", "increment_by", "cycle_flag", "order_flag", "cache_size", "sql"}, rows)
@@ -345,7 +345,7 @@ func writeDictionaryRoutines(path string, routines []DictionaryRoutine) error {
 			normalizeRoutineObjectType(routine.ObjectType),
 			strconv.FormatUint(uint64(routine.SeqNo), 10),
 			routine.Valid,
-			routine.SQL,
+			cleanRecoveredSQLText(routine.SQL),
 		})
 	}
 	return writeTSV(path, []string{"routine_id", "owner", "routine_name", "object_type", "seq_no", "valid", "sql"}, rows)
@@ -361,7 +361,7 @@ func writeDictionaryTriggers(path string, triggers []DictionaryTrigger) error {
 			trigger.TableOwner,
 			trigger.TableName,
 			trigger.Valid,
-			trigger.SQL,
+			cleanRecoveredSQLText(trigger.SQL),
 		})
 	}
 	return writeTSV(path, []string{"trigger_id", "owner", "trigger_name", "table_owner", "table_name", "valid", "sql"}, rows)
@@ -525,10 +525,10 @@ func readDictionaryViews(path string) ([]DictionaryView, error) {
 			Owner: rec[1],
 			Name:  rec[2],
 			Valid: rec[3],
-			SQL:   rec[4],
+			SQL:   cleanRecoveredSQLText(rec[4]),
 		}
 		if len(rec) >= 6 {
-			view.QuerySQL = rec[5]
+			view.QuerySQL = cleanRecoveredSQLText(rec[5])
 		}
 		views = append(views, view)
 	}
@@ -559,13 +559,13 @@ func readDictionarySequences(path string) ([]DictionarySequence, error) {
 			seq.CycleFlag = rec[8]
 			seq.OrderFlag = rec[9]
 			seq.CacheSize = parseUint32Field(rec[10])
-			seq.SQL = rec[11]
+			seq.SQL = cleanRecoveredSQLText(rec[11])
 		} else {
 			seq.IncrementBy = parseInt64Field(rec[4])
 			seq.CycleFlag = rec[5]
 			seq.OrderFlag = rec[6]
 			if len(rec) >= 8 {
-				seq.SQL = rec[7]
+				seq.SQL = cleanRecoveredSQLText(rec[7])
 			}
 		}
 		sequences = append(sequences, seq)
@@ -590,7 +590,7 @@ func readDictionaryRoutines(path string) ([]DictionaryRoutine, error) {
 			ObjectType: normalizeRoutineObjectType(rec[3]),
 			SeqNo:      parseUint32Field(rec[4]),
 			Valid:      rec[5],
-			SQL:        rec[6],
+			SQL:        cleanRecoveredSQLText(rec[6]),
 		})
 	}
 	return routines, nil
@@ -613,7 +613,7 @@ func readDictionaryTriggers(path string) ([]DictionaryTrigger, error) {
 			TableOwner: rec[3],
 			TableName:  rec[4],
 			Valid:      rec[5],
-			SQL:        rec[6],
+			SQL:        cleanRecoveredSQLText(rec[6]),
 		})
 	}
 	return triggers, nil

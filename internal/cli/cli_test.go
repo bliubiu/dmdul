@@ -48,7 +48,7 @@ func TestRunInteractiveHelpAndExit(t *testing.T) {
 		t.Fatalf("RunInteractive returned error: %v", err)
 	}
 	output := stdout.String()
-	for _, want := range []string{"dmdul: Release v0.1.2", "Copyright (c) 2026 greatfinish", "https://github.com/greatfinish/dmdul", "DMDUL>", "bootstrap;", "list user;", "unload table", "unload database", "recover table", "bye"} {
+	for _, want := range []string{"dmdul: Release v0.1.2", "Dameng Database Offline Recovery & Data Unloader", "Copyright (c) 2026 greatfinish", "https://github.com/greatfinish/dmdul", "DMDUL>", "bootstrap;", "list user;", "unload table", "unload database", "recover table", "bye"} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("interactive output should contain %q, got %q", want, output)
 		}
@@ -178,6 +178,65 @@ func TestInteractiveLoadDictionaryUpdatesAutoCharset(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "charset    = gb18030") {
 		t.Fatalf("load dictionary should update charset, got %q", stdout.String())
+	}
+}
+
+func TestInteractiveListUserShowsObjectCounts(t *testing.T) {
+	previousDir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd failed: %v", err)
+	}
+	dir := t.TempDir()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("Chdir failed: %v", err)
+	}
+	defer func() {
+		if err := os.Chdir(previousDir); err != nil {
+			t.Fatalf("restore Chdir failed: %v", err)
+		}
+	}()
+
+	if _, err := dm.WriteDictionaryFiles(filepath.Join(dir, dm.DefaultDictionaryDirName), &dm.DictionaryInfo{
+		Source: "SYSTEM.DBF",
+		Users:  []dm.DictionaryUser{{ID: 1, Name: "APP"}},
+		Tables: []dm.DictionaryTable{
+			{ID: 1001, Owner: "APP", Name: "T1"},
+		},
+		Views: []dm.DictionaryView{
+			{ID: 2001, Owner: "APP", Name: "V1"},
+		},
+		Sequences: []dm.DictionarySequence{
+			{ID: 3001, Owner: "APP", Name: "S1"},
+		},
+		Routines: []dm.DictionaryRoutine{
+			{ID: 4001, Owner: "APP", Name: "F1", ObjectType: "FUNCTION"},
+			{ID: 4002, Owner: "APP", Name: "P1", ObjectType: "PROCEDURE"},
+			{ID: 4003, Owner: "APP", Name: "PKG1", ObjectType: "PACKAGE"},
+			{ID: 4003, Owner: "APP", Name: "PKG1", ObjectType: "PACKAGE BODY"},
+		},
+		Triggers: []dm.DictionaryTrigger{
+			{ID: 5001, Owner: "APP", Name: "TRG1"},
+		},
+		Synonyms: []dm.DictionarySynonym{
+			{ID: 6001, Owner: "APP", Name: "SYN1"},
+		},
+	}); err != nil {
+		t.Fatalf("WriteDictionaryFiles failed: %v", err)
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if err := RunInteractive(strings.NewReader("load dictionary;\nlist user;\nexit;\n"), &stdout, &stderr); err != nil {
+		t.Fatalf("RunInteractive returned error: %v", err)
+	}
+	output := stdout.String()
+	for _, want := range []string{"tables", "views", "synonyms", "sequences", "triggers", "functions", "procedures", "packages"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("list user output should contain %q, got %q", want, output)
+		}
+	}
+	if !strings.Contains(output, "APP                           1        1          1          1         1          1           1         1") {
+		t.Fatalf("list user should show per-owner object counts, got %q", output)
 	}
 }
 

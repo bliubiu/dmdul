@@ -149,6 +149,15 @@ func TestQuoteIdentQuotesReservedWords(t *testing.T) {
 	}
 }
 
+func TestEnsureSQLTerminatorTrimsRecoveredBinaryTail(t *testing.T) {
+	sql := "CREATE OR REPLACE TRIGGER APP.TRG BEFORE INSERT ON APP.T BEGIN NULL; END;\x00\x00garbage"
+	got := ensureSQLTerminator(sql)
+	want := "CREATE OR REPLACE TRIGGER APP.TRG BEFORE INSERT ON APP.T BEGIN NULL; END;"
+	if got != want {
+		t.Fatalf("ensureSQLTerminator() = %q, want %q", got, want)
+	}
+}
+
 func TestDictionaryObjectTableFlags(t *testing.T) {
 	heap := dictionaryObject{Info1: 0x10}
 	if heap.isIOTTable() {

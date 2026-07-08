@@ -36,6 +36,19 @@ func TestScanRawRoutineTextsFindsFunctionProcedureAndPackage(t *testing.T) {
 	}
 }
 
+func TestScanRawRoutineTextsIgnoresEndSemicolonInsideString(t *testing.T) {
+	raw := []byte("CREATE OR REPLACE FUNCTION APP.F_TEXT RETURN VARCHAR2 AS\nBEGIN\n    RETURN 'END;候诊时间为:以后';\nEND;\x00CREATE OR REPLACE FUNCTION APP.F_NEXT RETURN INT AS BEGIN RETURN 1; END;\x00")
+
+	got := scanRawRoutineTexts(raw, textDecoder{preferred: "utf-8"})
+	text := got[routineKey("APP", "F_TEXT", "FUNCTION")]
+	if !containsText(text, "候诊时间为") || !containsText(text, "END;") {
+		t.Fatalf("function string literal should be preserved, got %q", text)
+	}
+	if containsText(text, "F_NEXT") {
+		t.Fatalf("function text should not include the next routine, got %q", text)
+	}
+}
+
 func TestSequenceIsPrivilegeTarget(t *testing.T) {
 	obj := dictionaryObject{Type: "SCHOBJ", Subtype: "SEQ", Owner: "APP", Name: "SEQ_T"}
 	if !isTabPrivilegeTarget(obj) {

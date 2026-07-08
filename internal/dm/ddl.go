@@ -957,7 +957,7 @@ func isSafeDefault(value string) bool {
 		return false
 	}
 	for _, ch := range value {
-		if ch < 32 && ch != '\t' {
+		if ch == utf8.RuneError || (ch < 32 && ch != '\t') {
 			return false
 		}
 	}
@@ -1035,7 +1035,7 @@ func decodeWithEncoding(raw []byte, enc encoding.Encoding) (string, bool) {
 
 func containsBadControl(value string) bool {
 	for _, ch := range value {
-		if ch < 32 && ch != '\t' && ch != '\n' && ch != '\r' {
+		if ch == utf8.RuneError || (ch < 32 && ch != '\t' && ch != '\n' && ch != '\r') {
 			return true
 		}
 	}
@@ -1681,11 +1681,22 @@ func renderTabPrivileges(out *strings.Builder, privileges []DictionaryTabPrivile
 }
 
 func ensureSQLTerminator(sql string) string {
-	sql = strings.TrimSpace(sql)
+	sql = cleanRecoveredSQLText(sql)
 	if strings.HasSuffix(sql, ";") {
 		return sql
 	}
 	return sql + ";"
+}
+
+func cleanRecoveredSQLText(sql string) string {
+	sql = strings.TrimSpace(sql)
+	for i, ch := range sql {
+		if ch == utf8.RuneError || (ch < 32 && ch != '\t' && ch != '\n' && ch != '\r') {
+			sql = sql[:i]
+			break
+		}
+	}
+	return strings.TrimSpace(sql)
 }
 
 func renderIndexes(out *strings.Builder, tables map[uint32]dictionaryObject, columnsByTableColID map[tableColKey]columnDef, indexObjects map[uint32]dictionaryObject, indexes map[uint32]indexDef, matcher ownerMatcher, tableMatcher tableNameMatcher, tablespaces map[uint32]string) {

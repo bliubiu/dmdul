@@ -1,7 +1,6 @@
 package dm
 
 import (
-	"bytes"
 	"encoding/binary"
 	"regexp"
 	"sort"
@@ -835,9 +834,10 @@ func scanRawRoutineTexts(data []byte, decoder textDecoder) map[string]string {
 			}
 			sql, ok := decoder.decode(data[start:end])
 			if !ok {
-				sql = string(data[start:end])
+				searchFrom = end
+				continue
 			}
-			sql = strings.TrimSpace(sql)
+			sql = cleanRecoveredSQLText(sql)
 			objectType, owner, name := parseCreateRoutineName(sql)
 			if owner != "" && name != "" && objectType != "" {
 				key := routineKey(owner, name, objectType)
@@ -867,9 +867,10 @@ func scanRawTriggerTexts(data []byte, decoder textDecoder) map[string]string {
 		}
 		sql, ok := decoder.decode(data[start:end])
 		if !ok {
-			sql = string(data[start:end])
+			searchFrom = end
+			continue
 		}
-		sql = strings.TrimSpace(sql)
+		sql = cleanRecoveredSQLText(sql)
 		owner, name := parseCreateTriggerName(sql)
 		if owner != "" && name != "" {
 			key := qualifiedObjectKey(owner, name)
@@ -888,38 +889,108 @@ func rawRoutineEnd(data []byte, start int) int {
 		maxEnd = len(data)
 	}
 	window := data[start:maxEnd]
-	upper := bytes.ToUpper(window)
-	for search := 0; search < len(upper); {
-		rel := bytes.Index(upper[search:], []byte("END"))
-		if rel < 0 {
-			return 0
-		}
-		endKeyword := search + rel
-		if !isSQLWordBoundary(upper, endKeyword-1) || !isSQLWordBoundary(upper, endKeyword+3) {
-			search = endKeyword + 3
+	tokens := scanRawSQLTokens(window)
+	for i := 0; i < len(tokens); i++ {
+		if tokens[i].text != "END" {
 			continue
 		}
-		semicolonLimit := endKeyword + 256
-		if semicolonLimit > len(upper) {
-			semicolonLimit = len(upper)
+		semicolonIndex := i + 1
+		if semicolonIndex < len(tokens) && tokens[semicolonIndex].text != ";" {
+			if isNestedRoutineEndTail(tokens[semicolonIndex].text) {
+				continue
+			}
+			semicolonIndex++
 		}
-		semicolonRel := bytes.IndexByte(upper[endKeyword+3:semicolonLimit], ';')
-		if semicolonRel < 0 {
-			return 0
-		}
-		semicolon := endKeyword + 3 + semicolonRel
-		tail := strings.TrimSpace(string(upper[endKeyword+3 : semicolon]))
-		if isNestedRoutineEndTail(tail) {
-			search = semicolon + 1
+		if semicolonIndex >= len(tokens) || tokens[semicolonIndex].text != ";" {
 			continue
 		}
-		end := semicolon + 1
+		end := tokens[semicolonIndex].end
 		if rawSQLBoundary(window, end) {
 			return start + end
 		}
-		search = end
 	}
 	return 0
+}
+
+type rawSQLToken struct {
+	text string
+	pos  int
+	end  int
+}
+
+func scanRawSQLTokens(data []byte) []rawSQLToken {
+	var tokens []rawSQLToken
+	for i := 0; i < len(data); {
+		b := data[i]
+		switch {
+		case b == '\'':
+			i = skipRawSQLSingleQuoted(data, i)
+		case b == '"':
+			i = skipRawSQLDoubleQuoted(data, i)
+		case b == '-' && i+1 < len(data) && data[i+1] == '-':
+			i += 2
+			for i < len(data) && data[i] != '\r' && data[i] != '\n' {
+				i++
+			}
+		case b == '/' && i+1 < len(data) && data[i+1] == '*':
+			i += 2
+			for i+1 < len(data) && !(data[i] == '*' && data[i+1] == '/') {
+				i++
+			}
+			if i+1 < len(data) {
+				i += 2
+			}
+		case b == ';':
+			tokens = append(tokens, rawSQLToken{text: ";", pos: i, end: i + 1})
+			i++
+		case isRawSQLWordStart(b):
+			start := i
+			i++
+			for i < len(data) && isRawSQLWordPart(data[i]) {
+				i++
+			}
+			tokens = append(tokens, rawSQLToken{text: strings.ToUpper(string(data[start:i])), pos: start, end: i})
+		default:
+			i++
+		}
+	}
+	return tokens
+}
+
+func skipRawSQLSingleQuoted(data []byte, start int) int {
+	for i := start + 1; i < len(data); i++ {
+		if data[i] != '\'' {
+			continue
+		}
+		if i+1 < len(data) && data[i+1] == '\'' {
+			i++
+			continue
+		}
+		return i + 1
+	}
+	return len(data)
+}
+
+func skipRawSQLDoubleQuoted(data []byte, start int) int {
+	for i := start + 1; i < len(data); i++ {
+		if data[i] != '"' {
+			continue
+		}
+		if i+1 < len(data) && data[i+1] == '"' {
+			i++
+			continue
+		}
+		return i + 1
+	}
+	return len(data)
+}
+
+func isRawSQLWordStart(b byte) bool {
+	return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || b == '_'
+}
+
+func isRawSQLWordPart(b byte) bool {
+	return isRawSQLWordStart(b) || (b >= '0' && b <= '9') || b == '$' || b == '#'
 }
 
 func isSQLWordBoundary(data []byte, index int) bool {
@@ -980,17 +1051,25 @@ func rawTriggerEnd(data []byte, start int) int {
 		maxEnd = len(data)
 	}
 	window := data[start:maxEnd]
-	upper := bytes.ToUpper(window)
-	for search := 0; search < len(upper); {
-		rel := bytes.Index(upper[search:], []byte("END;"))
-		if rel < 0 {
-			return 0
+	tokens := scanRawSQLTokens(window)
+	for i := 0; i < len(tokens); i++ {
+		if tokens[i].text != "END" {
+			continue
 		}
-		end := search + rel + len("END;")
+		semicolonIndex := i + 1
+		if semicolonIndex < len(tokens) && tokens[semicolonIndex].text != ";" {
+			if isNestedRoutineEndTail(tokens[semicolonIndex].text) {
+				continue
+			}
+			semicolonIndex++
+		}
+		if semicolonIndex >= len(tokens) || tokens[semicolonIndex].text != ";" {
+			continue
+		}
+		end := tokens[semicolonIndex].end
 		if rawSQLBoundary(window, end) {
 			return start + end
 		}
-		search = end
 	}
 	return 0
 }
