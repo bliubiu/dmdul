@@ -63,17 +63,8 @@ DMDUL> unload table SYSDBA.T;
 
 如果样例表名不同，可以先用 `list table <owner>;` 找到实际表名，再执行 `unload table`。
 
-一次性命令仍可作为底层调试入口：
-
-```powershell
-.\bin\dmdul.exe export-ddl `
-  -file oldpro\SYSTEM.DBF `
-  -out oldpro\dm_offline_all.sql
-
-.\bin\dmdul.exe export-data `
-  -file oldpro\SYSTEM.DBF `
-  -out oldpro\dm_offline_data.sql
-```
+功能验证统一通过交互式命令完成。底层解析器应直接由 Go 单元测试或集成测试覆盖，
+不再通过一次性功能子命令暴露。
 
 ## 版本信息
 

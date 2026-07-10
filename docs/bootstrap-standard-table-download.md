@@ -36,11 +36,11 @@ storage root
 
 当前代码中，普通表数据导出已实现 `storage root -> internal -> leaf chain`，并已补充 internal next fallback。
 
-## Bootstrap 优化方向
+## Bootstrap 标准下载流程
 
-长期目标是让 bootstrap 也尽量走“标准表下载”，而不是长期依赖对 `SYSTEM.DBF` 的全文件字节流扫描。
+当前 bootstrap 已优先走“标准表下载”，不再把对 `SYSTEM.DBF` 的全文件 marker 扫描作为正常主路径。
 
-目标流程：
+当前流程：
 
 ```text
 SYSTEM.DBF page 0 bootstrap-like 入口
@@ -60,6 +60,44 @@ SYSTEM.DBF page 0 + 0x7c: SYSINDEXES root page
 
 读取 root 页后，应从页头取得真实 `storage_id`，再走标准 BTree 下载路径。固定 root page、固定 storage id 和字符串 marker 扫描都只能作为兼容兜底。
 
+第一阶段直接从 page 0 的两个入口下载：
+
+- `SYSOBJECTS`：解析 owner、对象名、对象类型、父对象和内部索引对象。
+- `SYSINDEXES`：解析 storage id、group/file、root page、索引类型和键定义。
+
+第一阶段会验证 `SYSOBJECTS`、`SYSCOLUMNS`、`SYSTEXTS`、`SYSGRANTS`、`SYSHPARTTABLEINFO` 等必要对象是否存在。验证失败时才回退到按页流式全文件扫描。
+
+第二阶段根据第一阶段得到的对象和索引关系，分别沿 storage root 下载：
+
+- `SYSCOLUMNS`
+- `SYSTEXTS`
+- `SYSGRANTS`
+- `SYSHPARTTABLEINFO`
+
+存储过程和触发器源码在 `SYSTEXTS` 信息不足时仍会使用有界 raw window 补充，并在日志中标记为 `raw-window-fallback`。
+
+## 结构化日志
+
+`bootstrap;` 会把相同的结构化诊断同时输出到控制台和 `dul.log`：
+
+```text
+[BOOTSTRAP] phase=file status=OK group=0 file=0 header_group=0 header_file=0 header_page=0 pages=9472 aligned=true path="...SYSTEM.DBF"
+[BOOTSTRAP] stage=1 phase=anchor name=SYSOBJECTS mode=root-chain status=OK root=0/16 storage=33554540 pages=40 rows=1207
+[BOOTSTRAP] stage=2 phase=dictionary name=SYSCOLUMNS mode=root-chain status=OK root=0/80 storage=33554433 pages=61
+[BOOTSTRAP] stage=2 phase=extract name=SYSCOLUMNS mode=root-chain status=OK pages=61 rows=4284
+[BOOTSTRAP] phase=complete status=SUCCESS mode=standard-two-stage objects=1207 elapsed_ms=628
+```
+
+文件检查会记录：
+
+- control/page header 中的 group id、file id、page no；
+- 文件大小、页数和页对齐状态；
+- 表空间名和实际路径；
+- `MISSING`、`UNALIGNED`、`HEADER_MISMATCH` 等状态。
+- 可重建且不参与离线用户数据恢复的空 TEMP 文件会标记为 `IGNORED_TEMP`，不会把 bootstrap 降级为警告。
+
+当 anchor、storage root 或 leaf chain 不可用时，日志会写出 `FALLBACK`、具体原因和最终 `SUCCESS_WITH_WARNINGS` 状态。
+
 ## 灾难恢复模式边界
 
 当 `SYSTEM.DBF` 丢失、核心字典入口不可读，或字典页严重损坏时，普通 `bootstrap` 不应悄悄生成空字典并继续导出。应返回明确错误并写入日志。
@@ -74,8 +112,7 @@ bootstrap --scan-storages-without-system-dicts
 
 ## 后续任务
 
-- 将 bootstrap 的 SYSOBJECTS 入口定位改为优先读取 page 0 的 `0x80`。
-- 为 SYSOBJECTS / SYSINDEXES / SYSCOLUMNS 等核心字典表复用标准 page plan 下载。
-- 增加 bootstrap diagnostics，记录入口页、storage id、root 页、leaf 链长度和 fallback 原因。
-- 将 marker 扫描降级为明确的 fallback，并在日志中标注。
+- 将 `SYSOBJINFOS`、`SYSCOLINFOS`、注释和更多扩展字典也切换到第二阶段标准下载。
+- 为不同 DM8 存储格式增加明确的 parser profile 和版本特征日志。
+- 增加 leaf chain 局部损坏时的跳页、断链续扫和坏页清单。
 - 设计独立的 raw storage scan 救援模式，避免和正常字典恢复混在一起。

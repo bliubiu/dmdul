@@ -12,10 +12,112 @@
 
   ------
 
-  ## v0.3.0
+  ## v0.4.0
 
   ### Added
 
+  - 新增标准两阶段 `bootstrap` 流程。
+  - 第一阶段通过 `SYSTEM.DBF` page 0 的 anchor 定位核心系统字典入口：
+    - `SYSOBJECTS`
+    - `SYSINDEXES`
+  - 第二阶段根据核心字典定位并下载扩展系统字典：
+    - `SYSCOLUMNS`
+    - `SYSTEXTS`
+    - `SYSGRANTS`
+    - `SYSHPARTTABLEINFO`
+  - 新增结构化 `bootstrap` 日志。
+  - `bootstrap;` 现在会在控制台和 `dul.log` 中记录：
+    - SYSTEM.DBF 基本信息
+    - page size / extent size / charset
+    - DBF 文件 group/file/page 信息
+    - SYSOBJECTS / SYSINDEXES anchor 信息
+    - root page / storage id / leaf pages / rows
+    - 核心字典表扫描方式
+    - fallback 原因
+    - 输出目录
+    - 对象统计
+    - 执行耗时
+    - 最终状态
+  - `dmdul_dict/meta.tsv` 新增 bootstrap 模式信息：
+    - `bootstrap_mode`
+    - `bootstrap_fallback`
+  
+  ### Changed
+  
+  - `bootstrap` 优先使用 `standard-two-stage` 标准字典下载模式。
+  - 当 anchor、storage root 或 leaf chain 无效时，自动回退到原有按页流式扫描模式。
+  - 空 TEMP 文件或可重建临时文件会标记为 `IGNORED_TEMP`，不影响最终成功状态。
+  - `dul.log` 从简单命令日志升级为可诊断的恢复证据链日志。
+  - `list user;` 会显示当前 bootstrap 模式和 fallback 状态。
+  - README、使用文档和开发文档已调整为交互式流程优先。
+
+  ### Removed
+  
+  - 移除功能性命令行子命令：
+    - `inspect`
+    - `inspect-ctl`
+    - `scan-system`
+    - `scan-partitions`
+    - `export-ddl`
+    - `export-data`
+  - 移除仅用于旧 inspect 命令的 `internal/storage` 包。
+  - 后续 DDL、数据导出、分区扫描、残留页恢复统一通过交互式 DUL Shell 执行。
+  
+  ### Breaking Changes
+  
+  - 从 v0.4.0 开始，`dmdul` 不再支持直接命令行导出 DDL 或数据。
+  - 以下命令已废弃并移除：
+  
+  ```text
+  dmdul export-ddl
+  dmdul export-data
+  dmdul inspect
+  dmdul inspect-ctl
+  dmdul scan-system
+  dmdul scan-partitions
+  ```
+  
+  请改用交互式流程：
+
+  ~~~text
+  dmdul
+  DMDUL> bootstrap;
+  DMDUL> unload database;
+  DMDUL> unload user HIS;
+  DMDUL> unload table SYSDBA.T1;
+  DMDUL> recover table USERS1.T_TEST;
+  ~~~
+  
+  ### Validation
+  
+  - `go test -count=1 ./...` 通过。
+  - `go vet ./...` 通过。
+  - oldpro 样例验证通过：
+    - users: 6
+    - tables: 28
+    - columns: 122
+    - rows exported: 12679
+    - rows failed: 0
+  - FEIGE 样例验证通过：
+    - users: 125
+    - tables: 3814
+    - columns: 65253
+    - routines: 115
+    - bootstrap mode: `standard-two-stage`
+    - fallback: `false`
+  - 真实 `load dictionary; list table HR_TEST;` 流程验证通过。
+  
+  ### Notes
+  
+  - `standard-two-stage` 模式下，对象数可能比旧版本略少，因为旧版本在 root/internal 页中可能误识别少量分隔键对象。
+  - 如果标准 anchor 或 root-chain 损坏，dmdul 会自动 fallback 到流式扫描，并在日志中记录原因。
+  
+  
+  
+  ## v0.3.0
+  
+  ### Added
+  
   - 新增 `STORAGE(USING LONG ROW)` 表初步恢复能力。
   - 新增 21 字节 LOB locator 解析。
   - 新增从当前活动行追踪 `0x20` LOB 页和 `0x22` Long Row 页的读取能力。
@@ -29,9 +131,9 @@
     - 带时区时间类型
     - `INTERVAL DAY TO SECOND`
     - `ROWID`
-
+  
   ### Changed
-
+  
   - 数据行解析核心从主要依赖启发式判断，调整为优先使用显式 metadata。
   - 变长字段解析增强，支持识别普通变长值、内联 LOB envelope 和 21 字节 locator。
   - LOB / Long Row 读取不再依赖全文件扫描 LOB 页，而是从当前行 locator 出发按页链读取。
@@ -39,7 +141,7 @@
   - DDL 类型格式化补充带时区时间、`INTERVAL`、`ROWID` 等类型处理。
   
   ### Fixed
-  
+
   - 修复 `STORAGE(USING LONG ROW)` 表导出时多导出索引伪行的问题。
   - 修复部分 CLOB / Long Row 场景下 locator 无法正确追踪的问题。
   - 修复 `TIME` 类型误走 8 字节 `DATETIME` / `TIMESTAMP` 路径的问题。
@@ -59,34 +161,34 @@
     - `id=10, name=NULL, birth=NULL` 未被误伤。
   
   ### Notes
-
+  
   - Long Row / 行外 LOB 当前为初步支持。
   - 复杂 LOB 页链、损坏页、多版本残留页、特殊字符集和更多基础类型样例仍需继续验证。
   
   ## v0.2.1
   
   ### Fixed
-
+  
   - 修复 `ALTER TABLE ADD COLUMN` 后历史行解析问题。
   - 旧记录会按历史列布局解析，新增尾部列在允许时补 `NULL`。
   - 修复主键页、索引页中前缀键值被误识别为普通表数据的问题。
   - 改进候选行去重逻辑，优先保留完整表行，降低重复短行、假行导出概率。
-
+  
   ### Validation
-
+  
   - `go test -count=1 ./...` 通过。
   - Windows x64 构建验证通过。
   - Linux x64 构建验证通过。
   - 真实样例验证：
     - `JYC."t"` 新旧行混合场景导出正常。
     - `rows failed: 0`。
-
+  
   ------
-
+  
   ## v0.2.0
-
+  
   ### Added
-
+  
   - 增强表数据定位能力，从“段范围扫描”升级为：
     - storage root
     - internal page refs
@@ -98,13 +200,13 @@
   ```text
   recover table <owner.table_name>;
   ```
-  
+
   - `export-data` 新增恢复模式参数：
-  
+
   ```text
   -recover
   ```
-
+  
   - `bootstrap` 生成的 `tables.tsv` 新增恢复辅助字段：
     - `storage_id`
     - `root_file`
@@ -122,9 +224,9 @@
   
   - 进一步降低同名表、相似行格式、隐藏索引页导致误匹配的概率。
   - 改进相同 owner 或不同 owner 下相似表结构的数据页识别准确性。
-
-  ### Validation
   
+  ### Validation
+
   - `go test ./...` 通过。
   - Windows x64 构建验证通过。
   - Linux x64 构建验证通过。
@@ -150,7 +252,7 @@
     - `CREATE OR REPLACE PACKAGE BODY`
   
   ### Changed
-
+  
   - `dmdul_dict` 对象字典范围扩大到存储过程、函数、包和包体。
   - `DATABASE_ddl.sql` 整库 DDL 输出范围进一步完善。
   
@@ -160,9 +262,9 @@
   - 真实样例验证：
     - `routines loaded: 10`
     - `routines exported: 10`
-
+  
   ------
-
+  
   ## v0.1.8
   
   ### Added
@@ -181,9 +283,9 @@
   
   - `go test ./...` 通过。
   - Windows x64 构建验证通过。
-
+  
   ------
-
+  
   ## v0.1.7
   
   ### Added
@@ -207,7 +309,7 @@
   - `go test ./...` 通过。
   - Windows x64 构建验证通过。
   - Linux x64 构建验证通过。
-
+  
   ------
   
   ## v0.1.6
@@ -224,17 +326,17 @@
     - `blocks`
     - `extents`
   - 新增 dictionary override 和 segment 推断测试。
-
+  
   ### Changed
-
+  
   - DDL 和数据导出优先使用 `dmdul_dict` 中修正后的用户、表、字段、类型、表空间和存储组织信息。
   - `SYSTEM.DBF` 继续用于索引、约束、分区和物理定位等底层信息。
   - 整库导出可以同时生成：
     - `DATABASE_ddl.sql`
     - `DATABASE_data.sql`
-
+  
   ### Fixed
-
+  
   - 修复相同表名不同 owner 时可能误匹配数据页的问题。
   - 降低普通索引页被误识别为表数据页的概率。
   
@@ -250,24 +352,24 @@
   ## v0.1.5
   
   ### Added
-
+  
   - 新增数据字典持久化能力。
   - 新增 `dmdul_dict` 字典文件加载和保存逻辑。
   - 新增 `dul.log` 交互式操作日志。
   - `dul.log` 每条命令和错误记录带本地时间戳。
   - 新增字典文件相关测试。
-
+  
   ### Changed
-
+  
   - 交互式流程可以通过 `load dictionary;` 加载已保存的文本字典。
   - `list user`、`list table` 等命令可以展示字典来源和统计信息。
   
   ### Validation
   
   - `go test ./...` 通过。
-
+  
   ------
-
+  
   ## v0.1.4
   
   ### Changed
@@ -283,9 +385,9 @@
   ------
   
   ## v0.1.3
-
+  
   ### Added
-
+  
   - 新增交互式 DUL Shell。
   - 新增 REPL 模式。
   - 新增 DUL 风格命令：
@@ -318,7 +420,7 @@
   - 增加页级样例行确认候选表逻辑。
   
   ### Fixed
-
+  
   - 降低普通索引页被误导出为表数据页的概率。
   - 改进离线数据页候选判断准确性。
   

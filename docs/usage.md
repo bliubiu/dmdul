@@ -1,7 +1,7 @@
 # 使用示例
 
-以下示例假设程序位于 `.\bin\dmdul.exe`。当前推荐使用交互式入口，旧的
-`export-ddl`、`export-data` 一次性命令仍保留用于调试和兼容，但不再作为主要操作方式。
+以下示例假设程序位于 `.\bin\dmdul.exe`。数据库扫描、字典加载、DDL 导出、
+数据恢复全部通过交互式入口完成，不再提供功能性命令行子命令。
 
 ## 准备目录
 
@@ -182,12 +182,6 @@ DMDUL> load dictionary;
 DMDUL> recover table USERS1.T_TEST to users1_t_test_drop_recover;
 ```
 
-一次性命令也支持恢复扫描：
-
-```powershell
-.\bin\dmdul.exe export-data -file D:\dm\SYSTEM.DBF -data-dir D:\dm -table USERS1.T_TEST -recover -out D:\dm\USERS1_T_TEST_recover.sql
-```
-
 ## 恢复一个用户
 
 ```text
@@ -275,16 +269,18 @@ DMDUL> show parameter;
 DMDUL> exit;
 ```
 
-## 研究辅助命令
+## 命令行边界
 
-以下一次性命令仍可用于排查文件和验证底层解析：
+直接运行 `.\bin\dmdul.exe` 进入交互界面。当前只保留两个非恢复子命令：
 
 ```powershell
-.\bin\dmdul.exe inspect -file oldpro\SYSTEM.DBF
-.\bin\dmdul.exe inspect-ctl -ctl oldpro\dm.ctl
-.\bin\dmdul.exe scan-system -file oldpro\SYSTEM.DBF
-.\bin\dmdul.exe scan-partitions -file oldpro\SYSTEM.DBF -ctl oldpro\dm.ctl -owner all
+.\bin\dmdul.exe help
+.\bin\dmdul.exe version
 ```
+
+`inspect`、`inspect-ctl`、`scan-system`、`scan-partitions`、`export-ddl`、
+`export-data` 均已移除。对应的解析和恢复能力由 `bootstrap`、`list`、`unload`
+和 `recover` 等交互命令统一提供。
 
 ## 输出结果建议
 

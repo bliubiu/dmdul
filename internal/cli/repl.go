@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bufio"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
@@ -82,7 +83,7 @@ func RunInteractive(input io.Reader, stdout io.Writer, stderr io.Writer) error {
 
 func newInteractiveSession() *interactiveSession {
 	return &interactiveSession{
-		systemPath: defaultExportSystemPath,
+		systemPath: defaultSystemPath,
 		charset:    "auto",
 		dataFormat: "sql",
 	}
@@ -284,13 +285,15 @@ func (s *interactiveSession) executeUnload(args []string, stdout io.Writer) erro
 }
 
 func (s *interactiveSession) bootstrap(stdout io.Writer) error {
-	systemPath := defaultIfBlank(s.systemPath, defaultExportSystemPath)
+	startedAt := time.Now()
+	systemPath := defaultIfBlank(s.systemPath, defaultSystemPath)
 	ctlPath, ctlProvided := optionalControlPathForSystem(systemPath, s.controlPath, s.controlProvided)
 	if err := validateOptionalControlInputFiles("bootstrap", systemPath, ctlPath, ctlProvided); err != nil {
 		return err
 	}
 	dataDir := s.effectiveDataDir()
 	controlDULPath := s.effectiveControlDULPath()
+	s.emitBootstrapLine(stdout, fmt.Sprintf("[BOOTSTRAP] phase=start status=RUNNING system=%q data_dir=%q", systemPath, dataDir))
 	dataFiles, err := dm.ScanOfflineDataFiles(ctlPath, "", dataDir)
 	if err != nil {
 		return err
@@ -299,12 +302,24 @@ func (s *interactiveSession) bootstrap(stdout io.Writer) error {
 		return fmt.Errorf("write control.dul: %w", err)
 	}
 	bootstrapCharset := s.bootstrapCharset(systemPath, ctlPath)
+	metadata := dm.InspectDatabaseMetadata(systemPath, ctlPath, "", bootstrapCharset)
+	s.emitBootstrapLine(stdout, fmt.Sprintf("[BOOTSTRAP] phase=metadata status=OK page_size=%d extent_size=%d page_count=%d charset=%q",
+		metadata.PageSize, metadata.ExtentSize, metadata.PageCount, metadata.Charset))
+	fileWarnings := false
+	for _, file := range dataFiles {
+		line, warning := formatBootstrapFileDiagnostic(file, metadata.PageSize)
+		fileWarnings = fileWarnings || warning
+		s.emitBootstrapLine(stdout, line)
+	}
 	dict, err := dm.LoadDictionary(dm.DictionaryOptions{
 		SystemPath:     systemPath,
 		ControlPath:    ctlPath,
 		ControlDULPath: controlDULPath,
 		OwnerFilter:    "all",
 		Charset:        bootstrapCharset,
+		Diagnostic: func(diag dm.BootstrapDiagnostic) {
+			s.emitBootstrapLine(stdout, formatBootstrapDiagnostic(diag))
+		},
 	})
 	if err != nil {
 		return err
@@ -325,6 +340,16 @@ func (s *interactiveSession) bootstrap(stdout io.Writer) error {
 		s.charsetExplicit = false
 	}
 	debug.FreeOSMemory()
+	status := "SUCCESS"
+	if dict.BootstrapFallback || fileWarnings {
+		status = "SUCCESS_WITH_WARNINGS"
+	}
+	s.emitBootstrapLine(stdout, fmt.Sprintf("[BOOTSTRAP] phase=output name=control.dul status=OK files=%d path=%q", len(dataFiles), controlDULPath))
+	s.emitBootstrapLine(stdout, fmt.Sprintf("[BOOTSTRAP] phase=output name=dmdul_dict status=OK users=%d tables=%d columns=%d views=%d sequences=%d routines=%d triggers=%d synonyms=%d tab_privs=%d path=%q",
+		dictFiles.UserCount, dictFiles.TableCount, dictFiles.ColumnCount, dictFiles.ViewCount, dictFiles.SequenceCount,
+		dictFiles.RoutineCount, dictFiles.TriggerCount, dictFiles.SynonymCount, dictFiles.TabPrivilegeCount, dictFiles.Dir))
+	s.emitBootstrapLine(stdout, fmt.Sprintf("[BOOTSTRAP] phase=complete status=%s mode=%s objects=%d elapsed_ms=%d",
+		status, dict.BootstrapMode, dict.ObjectCount, time.Since(startedAt).Milliseconds()))
 
 	fmt.Fprintln(stdout, "bootstrap completed")
 	fmt.Fprintf(stdout, "system file: %s\n", dict.SystemPath)
@@ -350,6 +375,86 @@ func (s *interactiveSession) bootstrap(stdout io.Writer) error {
 	fmt.Fprintf(stdout, "synonyms loaded: %d\n", dict.SynonymCount)
 	fmt.Fprintf(stdout, "tab privileges loaded: %d\n", dict.TabPrivilegeCount)
 	return nil
+}
+
+func (s *interactiveSession) emitBootstrapLine(stdout io.Writer, line string) {
+	fmt.Fprintln(stdout, line)
+	s.log(line)
+}
+
+func formatBootstrapDiagnostic(diag dm.BootstrapDiagnostic) string {
+	var out strings.Builder
+	out.WriteString("[BOOTSTRAP]")
+	if diag.Stage > 0 {
+		fmt.Fprintf(&out, " stage=%d", diag.Stage)
+	}
+	if diag.Phase != "" {
+		fmt.Fprintf(&out, " phase=%s", diag.Phase)
+	}
+	if diag.Name != "" {
+		fmt.Fprintf(&out, " name=%s", diag.Name)
+	}
+	if diag.Mode != "" {
+		fmt.Fprintf(&out, " mode=%s", diag.Mode)
+	}
+	if diag.Status != "" {
+		fmt.Fprintf(&out, " status=%s", diag.Status)
+	}
+	if diag.RootFile >= 0 {
+		fmt.Fprintf(&out, " root=%d/%d", diag.RootFile, diag.RootPage)
+	}
+	if diag.StorageID != 0 {
+		fmt.Fprintf(&out, " storage=%d", diag.StorageID)
+	}
+	if diag.Pages > 0 {
+		fmt.Fprintf(&out, " pages=%d", diag.Pages)
+	}
+	if diag.Rows > 0 || diag.Phase == "anchor" || diag.Phase == "extract" || diag.Phase == "source" || diag.Phase == "validate" {
+		fmt.Fprintf(&out, " rows=%d", diag.Rows)
+	}
+	if diag.Reason != "" {
+		fmt.Fprintf(&out, " reason=%q", diag.Reason)
+	}
+	return out.String()
+}
+
+func formatBootstrapFileDiagnostic(file dm.OfflineDataFile, pageSize uint32) (string, bool) {
+	status := "OK"
+	var size int64
+	if info, err := os.Stat(file.Path); err == nil && !info.IsDir() {
+		size = info.Size()
+	} else {
+		status = "MISSING"
+	}
+	pages := int64(0)
+	aligned := false
+	if pageSize > 0 && size >= 0 {
+		pages = size / int64(pageSize)
+		aligned = size%int64(pageSize) == 0
+	}
+	if status == "OK" && !aligned {
+		status = "UNALIGNED"
+	}
+	headerGroup, headerFile, headerPage := uint16(0), uint16(0), uint32(0)
+	if input, err := os.Open(file.Path); err == nil {
+		var header [8]byte
+		if _, err := io.ReadFull(input, header[:]); err == nil {
+			headerGroup = binary.LittleEndian.Uint16(header[0:])
+			headerFile = binary.LittleEndian.Uint16(header[2:])
+			headerPage = binary.LittleEndian.Uint32(header[4:])
+			if status == "OK" && (uint32(headerGroup) != file.GroupID || int16(headerFile) != file.FileID || headerPage != 0) {
+				if file.GroupID == 3 && headerGroup == 0 && headerFile == 0 && headerPage == 0 {
+					status = "IGNORED_TEMP"
+				} else {
+					status = "HEADER_MISMATCH"
+				}
+			}
+		}
+		_ = input.Close()
+	}
+	line := fmt.Sprintf("[BOOTSTRAP] phase=file status=%s group=%d file=%d header_group=%d header_file=%d header_page=%d tablespace=%q bytes=%d pages=%d aligned=%t path=%q",
+		status, file.GroupID, file.FileID, headerGroup, headerFile, headerPage, file.Tablespace, size, pages, aligned, file.Path)
+	return line, status != "OK" && status != "IGNORED_TEMP"
 }
 
 func (s *interactiveSession) printParameters(stdout io.Writer) {
@@ -465,6 +570,9 @@ func (s *interactiveSession) printDictionarySummary(stdout io.Writer) {
 	dir := defaultIfBlank(s.dictionary.DictionaryDir, s.effectiveDictionaryDir())
 	fmt.Fprintf(stdout, "dictionary source: %s\n", source)
 	fmt.Fprintf(stdout, "dictionary dir: %s\n", dir)
+	if s.dictionary.BootstrapMode != "" {
+		fmt.Fprintf(stdout, "bootstrap mode: %s (fallback=%t)\n", s.dictionary.BootstrapMode, s.dictionary.BootstrapFallback)
+	}
 	fmt.Fprintf(stdout, "dictionary rows: users=%d tables=%d columns=%d views=%d sequences=%d routines=%d triggers=%d synonyms=%d tab_privs=%d objects=%d\n\n",
 		len(s.dictionary.Users), len(s.dictionary.Tables), len(s.dictionary.Columns), len(s.dictionary.Views), len(s.dictionary.Sequences), len(s.dictionary.Routines), len(s.dictionary.Triggers), len(s.dictionary.Synonyms), len(s.dictionary.TabPrivileges), s.dictionary.ObjectCount)
 }
@@ -912,7 +1020,7 @@ func (s *interactiveSession) effectiveDataDir() string {
 	if s.dataDirSet && strings.TrimSpace(s.dataDir) != "" {
 		return s.dataDir
 	}
-	dir := filepath.Dir(defaultIfBlank(s.systemPath, defaultExportSystemPath))
+	dir := filepath.Dir(defaultIfBlank(s.systemPath, defaultSystemPath))
 	if dir == "" {
 		return "."
 	}

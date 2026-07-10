@@ -135,7 +135,7 @@ Why this matters:
 - Dictionary slot-array positioning still uses the fixed 8-byte page trailer:
   `slot_array_start = page_size - 8 - slot_count * 2`.
 - Ordinary user data pages can store row/slot offset information in the tail.
-  `export-data` therefore does not run this protection-byte restoration on
+  data unload therefore does not run this protection-byte restoration on
   `MAIN.DBF`/user tablespace pages unless a page-specific rule is proven.
 
 Verified examples from `oldpro/gr/SYSTEM.DBF`:
@@ -262,47 +262,30 @@ little-endian `u32` located at `name_offset - 6`. Example:
 `3 -> TEMP` even though it is not emitted as a normal string entry in this sample
 control file.
 
-## Current Go Commands
+## Current Interactive Workflow
 
-The Go CLI now has repeatable research commands:
+The Go CLI exposes database recovery only through the interactive shell:
 
-```powershell
-.\bin\dmdul.exe scan-system -file .\oldpro\SYSTEM.DBF
-.\bin\dmdul.exe inspect-ctl -ctl .\oldpro\dm.ctl
-.\bin\dmdul.exe export-ddl -file .\oldpro\SYSTEM.DBF -out .\oldpro\dm_offline_all.sql -owner all
-.\bin\dmdul.exe export-data -file .\oldpro\SYSTEM.DBF -out .\oldpro\dm_offline_data.sql -owner all -table all
-.\bin\dmdul.exe export-data -file .\oldpro\SYSTEM.DBF -out .\oldpro\dm_offline_bin_test.sql -table SYSDBA.BIN_TEST2,SYSDBA.BIN_TEST2_CHILD
-.\bin\dmdul.exe scan-partitions -file .\oldpro\SYSTEM.DBF -ctl .\oldpro\dm.ctl -owner all
+```text
+DMDUL> set system .\oldpro\SYSTEM.DBF;
+DMDUL> set data_dir .\oldpro;
+DMDUL> bootstrap;
+DMDUL> list table SYSDBA;
+DMDUL> unload table SYSDBA.BIN_TEST2;
+DMDUL> unload database;
 ```
 
-`export-ddl` is the main offline extractor and now includes partition DDL from
-`SYSHPARTTABLEINFO` plus `SYSOBJINFOS.TABPART`. It can run with only
-`SYSTEM.DBF`; when `dm.ctl` exists beside `SYSTEM.DBF` or is passed explicitly,
-it is used to enrich database and tablespace names. `scan-partitions` is
-retained as a focused diagnostic view over the same parser.
-
-`export-data` is the first offline row extractor. It reads table/column/storage
-metadata from `SYSTEM.DBF`. When `dm.ctl` is available it is used for database
-name, tablespace names, and configured datafile paths. When `dm.ctl` is absent,
-`export-data` scans DBF files under `-data-dir` and identifies `(group_id,
-file_id)` from each DBF page header. `-data-dir` defaults to the directory that
-contains `SYSTEM.DBF`. The current row locator follows the verified ordinary
-data-page layout:
-
-`-table` defaults to `all`. When narrowing the export, prefer fully qualified
-`OWNER.TABLE_NAME` values, for example `SYSDBA.BIN_TEST2`. Quoted qualified
-names such as `"SYSDBA"."中文测试表"` are accepted. `-exclude` defaults to empty;
-pass qualified names there only when a table should be skipped deliberately.
-The generated data SQL no longer writes per-row page/slot diagnostic comments by
-default, so the output can be reviewed or replayed as a cleaner INSERT script.
-Use `-failed-comments` only when debugging rows that were located but not yet
-decoded successfully.
+DDL recovery includes partition definitions from `SYSHPARTTABLEINFO` plus
+`SYSOBJINFOS.TABPART`. Data recovery reads table, column, and storage metadata
+from `SYSTEM.DBF`; when `dm.ctl` is absent, DBF files are identified from their
+`(group_id, file_id)` page headers. The current row locator follows the verified
+ordinary data-page layout:
 
 - page `+0x24`: slot count
 - page `+0x26`: free/end offset
 - page `+0x2C`: live record count
 - page `+0x38`: B-tree level; `0` means leaf data page, `1` means root/internal
-  page. `export-data` skips non-zero levels so root separator rows are not
+  page. Data unload skips non-zero levels so root separator rows are not
   exported as table rows.
 - page `+0x3A`: table assist index id
 - row area starts at page `+0x62`

@@ -79,6 +79,22 @@ func (s *systemPageStream) forEachPage(visit func(page []byte, pageNo uint32)) e
 	return nil
 }
 
+func (s *systemPageStream) readPage(pageNo uint32) ([]byte, error) {
+	if s == nil || s.file == nil || s.pageSize == 0 || pageNo >= s.pageCount {
+		return nil, fmt.Errorf("SYSTEM.DBF page %d is out of range", pageNo)
+	}
+	page := make([]byte, int(s.pageSize))
+	n, err := s.file.ReadAt(page, int64(pageNo)*int64(s.pageSize))
+	if err != nil && err != io.EOF {
+		return nil, fmt.Errorf("read SYSTEM.DBF page %d: %w", pageNo, err)
+	}
+	if n != len(page) {
+		return nil, fmt.Errorf("read SYSTEM.DBF page %d: short read %d/%d", pageNo, n, len(page))
+	}
+	restorePageProtectionBytes(page, s.pageSize)
+	return page, nil
+}
+
 func (s *systemPageStream) forEachDictionaryRow(visit func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16)) error {
 	return s.forEachPage(func(page []byte, pageNo uint32) {
 		iterDictionaryRowsInPage(page, s.pageSize, pageNo, visit)

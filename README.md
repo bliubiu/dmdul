@@ -284,17 +284,6 @@ DMDUL> recover table USERS1.T_TEST;
 DMDUL> recover table USERS1.T_TEST to users1_t_test_recover;
 ```
 
-命令行模式：
-
-```powershell
-.\dmdul.exe export-data `
-  -file D:\dm\SYSTEM.DBF `
-  -data-dir D:\dm `
-  -table USERS1.T_TEST `
-  -recover `
-  -out D:\dm\USERS1_T_TEST_recover.sql
-```
-
 DROP 场景中，当前 `SYSTEM.DBF` 里可能已经没有表定义。此时需要：
 
 1. 加载 DROP 前保存的 `dmdul_dict`；
@@ -323,47 +312,8 @@ set data_format csv;
 exit;
 ```
 
-### 命令行模式
-
-```bash
-dmdul inspect -file SYSTEM.DBF
-dmdul inspect-ctl -ctl dm.ctl
-dmdul scan-system -file SYSTEM.DBF -ctl dm.ctl
-dmdul scan-partitions -file SYSTEM.DBF -ctl dm.ctl -owner all
-```
-
-导出 DDL：
-
-```bash
-dmdul export-ddl \
-  -file SYSTEM.DBF \
-  -ctl dm.ctl \
-  -out schema.sql \
-  -owner HR_TEST,SYSDBA \
-  -charset utf-8
-```
-
-导出数据：
-
-```bash
-dmdul export-data \
-  -file SYSTEM.DBF \
-  -ctl dm.ctl \
-  -data-dir . \
-  -table HR_TEST.EMP_INFO \
-  -out data.sql
-```
-
-残留页恢复：
-
-```bash
-dmdul export-data \
-  -file SYSTEM.DBF \
-  -data-dir . \
-  -table USERS1.T_TEST \
-  -recover \
-  -out USERS1_T_TEST_recover.sql
-```
+功能性命令行子命令已经移除。请直接运行 `dmdul` 进入交互界面；`help` 和
+`version` 仅用于查看帮助与版本，不执行数据库恢复操作。
 
 ------
 

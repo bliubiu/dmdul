@@ -13,6 +13,21 @@ type DictionaryOptions struct {
 	ControlDULPath string
 	OwnerFilter    string
 	Charset        string
+	Diagnostic     func(BootstrapDiagnostic)
+}
+
+type BootstrapDiagnostic struct {
+	Stage     int
+	Phase     string
+	Name      string
+	Mode      string
+	Status    string
+	RootFile  int16
+	RootPage  uint32
+	StorageID uint32
+	Pages     int
+	Rows      int
+	Reason    string
 }
 
 type DictionaryInfo struct {
@@ -36,6 +51,9 @@ type DictionaryInfo struct {
 	TriggerCount      int
 	SynonymCount      int
 	TabPrivilegeCount int
+	BootstrapMode     string
+	BootstrapFallback bool
+	Diagnostics       []BootstrapDiagnostic
 	Users             []DictionaryUser
 	Tables            []DictionaryTable
 	Columns           []DictionaryColumn
@@ -175,9 +193,22 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 	decoder := textDecoder{preferred: preferredCharset}
 	ownerMatcher := newOwnerMatcher(opts.OwnerFilter)
 
-	objects, err := stream.dictionaryObjects(decoder)
-	if err != nil {
-		return nil, err
+	catalog, fallbackReason := loadStandardBootstrapCatalog(stream, decoder, opts.Diagnostic)
+	bootstrapMode := "standard-two-stage"
+	bootstrapFallback := fallbackReason != ""
+	var objects map[uint32]dictionaryObject
+	if !bootstrapFallback {
+		objects = catalog.objects
+	} else {
+		bootstrapMode = "stream-scan-fallback"
+		catalog.addDiagnostic(BootstrapDiagnostic{
+			Stage: 1, Phase: "fallback", Name: "SYSOBJECTS", Mode: bootstrapMode,
+			Status: "WARNING", RootFile: -1, Reason: fallbackReason,
+		})
+		objects, err = stream.dictionaryObjects(decoder)
+		if err != nil {
+			return nil, err
+		}
 	}
 	schemaNames := schemaNamesFromDictionaryObjects(objects)
 	for id, obj := range objects {
@@ -209,11 +240,13 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 	columnsByTable := make(map[uint32]int)
 	var columnList []DictionaryColumn
 	columnCount := 0
-	if err := stream.forEachDictionaryRow(func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16) {
+	parsedColumnRows := 0
+	visitColumn := func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16) {
 		col, ok := parseDDLColumnRow(page, int(slotOff), pageNo, slotNo, slotOff, pageSize, decoder)
 		if !ok {
 			return
 		}
+		parsedColumnRows++
 		table, ok := tables[col.TableID]
 		if !ok || !ownerMatcher.allowed(table.Owner) {
 			return
@@ -232,22 +265,49 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 			Default:    col.Default,
 		})
 		columnCount++
-	}); err != nil {
-		return nil, err
 	}
-
-	indexes := make(map[uint32]indexDef)
-	if err := stream.forEachDictionaryRow(func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16) {
-		idx, ok := parseDDLIndexRow(page, int(slotOff), pageSize)
-		if ok {
-			indexes[idx.ID] = idx
-		}
-	}); err != nil {
-		return nil, err
+	usedStandardColumns := false
+	if !bootstrapFallback {
+		usedStandardColumns, err = catalog.forEachTableRow("SYSCOLUMNS", visitColumn)
 	}
-	texts, err := stream.dictionaryTexts(decoder)
 	if err != nil {
 		return nil, err
+	}
+	if !usedStandardColumns {
+		if err := stream.forEachDictionaryRow(visitColumn); err != nil {
+			return nil, err
+		}
+		catalog.recordTableRows("SYSCOLUMNS", parsedColumnRows, false, defaultIfEmpty(fallbackReason, "standard table plan is unavailable"))
+	} else {
+		catalog.recordTableRows("SYSCOLUMNS", parsedColumnRows, true, "")
+	}
+
+	indexes := catalog.indexes
+	if bootstrapFallback {
+		indexes = make(map[uint32]indexDef)
+		if err := stream.forEachDictionaryRow(func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16) {
+			idx, ok := parseDDLIndexRow(page, int(slotOff), pageSize)
+			if ok {
+				indexes[idx.ID] = idx
+			}
+		}); err != nil {
+			return nil, err
+		}
+	}
+	var texts map[uint32]map[uint32]string
+	usedStandardTexts := false
+	if !bootstrapFallback {
+		texts, usedStandardTexts, err = catalog.dictionaryTexts()
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !usedStandardTexts {
+		texts, err = stream.dictionaryTexts(decoder)
+		if err != nil {
+			return nil, err
+		}
+		catalog.recordTableRows("SYSTEXTS", countDictionaryTextRows(texts), false, defaultIfEmpty(fallbackReason, "standard table plan is unavailable"))
 	}
 	viewList := scanDictionaryViews(objects, texts, ownerMatcher)
 	sequenceList := scanDictionarySequences(objects, texts, ownerMatcher)
@@ -261,18 +321,46 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 	}
 	routineList := scanDictionaryRoutines(objects, texts, rawRoutines, ownerMatcher)
 	triggerList := scanDictionaryTriggers(objects, texts, rawTriggers, ownerMatcher)
+	if len(rawRoutines) > 0 {
+		catalog.addDiagnostic(BootstrapDiagnostic{Stage: 2, Phase: "source", Name: "ROUTINES", Mode: "raw-window-fallback", Status: "NOTICE", RootFile: -1, Rows: len(rawRoutines), Reason: "supplemented SYSTEXTS definitions"})
+	}
+	if len(rawTriggers) > 0 {
+		catalog.addDiagnostic(BootstrapDiagnostic{Stage: 2, Phase: "source", Name: "TRIGGERS", Mode: "raw-window-fallback", Status: "NOTICE", RootFile: -1, Rows: len(rawTriggers), Reason: "supplemented SYSTEXTS definitions"})
+	}
 	synonymList := scanDictionarySynonyms(objects, ownerMatcher)
-	tabPrivilegeList, err := stream.tabPrivileges(objects, userObjects, roleObjects, ownerMatcher, newTableNameMatcher("all"))
+	var tabPrivilegeList []DictionaryTabPrivilege
+	usedStandardGrants := false
+	if !bootstrapFallback {
+		tabPrivilegeList, usedStandardGrants, err = catalog.tabPrivileges(objects, userObjects, roleObjects, ownerMatcher, newTableNameMatcher("all"))
+	}
 	if err != nil {
 		return nil, err
+	}
+	if !usedStandardGrants {
+		tabPrivilegeList, err = stream.tabPrivileges(objects, userObjects, roleObjects, ownerMatcher, newTableNameMatcher("all"))
+		if err != nil {
+			return nil, err
+		}
+		catalog.recordTableRows("SYSGRANTS", len(tabPrivilegeList), false, defaultIfEmpty(fallbackReason, "standard table plan is unavailable"))
 	}
 
 	tablespaces := loadTablespaceNames(opts.ControlPath, opts.ControlDULPath)
 	tableStorage := tableStorageByID(tables, indexObjects, indexes, tablespaces)
 	assistByParentID := assistIndexesByParentID(tables, indexObjects, indexes)
-	partitionsByTable, err := stream.partitionsByTable(decoder, tables, ownerMatcher)
+	var partitionsByTable map[uint32][]PartitionInfo
+	usedStandardPartitions := false
+	if !bootstrapFallback {
+		partitionsByTable, usedStandardPartitions, err = catalog.partitionsByTable(tables, ownerMatcher)
+	}
 	if err != nil {
 		return nil, err
+	}
+	if !usedStandardPartitions {
+		partitionsByTable, err = stream.partitionsByTable(decoder, tables, ownerMatcher)
+		if err != nil {
+			return nil, err
+		}
+		catalog.recordTableRows("SYSHPARTTABLEINFO", countPartitions(partitionsByTable), false, defaultIfEmpty(fallbackReason, "standard table plan is unavailable"))
 	}
 	var tableList []DictionaryTable
 	userNamesByName := make(map[string]DictionaryUser)
@@ -354,6 +442,10 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 		}
 		return columnList[i].Name < columnList[j].Name
 	})
+	if !bootstrapFallback && catalog.fallback {
+		bootstrapFallback = true
+		bootstrapMode = "standard-two-stage-with-fallback"
+	}
 
 	return &DictionaryInfo{
 		SystemPath:        opts.SystemPath,
@@ -375,6 +467,9 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 		TriggerCount:      len(triggerList),
 		SynonymCount:      len(synonymList),
 		TabPrivilegeCount: len(tabPrivilegeList),
+		BootstrapMode:     bootstrapMode,
+		BootstrapFallback: bootstrapFallback,
+		Diagnostics:       append([]BootstrapDiagnostic(nil), catalog.diagnostics...),
 		Users:             userList,
 		Tables:            tableList,
 		Columns:           columnList,
