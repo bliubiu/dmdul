@@ -24,6 +24,7 @@ type interactiveSession struct {
 	dataDir         string
 	dataDirSet      bool
 	charset         string
+	charsetExplicit bool
 	dataFormat      string
 	outputDir       string
 	outputDirSet    bool
@@ -182,6 +183,8 @@ func (s *interactiveSession) executeSet(args []string, stdout io.Writer) error {
 	case "system", "file":
 		s.systemPath = value
 		s.dictionary = nil
+		s.charset = "auto"
+		s.charsetExplicit = false
 	case "data_dir", "datadir":
 		s.dataDir = value
 		s.dataDirSet = strings.TrimSpace(value) != ""
@@ -200,6 +203,7 @@ func (s *interactiveSession) executeSet(args []string, stdout io.Writer) error {
 		s.dataFormat = value
 	case "charset":
 		s.charset = value
+		s.charsetExplicit = true
 		s.dictionary = nil
 	case "log":
 		s.logPath = value
@@ -294,12 +298,13 @@ func (s *interactiveSession) bootstrap(stdout io.Writer) error {
 	if err := dm.WriteControlDUL(controlDULPath, dataFiles); err != nil {
 		return fmt.Errorf("write control.dul: %w", err)
 	}
+	bootstrapCharset := s.bootstrapCharset(systemPath, ctlPath)
 	dict, err := dm.LoadDictionary(dm.DictionaryOptions{
 		SystemPath:     systemPath,
 		ControlPath:    ctlPath,
 		ControlDULPath: controlDULPath,
 		OwnerFilter:    "all",
-		Charset:        s.charset,
+		Charset:        bootstrapCharset,
 	})
 	if err != nil {
 		return err
@@ -317,6 +322,7 @@ func (s *interactiveSession) bootstrap(stdout io.Writer) error {
 	s.dictionary = dict
 	if detectedCharset, ok := charsetParameterFromDictionary(dict.Charset); ok {
 		s.charset = detectedCharset
+		s.charsetExplicit = false
 	}
 	debug.FreeOSMemory()
 
@@ -883,7 +889,7 @@ func (s *interactiveSession) loadDictionaryFiles(stdout io.Writer) error {
 		s.controlPath = dict.ControlPath
 		s.controlProvided = true
 	}
-	if detectedCharset, ok := charsetParameterFromDictionary(dict.Charset); ok && (s.charset == "" || strings.EqualFold(s.charset, "auto")) {
+	if detectedCharset, ok := charsetParameterFromDictionary(dict.Charset); ok && !s.charsetExplicit {
 		s.charset = detectedCharset
 	}
 	debug.FreeOSMemory()
@@ -972,6 +978,7 @@ func (s *interactiveSession) loadInitDULCommand(stdout io.Writer) error {
 }
 
 func (s *interactiveSession) loadInitDUL(path string) error {
+	s.charsetExplicit = false
 	file, err := os.Open(path)
 	if err != nil {
 		return err
@@ -1234,4 +1241,18 @@ func charsetParameterFromDictionary(value string) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+func (s *interactiveSession) bootstrapCharset(systemPath string, controlPath string) string {
+	configured := defaultIfBlank(s.charset, "auto")
+	if s.charsetExplicit {
+		return configured
+	}
+	metadata := dm.InspectDatabaseMetadata(systemPath, controlPath, "", configured)
+	if metadata.HasCharsetFlag {
+		if detected, ok := charsetParameterFromDictionary(metadata.Charset); ok {
+			return detected
+		}
+	}
+	return configured
 }

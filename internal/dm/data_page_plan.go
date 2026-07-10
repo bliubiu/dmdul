@@ -13,6 +13,7 @@ const (
 	dmPageKindBTreeRoot        = 0x15
 	maxBTreeDescentDepth       = 64
 	maxLeafChainWalkMultiplier = 2
+	maxCachedDataFilePages     = 256
 )
 
 type dataFilePageCache struct {
@@ -20,6 +21,7 @@ type dataFilePageCache struct {
 	refs     map[dataFileKey]dataFileRef
 	sizes    map[dataFileKey]int64
 	pages    map[dataPageRef][]byte
+	pageFIFO []dataPageRef
 }
 
 func newDataFilePageCache(files []dataFileRef, pageSize uint32) *dataFilePageCache {
@@ -60,7 +62,13 @@ func (c *dataFilePageCache) readPage(ref dataPageRef) ([]byte, bool) {
 	if err != nil || n != pageSize {
 		return nil, false
 	}
+	if len(c.pages) >= maxCachedDataFilePages && len(c.pageFIFO) > 0 {
+		oldest := c.pageFIFO[0]
+		c.pageFIFO = c.pageFIFO[1:]
+		delete(c.pages, oldest)
+	}
 	c.pages[ref] = page
+	c.pageFIFO = append(c.pageFIFO, ref)
 	return page, true
 }
 

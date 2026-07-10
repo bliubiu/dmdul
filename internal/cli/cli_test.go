@@ -381,6 +381,22 @@ func TestCharsetParameterFromDictionary(t *testing.T) {
 	}
 }
 
+func TestBootstrapCharsetReplacesStaleInitValueButKeepsExplicitOverride(t *testing.T) {
+	systemPath := filepath.Join(t.TempDir(), "SYSTEM.DBF")
+	writeMinimalSystemDBF(t, systemPath)
+
+	session := newInteractiveSession()
+	session.charset = "gb18030"
+	if got := session.bootstrapCharset(systemPath, ""); got != "utf-8" {
+		t.Fatalf("bootstrap charset with stale init value = %q, want utf-8", got)
+	}
+
+	session.charsetExplicit = true
+	if got := session.bootstrapCharset(systemPath, ""); got != "gb18030" {
+		t.Fatalf("bootstrap charset with explicit override = %q, want gb18030", got)
+	}
+}
+
 func setupUnloadDatabaseFixture(t *testing.T) (string, string) {
 	t.Helper()
 	cwd := t.TempDir()

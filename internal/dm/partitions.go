@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 	"unicode"
@@ -70,28 +69,26 @@ func ScanPartitions(opts PartitionScanOptions) (*PartitionScanResult, error) {
 		return nil, fmt.Errorf("scan-partitions requires SYSTEM.DBF path")
 	}
 
-	data, err := os.ReadFile(opts.SystemPath)
+	stream, err := openSystemPageStream(opts.SystemPath)
 	if err != nil {
-		return nil, fmt.Errorf("read SYSTEM.DBF: %w", err)
+		return nil, err
 	}
-	if len(data) < systemHeaderReadSize {
-		return nil, fmt.Errorf("SYSTEM.DBF is too small")
-	}
+	defer stream.close()
 
-	pageSize, _ := detectSystemPageSize(data[:systemHeaderReadSize], int64(len(data)))
-	pageCount, _ := detectSystemPageCount(data[:systemHeaderReadSize], int64(len(data)), pageSize)
-	extentSize, _ := detectSystemExtentSize(data[:systemHeaderReadSize])
-	restoreSystemPages(data, pageSize)
+	pageSize, pageCount, extentSize := stream.pageSize, stream.pageCount, stream.extentSize
 	preferredCharset := strings.ToLower(strings.TrimSpace(opts.Charset))
 	if preferredCharset == "" || preferredCharset == "auto" {
-		if charset, ok := detectSystemCharsetFromData(data, pageSize); ok && charset.DecoderName != "" {
+		if charset, ok := stream.charset(); ok && charset.DecoderName != "" {
 			preferredCharset = charset.DecoderName
 		}
 	}
 	decoder := textDecoder{preferred: preferredCharset}
 	matcher := newOwnerMatcher(opts.OwnerFilter)
 
-	objects := scanDictionaryObjects(data, pageSize, decoder)
+	objects, err := stream.dictionaryObjects(decoder)
+	if err != nil {
+		return nil, err
+	}
 	schemaNames := schemaNamesFromDictionaryObjects(objects)
 	for id, obj := range objects {
 		obj.Owner = resolveSchemaName(obj.SchemaID, schemaNames)
@@ -105,7 +102,10 @@ func ScanPartitions(opts PartitionScanOptions) (*PartitionScanResult, error) {
 		}
 	}
 
-	partitionsByTable := scanPartitionsByTable(data, pageSize, decoder, tables, matcher)
+	partitionsByTable, err := stream.partitionsByTable(decoder, tables, matcher)
+	if err != nil {
+		return nil, err
+	}
 
 	result := &PartitionScanResult{
 		SystemPath:     opts.SystemPath,
@@ -280,43 +280,47 @@ func iterDictionarySlotRanges(data []byte, pageSize uint32, visit func(page []by
 	for pageNo := 0; pageNo < totalPages; pageNo++ {
 		start := pageNo * int(pageSize)
 		page := data[start : start+int(pageSize)]
-		if len(page) < sysObjectsSlotCountOff+2 {
-			continue
-		}
-		slotCount := binary.LittleEndian.Uint16(page[sysObjectsSlotCountOff:])
-		if slotCount == 0 || slotCount >= 2048 {
-			continue
-		}
-		slotArrayStart := int(pageSize) - pageSlotTrailerLen - int(slotCount)*2
-		if slotArrayStart < 0x40 || slotArrayStart >= int(pageSize) {
-			continue
-		}
+		iterDictionarySlotRangesInPage(page, pageSize, uint32(pageNo), visit)
+	}
+}
 
-		slots := make([]dictionarySlotRange, 0, slotCount)
-		for slotNo := uint16(0); slotNo < slotCount; slotNo++ {
-			pos := slotArrayStart + int(slotNo)*2
-			slotOff := binary.LittleEndian.Uint16(page[pos:])
-			if slotOff == 0 || int(slotOff) >= slotArrayStart {
-				continue
-			}
-			slots = append(slots, dictionarySlotRange{slotNo: slotNo, slotOff: slotOff})
+func iterDictionarySlotRangesInPage(page []byte, pageSize uint32, pageNo uint32, visit func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16, nextOff uint16)) {
+	if len(page) < int(pageSize) || len(page) < sysObjectsSlotCountOff+2 {
+		return
+	}
+	slotCount := binary.LittleEndian.Uint16(page[sysObjectsSlotCountOff:])
+	if slotCount == 0 || slotCount >= 2048 {
+		return
+	}
+	slotArrayStart := int(pageSize) - pageSlotTrailerLen - int(slotCount)*2
+	if slotArrayStart < 0x40 || slotArrayStart >= int(pageSize) {
+		return
+	}
+
+	slots := make([]dictionarySlotRange, 0, slotCount)
+	for slotNo := uint16(0); slotNo < slotCount; slotNo++ {
+		pos := slotArrayStart + int(slotNo)*2
+		slotOff := binary.LittleEndian.Uint16(page[pos:])
+		if slotOff == 0 || int(slotOff) >= slotArrayStart {
+			continue
 		}
-		sort.Slice(slots, func(i, j int) bool {
-			if slots[i].slotOff == slots[j].slotOff {
-				return slots[i].slotNo < slots[j].slotNo
-			}
-			return slots[i].slotOff < slots[j].slotOff
-		})
-		for i, slot := range slots {
-			nextOff := uint16(slotArrayStart)
-			if i+1 < len(slots) {
-				nextOff = slots[i+1].slotOff
-			}
-			if nextOff <= slot.slotOff {
-				continue
-			}
-			visit(page, uint32(pageNo), slot.slotNo, slot.slotOff, nextOff)
+		slots = append(slots, dictionarySlotRange{slotNo: slotNo, slotOff: slotOff})
+	}
+	sort.Slice(slots, func(i, j int) bool {
+		if slots[i].slotOff == slots[j].slotOff {
+			return slots[i].slotNo < slots[j].slotNo
 		}
+		return slots[i].slotOff < slots[j].slotOff
+	})
+	for i, slot := range slots {
+		nextOff := uint16(slotArrayStart)
+		if i+1 < len(slots) {
+			nextOff = slots[i+1].slotOff
+		}
+		if nextOff <= slot.slotOff {
+			continue
+		}
+		visit(page, pageNo, slot.slotNo, slot.slotOff, nextOff)
 	}
 }
 

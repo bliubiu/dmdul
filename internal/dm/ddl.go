@@ -234,21 +234,17 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 		return nil, fmt.Errorf("export-ddl requires output path")
 	}
 
-	data, err := os.ReadFile(opts.SystemPath)
+	stream, err := openSystemPageStream(opts.SystemPath)
 	if err != nil {
-		return nil, fmt.Errorf("read SYSTEM.DBF: %w", err)
+		return nil, err
 	}
-	if len(data) < systemHeaderReadSize {
-		return nil, fmt.Errorf("SYSTEM.DBF is too small")
-	}
+	defer stream.close()
 
-	pageSize, _ := detectSystemPageSize(data[:systemHeaderReadSize], int64(len(data)))
-	pageCount, _ := detectSystemPageCount(data[:systemHeaderReadSize], int64(len(data)), pageSize)
-	extentSize, extentSizeSource := detectSystemExtentSize(data[:systemHeaderReadSize])
-	restoreSystemPages(data, pageSize)
+	pageSize, pageCount := stream.pageSize, stream.pageCount
+	extentSize, extentSizeSource := stream.extentSize, stream.extentSrc
 	preferredCharset := strings.ToLower(strings.TrimSpace(opts.Charset))
 	if preferredCharset == "" || preferredCharset == "auto" {
-		if charset, ok := detectSystemCharsetFromData(data, pageSize); ok && charset.DecoderName != "" {
+		if charset, ok := stream.charset(); ok && charset.DecoderName != "" {
 			preferredCharset = charset.DecoderName
 		}
 	}
@@ -261,7 +257,10 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 	tableMatcher := newTableNameMatcher(tableFilter)
 	tablespaces := loadTablespaceNames(opts.ControlPath, opts.ControlDULPath)
 
-	objects := scanDictionaryObjects(data, pageSize, decoder)
+	objects, err := stream.dictionaryObjects(decoder)
+	if err != nil {
+		return nil, err
+	}
 	schemaNames := schemaNamesFromDictionaryObjects(objects)
 	for id, obj := range objects {
 		obj.Owner = resolveSchemaName(obj.SchemaID, schemaNames)
@@ -290,13 +289,25 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 	applyDictionaryUserOverrides(opts.Dictionary, users)
 	dictionaryTables := applyDictionaryTableOverrides(opts.Dictionary, tables, tablespaces)
 
-	partitionsByTable := scanPartitionsByTable(data, pageSize, decoder, tables, ownerMatcher)
-	partitionKeysByTable := scanPartitionKeysByTable(data, pageSize, tables, ownerMatcher)
+	partitionsByTable, err := stream.partitionsByTable(decoder, tables, ownerMatcher)
+	if err != nil {
+		return nil, err
+	}
+	partitionKeysByTable, err := stream.partitionKeysByTable(tables, ownerMatcher)
+	if err != nil {
+		return nil, err
+	}
+	var scanErr error
+	iterRows := func(visit func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16)) {
+		if scanErr == nil {
+			scanErr = stream.forEachDictionaryRow(visit)
+		}
+	}
 
 	columnsByTable := make(map[uint32][]columnDef)
 	columnsByTableColID := make(map[tableColKey]columnDef)
 	columnCount := 0
-	iterDictionaryRows(data, pageSize, func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16) {
+	iterRows(func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16) {
 		col, ok := parseDDLColumnRow(page, int(slotOff), pageNo, slotNo, slotOff, pageSize, decoder)
 		if !ok {
 			return
@@ -324,7 +335,7 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 	}
 
 	indexes := make(map[uint32]indexDef)
-	iterDictionaryRows(data, pageSize, func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16) {
+	iterRows(func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16) {
 		idx, ok := parseDDLIndexRow(page, int(slotOff), pageSize)
 		if ok {
 			indexes[idx.ID] = idx
@@ -335,7 +346,7 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 	applyDictionaryTableStorage(dictionaryTables, tableStorage, tablespaces)
 
 	var constraints []constraintDef
-	iterDictionaryRows(data, pageSize, func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16) {
+	iterRows(func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16) {
 		cons, ok := parseDDLConstraintRow(page, int(slotOff), pageNo, slotNo, slotOff, pageSize, decoder)
 		if !ok {
 			return
@@ -351,7 +362,7 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 	})
 
 	tableComments := make(map[ownerTableKey]tableComment)
-	iterDictionaryRows(data, pageSize, func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16) {
+	iterRows(func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16) {
 		comment, ok := parseDDLTableCommentRow(page, int(slotOff), pageSize, decoder)
 		if !ok {
 			return
@@ -367,7 +378,7 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 	})
 
 	columnComments := make(map[ownerTableColumnKey]columnComment)
-	iterDictionaryRows(data, pageSize, func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16) {
+	iterRows(func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16) {
 		comment, ok := parseDDLColumnCommentRow(page, int(slotOff), pageSize, decoder)
 		if !ok {
 			return
@@ -388,7 +399,7 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 	})
 
 	var roleGrants []roleGrantDef
-	iterDictionaryRows(data, pageSize, func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16) {
+	iterRows(func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16) {
 		grant, ok := parseDDLRoleGrantRow(page, int(slotOff), pageNo, slotNo, slotOff, pageSize)
 		if !ok {
 			return
@@ -407,7 +418,13 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 		roleGrants = append(roleGrants, grant)
 	})
 
-	texts := scanDictionaryTexts(data, pageSize, decoder)
+	if scanErr != nil {
+		return nil, scanErr
+	}
+	texts, err := stream.dictionaryTexts(decoder)
+	if err != nil {
+		return nil, err
+	}
 	views := scanDictionaryViews(objects, texts, ownerMatcher)
 	if dictViews, ok := dictionaryViewsForDDL(opts.Dictionary, ownerMatcher); ok {
 		views = dictViews
@@ -416,11 +433,19 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 	if dictSequences, ok := dictionarySequencesForDDL(opts.Dictionary, ownerMatcher); ok {
 		sequences = dictSequences
 	}
-	routines := scanDictionaryRoutines(objects, texts, scanRawRoutineTexts(data, decoder), ownerMatcher)
+	rawRoutines, err := stream.rawRoutineTexts(decoder)
+	if err != nil {
+		return nil, err
+	}
+	routines := scanDictionaryRoutines(objects, texts, rawRoutines, ownerMatcher)
 	if dictRoutines, ok := dictionaryRoutinesForDDL(opts.Dictionary, ownerMatcher); ok {
 		routines = dictRoutines
 	}
-	triggers := scanDictionaryTriggers(objects, texts, scanRawTriggerTexts(data, decoder), ownerMatcher)
+	rawTriggers, err := stream.rawTriggerTexts(decoder)
+	if err != nil {
+		return nil, err
+	}
+	triggers := scanDictionaryTriggers(objects, texts, rawTriggers, ownerMatcher)
 	if dictTriggers, ok := dictionaryTriggersForDDL(opts.Dictionary, ownerMatcher, tableMatcher); ok {
 		triggers = dictTriggers
 	}
@@ -428,7 +453,10 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 	if dictSynonyms, ok := dictionarySynonymsForDDL(opts.Dictionary, ownerMatcher); ok {
 		synonyms = dictSynonyms
 	}
-	tabPrivileges := scanDictionaryTabPrivileges(data, pageSize, objects, users, roles, ownerMatcher, tableMatcher)
+	tabPrivileges, err := stream.tabPrivileges(objects, users, roles, ownerMatcher, tableMatcher)
+	if err != nil {
+		return nil, err
+	}
 	if dictPrivileges, ok := dictionaryTabPrivilegesForDDL(opts.Dictionary, ownerMatcher, tableMatcher); ok {
 		tabPrivileges = dictPrivileges
 	}
@@ -528,25 +556,29 @@ func iterDictionaryRows(data []byte, pageSize uint32, visit func(page []byte, pa
 	for pageNo := 0; pageNo < totalPages; pageNo++ {
 		start := pageNo * int(pageSize)
 		page := data[start : start+int(pageSize)]
-		if len(page) < sysObjectsSlotCountOff+2 {
+		iterDictionaryRowsInPage(page, pageSize, uint32(pageNo), visit)
+	}
+}
+
+func iterDictionaryRowsInPage(page []byte, pageSize uint32, pageNo uint32, visit func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16)) {
+	if len(page) < int(pageSize) || len(page) < sysObjectsSlotCountOff+2 {
+		return
+	}
+	slotCount := binary.LittleEndian.Uint16(page[sysObjectsSlotCountOff:])
+	if slotCount == 0 || slotCount >= 2048 {
+		return
+	}
+	slotArrayStart := int(pageSize) - pageSlotTrailerLen - int(slotCount)*2
+	if slotArrayStart < 0x40 || slotArrayStart >= int(pageSize) {
+		return
+	}
+	for slotNo := uint16(0); slotNo < slotCount; slotNo++ {
+		pos := slotArrayStart + int(slotNo)*2
+		slotOff := binary.LittleEndian.Uint16(page[pos:])
+		if slotOff == 0 || int(slotOff) >= int(pageSize) {
 			continue
 		}
-		slotCount := binary.LittleEndian.Uint16(page[sysObjectsSlotCountOff:])
-		if slotCount == 0 || slotCount >= 2048 {
-			continue
-		}
-		slotArrayStart := int(pageSize) - pageSlotTrailerLen - int(slotCount)*2
-		if slotArrayStart < 0x40 || slotArrayStart >= int(pageSize) {
-			continue
-		}
-		for slotNo := uint16(0); slotNo < slotCount; slotNo++ {
-			pos := slotArrayStart + int(slotNo)*2
-			slotOff := binary.LittleEndian.Uint16(page[pos:])
-			if slotOff == 0 || int(slotOff) >= int(pageSize) {
-				continue
-			}
-			visit(page, uint32(pageNo), slotNo, slotOff)
-		}
+		visit(page, pageNo, slotNo, slotOff)
 	}
 }
 

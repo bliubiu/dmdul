@@ -170,22 +170,16 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 		}
 	}
 
-	systemData, err := os.ReadFile(opts.SystemPath)
+	stream, err := openSystemPageStream(opts.SystemPath)
 	if err != nil {
-		return nil, fmt.Errorf("read SYSTEM.DBF: %w", err)
+		return nil, err
 	}
-	if len(systemData) < systemHeaderReadSize {
-		return nil, fmt.Errorf("SYSTEM.DBF is too small")
-	}
-	pageSize, _ := detectSystemPageSize(systemData[:systemHeaderReadSize], int64(len(systemData)))
-	if pageSize == 0 {
-		return nil, fmt.Errorf("cannot detect SYSTEM.DBF page size")
-	}
-	restoreSystemPages(systemData, pageSize)
+	defer stream.close()
+	pageSize := stream.pageSize
 
 	preferredCharset := strings.ToLower(strings.TrimSpace(opts.Charset))
 	if preferredCharset == "" || preferredCharset == "auto" {
-		if charset, ok := detectSystemCharsetFromData(systemData, pageSize); ok && charset.DecoderName != "" {
+		if charset, ok := stream.charset(); ok && charset.DecoderName != "" {
 			preferredCharset = charset.DecoderName
 		}
 	}
@@ -201,7 +195,10 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 	if outputFormat == "" {
 		return nil, fmt.Errorf("unsupported data output format %q", opts.OutputFormat)
 	}
-	objects := scanDictionaryObjects(systemData, pageSize, decoder)
+	objects, err := stream.dictionaryObjects(decoder)
+	if err != nil {
+		return nil, err
+	}
 	schemaNames := schemaNamesFromDictionaryObjects(objects)
 	for id, obj := range objects {
 		obj.Owner = resolveSchemaName(obj.SchemaID, schemaNames)
@@ -222,7 +219,7 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 
 	columnsByTable := make(map[uint32][]columnDef)
 	columnCount := 0
-	iterDictionaryRows(systemData, pageSize, func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16) {
+	if err := stream.forEachDictionaryRow(func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16) {
 		col, ok := parseDDLColumnRow(page, int(slotOff), pageNo, slotNo, slotOff, pageSize, decoder)
 		if !ok {
 			return
@@ -236,7 +233,9 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 		}
 		columnsByTable[col.TableID] = append(columnsByTable[col.TableID], col)
 		columnCount++
-	})
+	}); err != nil {
+		return nil, err
+	}
 	for tableID := range columnsByTable {
 		sort.Slice(columnsByTable[tableID], func(i, j int) bool {
 			return columnsByTable[tableID][i].ColID < columnsByTable[tableID][j].ColID
@@ -248,15 +247,20 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 	}
 
 	indexes := make(map[uint32]indexDef)
-	iterDictionaryRows(systemData, pageSize, func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16) {
+	if err := stream.forEachDictionaryRow(func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16) {
 		idx, ok := parseDDLIndexRow(page, int(slotOff), pageSize)
 		if ok {
 			indexes[idx.ID] = idx
 		}
-	})
+	}); err != nil {
+		return nil, err
+	}
 
 	assistByParentID := assistIndexesByParentID(tables, indexObjects, indexes)
-	partitionsByTable := scanPartitionsByTable(systemData, pageSize, decoder, tables, ownerMatcher)
+	partitionsByTable, err := stream.partitionsByTable(decoder, tables, ownerMatcher)
+	if err != nil {
+		return nil, err
+	}
 	dataStorageByTable := tableStorageByID(tables, indexObjects, indexes, nil)
 	dataFiles, err := resolveDataFiles(opts.ControlPath, opts.ControlDULPath, dataDir)
 	if err != nil {
@@ -384,34 +388,26 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 		if stop {
 			break
 		}
-		fileData, err := os.ReadFile(file.path)
-		if err != nil {
-			return nil, fmt.Errorf("read data file %s: %w", file.path, err)
-		}
-		pageCount := len(fileData) / int(pageSize)
-		result.PagesScanned += pageCount
-		for pageNo := 0; pageNo < pageCount; pageNo++ {
+		pagesScanned, scanErr := forEachDataFilePage(file.path, pageSize, func(page []byte, pageNo uint32) error {
 			if stop {
-				break
+				return errStopPageScan
 			}
-			start := pageNo * int(pageSize)
-			page := fileData[start : start+int(pageSize)]
 			if !isProbableDMDataPage(page, pageSize) {
-				continue
+				return nil
 			}
 			assistIndexID := binary.LittleEndian.Uint32(page[dataPageAssistIndexOff:])
 			candidates := assistByID[assistIndexID]
 			if len(candidates) == 0 {
-				continue
+				return nil
 			}
 			nRec := int(binary.LittleEndian.Uint16(page[dataPageRecordCountOff:]))
 			if nRec <= 0 {
-				continue
+				return nil
 			}
 			rows := locateRowsInDataPage(page, pageSize, nRec)
-			info, ok := selectDataPageCandidate(candidates, file, uint32(pageNo), page, pageSize, rows, decoder)
+			info, ok := selectDataPageCandidate(candidates, file, pageNo, page, pageSize, rows, decoder)
 			if !ok {
-				continue
+				return nil
 			}
 			for _, row := range rows {
 				if opts.MaxRows > 0 && result.RowsLocated >= opts.MaxRows {
@@ -466,12 +462,23 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 				}
 				if outputFormat == "csv" {
 					if err := csvWriter.Write(record); err != nil {
-						return nil, fmt.Errorf("write csv row: %w", err)
+						return fmt.Errorf("write csv row: %w", err)
 					}
 				} else {
 					fmt.Fprintln(writer, line)
 				}
 			}
+			if stop {
+				return errStopPageScan
+			}
+			return nil
+		})
+		result.PagesScanned += pagesScanned
+		if scanErr != nil && scanErr != errStopPageScan {
+			return nil, fmt.Errorf("scan data file %s: %w", file.path, scanErr)
+		}
+		if scanErr == errStopPageScan {
+			stop = true
 		}
 	}
 	for _, pending := range pendingPartialRows {

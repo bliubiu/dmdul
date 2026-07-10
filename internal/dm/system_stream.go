@@ -1,0 +1,170 @@
+package dm
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"os"
+)
+
+var errStopPageScan = errors.New("stop page scan")
+
+const (
+	systemStreamChunkTarget = 1024 * 1024
+	rawRoutineWindowLimit   = 512 * 1024
+)
+
+// systemPageStream keeps SYSTEM.DBF scans bounded to a page (or a small raw
+// source window) instead of retaining the complete data file in memory.
+type systemPageStream struct {
+	file       *os.File
+	path       string
+	fileSize   int64
+	header     []byte
+	pageSize   uint32
+	pageCount  uint32
+	extentSize uint32
+	extentSrc  string
+}
+
+func openSystemPageStream(path string) (*systemPageStream, error) {
+	header, fileSize, err := readSystemHeader(path)
+	if err != nil {
+		return nil, fmt.Errorf("read SYSTEM.DBF header: %w", err)
+	}
+	pageSize, _ := detectSystemPageSize(header, fileSize)
+	if pageSize == 0 {
+		return nil, fmt.Errorf("cannot detect SYSTEM.DBF page size")
+	}
+	pageCount, _ := detectSystemPageCount(header, fileSize, pageSize)
+	extentSize, extentSrc := detectSystemExtentSize(header)
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open SYSTEM.DBF: %w", err)
+	}
+	return &systemPageStream{
+		file:       file,
+		path:       path,
+		fileSize:   fileSize,
+		header:     header,
+		pageSize:   pageSize,
+		pageCount:  pageCount,
+		extentSize: extentSize,
+		extentSrc:  extentSrc,
+	}, nil
+}
+
+func (s *systemPageStream) close() {
+	if s != nil && s.file != nil {
+		_ = s.file.Close()
+	}
+}
+
+func (s *systemPageStream) forEachPage(visit func(page []byte, pageNo uint32)) error {
+	if s == nil || s.file == nil || s.pageSize == 0 {
+		return fmt.Errorf("SYSTEM.DBF stream is not open")
+	}
+	page := make([]byte, int(s.pageSize))
+	for pageNo := uint32(0); pageNo < s.pageCount; pageNo++ {
+		n, err := s.file.ReadAt(page, int64(pageNo)*int64(s.pageSize))
+		if err != nil && err != io.EOF {
+			return fmt.Errorf("read SYSTEM.DBF page %d: %w", pageNo, err)
+		}
+		if n != len(page) {
+			return fmt.Errorf("read SYSTEM.DBF page %d: short read %d/%d", pageNo, n, len(page))
+		}
+		restorePageProtectionBytes(page, s.pageSize)
+		visit(page, pageNo)
+	}
+	return nil
+}
+
+func (s *systemPageStream) forEachDictionaryRow(visit func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16)) error {
+	return s.forEachPage(func(page []byte, pageNo uint32) {
+		iterDictionaryRowsInPage(page, s.pageSize, pageNo, visit)
+	})
+}
+
+func (s *systemPageStream) forEachDictionarySlotRange(visit func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16, nextOff uint16)) error {
+	return s.forEachPage(func(page []byte, pageNo uint32) {
+		iterDictionarySlotRangesInPage(page, s.pageSize, pageNo, visit)
+	})
+}
+
+func (s *systemPageStream) charset() (systemCharset, bool) {
+	return detectSystemCharsetFromFile(s.path, s.pageSize)
+}
+
+func (s *systemPageStream) rawRoutineTexts(decoder textDecoder) (map[string]string, error) {
+	return s.scanRawWindows(decoder, scanRawRoutineTexts)
+}
+
+func (s *systemPageStream) rawTriggerTexts(decoder textDecoder) (map[string]string, error) {
+	return s.scanRawWindows(decoder, scanRawTriggerTexts)
+}
+
+func (s *systemPageStream) scanRawWindows(decoder textDecoder, scan func([]byte, textDecoder) map[string]string) (map[string]string, error) {
+	result := make(map[string]string)
+	pagesPerChunk := systemStreamChunkTarget / int(s.pageSize)
+	if pagesPerChunk < 1 {
+		pagesPerChunk = 1
+	}
+	lookaheadPages := (rawRoutineWindowLimit + int(s.pageSize) - 1) / int(s.pageSize)
+	for firstPage := uint32(0); firstPage < s.pageCount; firstPage += uint32(pagesPerChunk) {
+		primaryPages := pagesPerChunk
+		if remaining := int(s.pageCount - firstPage); primaryPages > remaining {
+			primaryPages = remaining
+		}
+		readPages := primaryPages + lookaheadPages
+		if remaining := int(s.pageCount - firstPage); readPages > remaining {
+			readPages = remaining
+		}
+		window := make([]byte, readPages*int(s.pageSize))
+		n, err := s.file.ReadAt(window, int64(firstPage)*int64(s.pageSize))
+		if err != nil && err != io.EOF {
+			return nil, fmt.Errorf("read SYSTEM.DBF raw source window at page %d: %w", firstPage, err)
+		}
+		if n != len(window) {
+			return nil, fmt.Errorf("read SYSTEM.DBF raw source window at page %d: short read %d/%d", firstPage, n, len(window))
+		}
+		for offset := 0; offset < len(window); offset += int(s.pageSize) {
+			restorePageProtectionBytes(window[offset:offset+int(s.pageSize)], s.pageSize)
+		}
+		for key, sql := range scan(window, decoder) {
+			if len(sql) > len(result[key]) {
+				result[key] = sql
+			}
+		}
+	}
+	return result, nil
+}
+
+func forEachDataFilePage(path string, pageSize uint32, visit func(page []byte, pageNo uint32) error) (int, error) {
+	if pageSize == 0 {
+		return 0, fmt.Errorf("invalid page size 0")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return 0, err
+	}
+	pageCount := int(info.Size() / int64(pageSize))
+	page := make([]byte, int(pageSize))
+	for pageNo := 0; pageNo < pageCount; pageNo++ {
+		n, readErr := file.ReadAt(page, int64(pageNo)*int64(pageSize))
+		if readErr != nil && readErr != io.EOF {
+			return pageNo, readErr
+		}
+		if n != len(page) {
+			return pageNo, fmt.Errorf("short read %d/%d", n, len(page))
+		}
+		if err := visit(page, uint32(pageNo)); err != nil {
+			return pageNo + 1, err
+		}
+	}
+	return pageCount, nil
+}

@@ -2,7 +2,6 @@ package dm
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -153,26 +152,20 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 	if opts.SystemPath == "" {
 		return nil, fmt.Errorf("bootstrap requires SYSTEM.DBF path")
 	}
-	data, err := os.ReadFile(opts.SystemPath)
+	stream, err := openSystemPageStream(opts.SystemPath)
 	if err != nil {
-		return nil, fmt.Errorf("read SYSTEM.DBF: %w", err)
+		return nil, err
 	}
-	if len(data) < systemHeaderReadSize {
-		return nil, fmt.Errorf("SYSTEM.DBF is too small")
-	}
+	defer stream.close()
 
-	pageSize, _ := detectSystemPageSize(data[:systemHeaderReadSize], int64(len(data)))
-	if pageSize == 0 {
-		return nil, fmt.Errorf("cannot detect SYSTEM.DBF page size")
-	}
-	pageCount, _ := detectSystemPageCount(data[:systemHeaderReadSize], int64(len(data)), pageSize)
-	extentSize, extentSizeSource := detectSystemExtentSize(data[:systemHeaderReadSize])
-	restoreSystemPages(data, pageSize)
+	pageSize := stream.pageSize
+	pageCount := stream.pageCount
+	extentSize, extentSizeSource := stream.extentSize, stream.extentSrc
 
 	preferredCharset := strings.ToLower(strings.TrimSpace(opts.Charset))
 	charsetDisplay := defaultIfEmpty(opts.Charset, "auto")
 	charsetSource := "decoder setting"
-	if charset, ok := detectSystemCharsetFromData(data, pageSize); ok {
+	if charset, ok := stream.charset(); ok {
 		charsetDisplay = charset.DisplayName
 		charsetSource = charset.Source
 		if preferredCharset == "" || preferredCharset == "auto" {
@@ -182,7 +175,10 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 	decoder := textDecoder{preferred: preferredCharset}
 	ownerMatcher := newOwnerMatcher(opts.OwnerFilter)
 
-	objects := scanDictionaryObjects(data, pageSize, decoder)
+	objects, err := stream.dictionaryObjects(decoder)
+	if err != nil {
+		return nil, err
+	}
 	schemaNames := schemaNamesFromDictionaryObjects(objects)
 	for id, obj := range objects {
 		obj.Owner = resolveSchemaName(obj.SchemaID, schemaNames)
@@ -213,7 +209,7 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 	columnsByTable := make(map[uint32]int)
 	var columnList []DictionaryColumn
 	columnCount := 0
-	iterDictionaryRows(data, pageSize, func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16) {
+	if err := stream.forEachDictionaryRow(func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16) {
 		col, ok := parseDDLColumnRow(page, int(slotOff), pageNo, slotNo, slotOff, pageSize, decoder)
 		if !ok {
 			return
@@ -236,27 +232,48 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 			Default:    col.Default,
 		})
 		columnCount++
-	})
+	}); err != nil {
+		return nil, err
+	}
 
 	indexes := make(map[uint32]indexDef)
-	iterDictionaryRows(data, pageSize, func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16) {
+	if err := stream.forEachDictionaryRow(func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16) {
 		idx, ok := parseDDLIndexRow(page, int(slotOff), pageSize)
 		if ok {
 			indexes[idx.ID] = idx
 		}
-	})
-	texts := scanDictionaryTexts(data, pageSize, decoder)
+	}); err != nil {
+		return nil, err
+	}
+	texts, err := stream.dictionaryTexts(decoder)
+	if err != nil {
+		return nil, err
+	}
 	viewList := scanDictionaryViews(objects, texts, ownerMatcher)
 	sequenceList := scanDictionarySequences(objects, texts, ownerMatcher)
-	routineList := scanDictionaryRoutines(objects, texts, scanRawRoutineTexts(data, decoder), ownerMatcher)
-	triggerList := scanDictionaryTriggers(objects, texts, scanRawTriggerTexts(data, decoder), ownerMatcher)
+	rawRoutines, err := stream.rawRoutineTexts(decoder)
+	if err != nil {
+		return nil, err
+	}
+	rawTriggers, err := stream.rawTriggerTexts(decoder)
+	if err != nil {
+		return nil, err
+	}
+	routineList := scanDictionaryRoutines(objects, texts, rawRoutines, ownerMatcher)
+	triggerList := scanDictionaryTriggers(objects, texts, rawTriggers, ownerMatcher)
 	synonymList := scanDictionarySynonyms(objects, ownerMatcher)
-	tabPrivilegeList := scanDictionaryTabPrivileges(data, pageSize, objects, userObjects, roleObjects, ownerMatcher, newTableNameMatcher("all"))
+	tabPrivilegeList, err := stream.tabPrivileges(objects, userObjects, roleObjects, ownerMatcher, newTableNameMatcher("all"))
+	if err != nil {
+		return nil, err
+	}
 
 	tablespaces := loadTablespaceNames(opts.ControlPath, opts.ControlDULPath)
 	tableStorage := tableStorageByID(tables, indexObjects, indexes, tablespaces)
 	assistByParentID := assistIndexesByParentID(tables, indexObjects, indexes)
-	partitionsByTable := scanPartitionsByTable(data, pageSize, decoder, tables, ownerMatcher)
+	partitionsByTable, err := stream.partitionsByTable(decoder, tables, ownerMatcher)
+	if err != nil {
+		return nil, err
+	}
 	var tableList []DictionaryTable
 	userNamesByName := make(map[string]DictionaryUser)
 	for _, user := range users {

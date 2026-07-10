@@ -2,7 +2,6 @@ package dm
 
 import (
 	"encoding/binary"
-	"os"
 	"sort"
 )
 
@@ -34,21 +33,14 @@ func inferDictionaryTableSegments(controlPath string, controlDULPath string, dat
 	}
 	stats := make(map[uint32]*segmentPageStats)
 	for _, ref := range refs {
-		raw, err := os.ReadFile(ref.path)
-		if err != nil {
-			continue
-		}
-		pageCount := len(raw) / int(pageSize)
-		for pageNo := 0; pageNo < pageCount; pageNo++ {
-			start := pageNo * int(pageSize)
-			page := raw[start : start+int(pageSize)]
+		_, err := forEachDataFilePage(ref.path, pageSize, func(page []byte, pageNo uint32) error {
 			if !isProbableSegmentAssistPage(page, pageSize) {
-				continue
+				return nil
 			}
 			assistID := binary.LittleEndian.Uint32(page[dataPageAssistIndexOff:])
 			tableIDs := assistToTables[assistID]
 			if len(tableIDs) == 0 {
-				continue
+				return nil
 			}
 			for _, tableID := range tableIDs {
 				stat := stats[tableID]
@@ -61,8 +53,16 @@ func inferDictionaryTableSegments(controlPath string, controlDULPath string, dat
 					pages = make(map[uint32]bool)
 					stat.files[ref.key] = pages
 				}
-				pages[uint32(pageNo)] = true
+				extentStart := pageNo
+				if extentSize > 0 {
+					extentStart = (pageNo / extentSize) * extentSize
+				}
+				pages[extentStart] = true
 			}
+			return nil
+		})
+		if err != nil {
+			continue
 		}
 	}
 	result := make(map[uint32]tableSegment)
