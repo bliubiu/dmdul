@@ -25,6 +25,7 @@ Main interactive commands:
   list user;
   list table <owner>;
   unload table <owner.table_name>;
+  unload object <owner|all>;
   unload user <owner>;
   unload database;
   recover table <owner.table_name>;

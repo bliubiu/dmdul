@@ -10,15 +10,16 @@ import (
 )
 
 const (
-	systemHeaderReadSize    = 0x100
-	systemExtentSizeOffset  = 0x80
-	systemPageSizeOffset    = 0x84
-	systemPageCountOffset   = 0x8C
-	systemControlPage4No    = 4
-	systemUnicodeFlagOffset = 0x2D
-	sysObjectsSlotCountOff  = 0x24
-	systemSectorSize        = 4096
-	pageSlotTrailerLen      = 8
+	systemHeaderReadSize          = 0x100
+	systemExtentSizeOffset        = 0x80
+	systemPageSizeOffset          = 0x84
+	systemPageCountOffset         = 0x8C
+	systemControlPage4No          = 4
+	systemCaseSensitiveFlagOffset = 0x2C
+	systemUnicodeFlagOffset       = 0x2D
+	sysObjectsSlotCountOff        = 0x24
+	systemSectorSize              = 4096
+	pageSlotTrailerLen            = 8
 )
 
 var ImportantSystemObjectNames = []string{

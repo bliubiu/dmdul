@@ -9,29 +9,42 @@ import (
 	"strings"
 )
 
+const (
+	DefaultDatabaseName     = "DAMENG"
+	DefaultInstanceName     = "DMSERVER"
+	DefaultExtentSize       = uint32(16)
+	DefaultPageSize         = uint32(8192)
+	DefaultUnicodeFlag      = uint8(0)
+	DefaultCaseSensitive    = true
+	databaseParameterSource = "DM default"
+)
+
 type DatabaseMetadata struct {
-	SystemPath       string
-	ControlPath      string
-	IniPath          string
-	DatabaseName     string
-	DatabaseNameSrc  string
-	InstanceName     string
-	InstanceNameSrc  string
-	Port             string
-	PortSrc          string
-	ExtentSize       uint32
-	ExtentSizeSource string
-	PageSize         uint32
-	PageSizeSource   string
-	PageCount        uint32
-	PageCountSource  string
-	Charset          string
-	CharsetSource    string
-	CharsetFlag      uint8
-	HasCharsetFlag   bool
-	IniExtentSize    string
-	IniPageSize      string
-	IniCharset       string
+	SystemPath          string
+	ControlPath         string
+	IniPath             string
+	DatabaseName        string
+	DatabaseNameSrc     string
+	InstanceName        string
+	InstanceNameSrc     string
+	Port                string
+	PortSrc             string
+	ExtentSize          uint32
+	ExtentSizeSource    string
+	PageSize            uint32
+	PageSizeSource      string
+	PageCount           uint32
+	PageCountSource     string
+	Charset             string
+	CharsetSource       string
+	CharsetFlag         uint8
+	HasCharsetFlag      bool
+	CaseSensitive       bool
+	CaseSensitiveSource string
+	HasCaseSensitive    bool
+	IniExtentSize       string
+	IniPageSize         string
+	IniCharset          string
 }
 
 func DefaultControlPathForSystem(systemPath string) string {
@@ -42,11 +55,34 @@ func DefaultIniPathForSystem(systemPath string) string {
 	return filepath.Join(systemDir(systemPath), "dm.ini")
 }
 
+func DefaultDatabaseMetadata() DatabaseMetadata {
+	return DatabaseMetadata{
+		DatabaseName:        DefaultDatabaseName,
+		DatabaseNameSrc:     databaseParameterSource,
+		InstanceName:        DefaultInstanceName,
+		InstanceNameSrc:     databaseParameterSource,
+		ExtentSize:          DefaultExtentSize,
+		ExtentSizeSource:    databaseParameterSource,
+		PageSize:            DefaultPageSize,
+		PageSizeSource:      databaseParameterSource,
+		PageCountSource:     "unknown",
+		Charset:             "GB18030 (UNICODE_FLAG=0)",
+		CharsetSource:       databaseParameterSource,
+		CharsetFlag:         DefaultUnicodeFlag,
+		HasCharsetFlag:      true,
+		CaseSensitive:       DefaultCaseSensitive,
+		CaseSensitiveSource: databaseParameterSource,
+		HasCaseSensitive:    true,
+	}
+}
+
 func InspectDatabaseMetadata(systemPath string, controlPath string, iniPath string, charsetPreference string) DatabaseMetadata {
-	meta := DatabaseMetadata{
-		SystemPath:    systemPath,
-		Charset:       defaultIfEmpty(strings.TrimSpace(charsetPreference), "auto"),
-		CharsetSource: "decoder setting",
+	meta := DefaultDatabaseMetadata()
+	meta.SystemPath = systemPath
+	if preferred := strings.TrimSpace(charsetPreference); preferred != "" && !strings.EqualFold(preferred, "auto") {
+		meta.Charset = preferred
+		meta.CharsetSource = "decoder setting"
+		meta.HasCharsetFlag = false
 	}
 
 	if controlPath == "" {
@@ -56,10 +92,15 @@ func InspectDatabaseMetadata(systemPath string, controlPath string, iniPath stri
 		}
 	}
 	meta.ControlPath = controlPath
+	if iniPath == "" {
+		iniPath = DefaultIniPathForSystem(systemPath)
+	}
 	meta.IniPath = iniPath
 
 	if header, size, err := readSystemHeader(systemPath); err == nil {
-		meta.ExtentSize, meta.ExtentSizeSource = detectSystemExtentSize(header)
+		if extentSize, source := detectSystemExtentSize(header); extentSize != 0 {
+			meta.ExtentSize, meta.ExtentSizeSource = extentSize, source
+		}
 		meta.PageSize, meta.PageSizeSource = detectSystemPageSize(header, size)
 		meta.PageCount, meta.PageCountSource = detectSystemPageCount(header, size, meta.PageSize)
 		if charset, ok := detectSystemCharsetFromFile(systemPath, meta.PageSize); ok {
@@ -68,18 +109,29 @@ func InspectDatabaseMetadata(systemPath string, controlPath string, iniPath stri
 			meta.CharsetFlag = charset.Flag
 			meta.HasCharsetFlag = true
 		}
+		if caseSensitive, ok := detectSystemCaseSensitiveFromFile(systemPath, meta.PageSize); ok {
+			meta.CaseSensitive = caseSensitive
+			meta.CaseSensitiveSource = "SYSTEM.DBF page 4 + 0x2C"
+			meta.HasCaseSensitive = true
+		}
+		if instanceName, source, ok := detectSystemInstanceNameFromFile(systemPath, meta.PageSize); ok {
+			meta.InstanceName = instanceName
+			meta.InstanceNameSrc = source
+		}
 	}
 
 	if controlPath != "" {
 		if ctl, err := InspectControlFile(controlPath); err == nil {
-			meta.DatabaseName = ctl.DatabaseName
-			meta.DatabaseNameSrc = "dm.ctl"
+			if strings.TrimSpace(ctl.DatabaseName) != "" {
+				meta.DatabaseName = ctl.DatabaseName
+				meta.DatabaseNameSrc = "dm.ctl"
+			}
 		}
 	}
 
 	if ini, ok := loadDMIni(iniPath); ok {
-		meta.InstanceName = ini["INSTANCE_NAME"]
-		if meta.InstanceName != "" {
+		if instanceName := strings.TrimSpace(ini["INSTANCE_NAME"]); instanceName != "" && meta.InstanceNameSrc == databaseParameterSource {
+			meta.InstanceName = instanceName
 			meta.InstanceNameSrc = "dm.ini"
 		}
 		meta.Port = ini["PORT_NUM"]
@@ -127,6 +179,46 @@ type systemCharset struct {
 	DecoderName string
 	Flag        uint8
 	Source      string
+}
+
+func detectSystemCaseSensitiveFromFile(path string, pageSize uint32) (bool, bool) {
+	if pageSize == 0 {
+		return false, false
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return false, false
+	}
+	defer file.Close()
+
+	offset := int64(pageSize)*systemControlPage4No + systemCaseSensitiveFlagOffset
+	buf := []byte{0}
+	if _, err := file.ReadAt(buf, offset); err != nil {
+		return false, false
+	}
+	return systemCaseSensitiveFromFlag(buf[0])
+}
+
+func detectSystemCaseSensitiveFromData(data []byte, pageSize uint32) (bool, bool) {
+	if pageSize == 0 {
+		return false, false
+	}
+	offset := int(pageSize)*systemControlPage4No + systemCaseSensitiveFlagOffset
+	if offset < 0 || offset >= len(data) {
+		return false, false
+	}
+	return systemCaseSensitiveFromFlag(data[offset])
+}
+
+func systemCaseSensitiveFromFlag(flag byte) (bool, bool) {
+	switch flag {
+	case 0:
+		return false, true
+	case 1:
+		return true, true
+	default:
+		return false, false
+	}
 }
 
 func detectSystemCharsetFromFile(path string, pageSize uint32) (systemCharset, bool) {

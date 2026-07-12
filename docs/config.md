@@ -4,7 +4,8 @@ DMDUL 交互式模式会自动生成 `init.dul` 参数文件。未设置 `data_d
 `init.dul` 写在当前目录；设置 `data_dir` 后，会写到 `data_dir` 目录下。
 启动时会读取当前目录下的 `init.dul`。也可以进入 `DMDUL>` 后使用 `set`
 命令临时修改参数；每次 `set` 成功后会同步写入当前生效目录下的 `init.dul`。
-如果手工修改了磁盘上的 `init.dul`，可以在交互界面执行 `load init;` 重新加载。
+如果手工修改了磁盘上的 `init.dul`，可以在交互界面执行 `load parameter;` 重新加载；
+`load init;` 继续作为兼容别名保留。
 
 ## init.dul
 
@@ -20,11 +21,28 @@ DMDUL 交互式模式会自动生成 `init.dul` 参数文件。未设置 `data_d
 # effective_log=D:\temp\oldpro\dul.log
 # init_load=D:\temp\oldpro\init.dul
 # dictionary=not loaded
+db_name=DAMENG
+db_name_source=DM default
+instance_name=DMSERVER
+instance_name_source=DM default
+extent_size=16
+extent_size_source=DM default
+page_size=8192
+page_size_source=DM default
+page_count=0
+page_count_source=unknown
+database_charset=GB18030 (UNICODE_FLAG=0)
+unicode_flag=0
+charset_source=DM default
+case_sensitive_value=1
+case_sensitive_source=DM default
+ini_path=D:\temp\oldpro\dm.ini
 system=D:\temp\oldpro\SYSTEM.DBF
 control=D:\temp\oldpro\dm.ctl
 data_dir=D:\temp\oldpro
 output_dir=
 data_format=sql
+case_sensitive=auto
 charset=auto
 log=
 ```
@@ -35,9 +53,36 @@ log=
 | `control` | 自动查找 `SYSTEM.DBF` 同目录下的 `dm.ctl` | 可选控制文件路径。 |
 | `data_dir` | `SYSTEM.DBF` 所在目录 | 用户表空间 DBF 文件所在目录。 |
 | `output_dir` | 未设置时：如果设置过 `data_dir` 则使用 `data_dir`，否则使用当前目录 | DDL、数据文件、`control.dul` 和 `dul.log` 的输出目录。 |
-| `data_format` | `sql` | 数据导出格式，支持 `sql` 和 `csv`。 |
+| `data_format` | `sql` | 数据导出格式，支持 `sql`、`csv` 和 `dmp`。DMP 按表生成纯数据文件。 |
+| `case_sensitive` | `auto` | DMP 文件头的建库大小写敏感标志。`auto` 优先读取 `SYSTEM.DBF` 第 4 页偏移 `0x2C`；也可显式设为 `0` 或 `1`。 |
 | `charset` | `auto` | 字典和数据文本解码字符集。 |
 | `log` | `dul.log`，目录规则同 `output_dir` | 交互式执行日志。 |
+
+`bootstrap;` 还会识别并持久化以下数据库参数：
+
+| 参数 | 无文件证据时的默认值 | 实际来源 |
+| --- | --- | --- |
+| `db_name` | `DAMENG` | 优先读取 `dm.ctl`；SYSTEM.DBF 当前只能取得 DB magic，不能稳定反解名称。 |
+| `instance_name` | `DMSERVER` | 优先读取 `SYSTEM.DBF` 的 `SYS.SYSOPENHISTORY.CUR_INST_NAME`，无历史记录时读取同目录 `dm.ini`。 |
+| `extent_size` | `16` 页 | `SYSTEM.DBF + 0x80`。 |
+| `page_size` | `8192` 字节 | `SYSTEM.DBF + 0x84`。 |
+| `page_count` | `0` | `SYSTEM.DBF + 0x8C`，并校验文件大小。 |
+| `database_charset` / `unicode_flag` | `GB18030 / 0` | `SYSTEM.DBF` 第 4 页 `+0x2D`。 |
+| `case_sensitive_value` | `1` | `SYSTEM.DBF` 第 4 页 `+0x2C`。 |
+
+每个值都有对应的 `*_source` 字段。`case_sensitive` 表示 DMP 导出策略，
+`case_sensitive_value` 表示数据库实际建库值，两者不能合并：当策略为 `auto` 时，
+DMDUL 使用实际值。
+
+`INSTANCE_NAME` 不是第 4 页附近的固定字符串。DMDUL 按数据页 storage id 定位
+`SYS.SYSOPENHISTORY`，解析 `RGUID`、`SYS_MODE`、`PRIMARY_INST_NAME`、
+`CUR_INST_NAME` 和 `OPEN_TIME`，并选择最新的有效记录。未曾成功打开过的数据库可能
+没有 open history，此时才回退到 `dm.ini` 或默认值 `DMSERVER`。
+
+`DB_NAME` 与此不同。已验证样例的 `V$DM_INI` 不包含 `DB_NAME`，
+`SYSOPENHISTORY` 只保存 `PRIMARY_DB_MAGIC/CUR_DB_MAGIC`，部分 SYSTEM.DBF 全文件也
+不存在真实库名的字节序列。因此当前不会把普通字符串命中冒充数据库名，仍使用
+`dm.ctl`，缺失时明确标为默认值 `DAMENG`。
 
 `control_dul`、`init_dul`、`dict_dir`、`output_dir` 和 `log` 的实际路径也会写入注释，
 便于和 `show parameter;` 的输出对应。空值表示继续使用自动默认规则。
@@ -52,7 +97,7 @@ log=
 手工修改后重新加载：
 
 ```text
-DMDUL> load init;
+DMDUL> load parameter;
 DMDUL> show parameter;
 ```
 
@@ -64,9 +109,11 @@ DMDUL> set control D:\temp\oldpro\dm.ctl;
 DMDUL> set data_dir D:\temp\oldpro;
 DMDUL> set output_dir D:\temp\oldpro\out;
 DMDUL> set data_format csv;
+DMDUL> set data_format dmp;
+DMDUL> set case_sensitive 0;
 DMDUL> set charset gb18030;
 DMDUL> show parameter;
-DMDUL> load init;
+DMDUL> load parameter;
 ```
 
 修改 `system`、`control` 或 `charset` 后，需要重新执行：
@@ -91,6 +138,28 @@ DMDUL> bootstrap;
 DMDUL> set charset gb18030;
 DMDUL> bootstrap;
 ```
+
+## 大小写敏感标志
+
+`case_sensitive=auto` 读取 `SYSTEM.DBF` 第 4 页偏移 `0x2C` 的单字节建库标志：
+
+| 标记 | 含义 |
+| ---: | --- |
+| `0` | 大小写不敏感 |
+| `1` | 大小写敏感 |
+
+该字节紧邻 `0x2D` 的 `UNICODE_FLAG`。已使用 6 个实例验证，并额外创建了两个
+字符集、页大小、簇大小完全相同而 `CASE_SENSITIVE` 分别为 `0/1` 的实例做差分，
+只有候选控制字段 `0x2C` 随参数变化。`bootstrap;` 会把识别结果写入日志和
+`dmdul_dict/meta.tsv`，DMP 导出会自动写入相同标志，避免 `dimp` 等待人工确认。
+
+`V$DM_INI` 是服务器运行时动态视图；在离线 `SYSTEM.DBF` 中能找到引用该视图的
+系统 SQL 文本，但没有发现可直接下载的 `V$DM_INI` 参数数据行，因此不以字符串
+扫描结果作为该参数的来源。`V$DM_INI.GLOBAL_STR_CASE_SENSITIVE` 也不能替代
+建库 `CASE_SENSITIVE`：实测样例中其运行值与 `FILE_VALUE` 可以不同。
+
+`show parameter;` 会显示 `case_effective=0|1` 及其物理来源；`init.dul` 通过
+`case_sensitive_value=0|1` 持久化实际值，可配置策略仍保持 `case_sensitive=auto`。
 
 ## control.dul
 
@@ -137,7 +206,7 @@ DMDUL> load dictionary;
 也可以直接执行 `list user;`，工具会在内存字典为空时自动尝试从 `dmdul_dict`
 恢复字典摘要。
 
-加载文本字典后，后续 `unload table`、`unload user`、`unload database` 会优先使用
+加载文本字典后，后续 `unload table`、`unload object`、`unload user`、`unload database` 会优先使用
 `dmdul_dict` 中修正后的用户、表、字段、字段类型、默认值、表空间和存储组织信息。
 底层 `SYSTEM.DBF` 仍用于读取索引、约束、分区和数据页定位所需的物理元数据。
 如果在 Windows 工具中手工保存 TSV 文件并产生 UTF-8 BOM，DMDUL 会自动兼容。
@@ -181,7 +250,7 @@ v0.1.6 开始，`bootstrap` 会尝试通过 DBF 页头和 assist id 自动推断
 | `synonyms.tsv` | 同义词 owner/name 以及目标 owner/name |
 | `tab_privs.tsv` | 表/视图/序列授权的 grantee、owner、object、privilege、grantable |
 
-`unload table`、`unload user`、`unload database` 会优先使用这些 TSV
+`unload table`、`unload object`、`unload user`、`unload database` 会优先使用这些 TSV
 中的内容生成视图、序列、存储过程/函数/包、触发器、同义词和对象授权 DDL。人工修复这些文件后重新执行
 `load dictionary;` 即可让修正后的字典参与恢复。
 

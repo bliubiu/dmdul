@@ -62,6 +62,7 @@ func (c *dataFilePageCache) readPage(ref dataPageRef) ([]byte, bool) {
 	if err != nil || n != pageSize {
 		return nil, false
 	}
+	restorePageProtectionBytes(page, c.pageSize)
 	if len(c.pages) >= maxCachedDataFilePages && len(c.pageFIFO) > 0 {
 		oldest := c.pageFIFO[0]
 		c.pageFIFO = c.pageFIFO[1:]

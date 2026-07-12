@@ -21,6 +21,9 @@ TBS_*.DBF
 
 `dm.ctl` 是可选增强文件。有它时可以补充数据库名、表空间名和数据文件路径；没有它时，
 数据抽取会根据 DBF 页头识别 `(表空间号, 文件号)`。
+`bootstrap` 会优先从 SYSTEM.DBF 的 `SYS.SYSOPENHISTORY` 恢复 `INSTANCE_NAME`；
+数据库从未成功打开或历史页不可用时，再读取同目录 `dm.ini`，最后使用默认值
+`DMSERVER`。这不影响离线字典和数据恢复。
 
 ## 启动 DMDUL
 
@@ -50,6 +53,7 @@ DMDUL> set data_dir D:\temp\oldpro;
 DMDUL> set control D:\temp\oldpro\dm.ctl;
 DMDUL> set output_dir D:\temp\oldpro\out;
 DMDUL> set data_format sql;
+DMDUL> set case_sensitive auto;
 DMDUL> set charset auto;
 ```
 
@@ -65,10 +69,12 @@ DMDUL> show parameter;
 DMDUL> bootstrap;
 ```
 
-`bootstrap` 会读取 `SYSTEM.DBF`，识别页大小、簇大小、页数、字符集，并加载用户、表、字段等字典信息。
+`bootstrap` 会读取 `SYSTEM.DBF`，识别页大小、簇大小、页数、字符集、大小写敏感标志，
+从可选 `dm.ctl` 获取数据库名，并从 `SYS.SYSOPENHISTORY` 最新有效记录获取实例名，
+然后加载用户、表、字段等字典信息。
 同时会扫描 `data_dir` 下的 DBF 页头，生成 `control.dul` 数据文件清单，并把字典摘要写入
-`dmdul_dict` 文本目录。成功后还会把识别到的数据库字符集回写到 `init.dul`
-的 `charset` 参数。成功后才能继续执行 `list` 和 `unload`。
+`dmdul_dict` 文本目录。成功后会把所有基础数据库参数及来源回写到 `init.dul`。
+成功后才能继续执行 `list` 和 `unload`。
 
 `dmdul_dict` 目录当前包含：
 
@@ -100,7 +106,7 @@ UTF-8 BOM 的 TSV 文件也可以正常读取。
 字段，对应在线 `DBA_SEGMENTS` 的段信息。补齐这些字段后，数据抽取会按段页范围过滤候选页，
 能减少同名表或相似行格式造成的误匹配。
 
-如果内存中还没有字典，执行 `list user`、`list table`、`unload table`、`unload user`、
+如果内存中还没有字典，执行 `list user`、`list table`、`unload table`、`unload object`、`unload user`、
 `unload database` 前也会尝试自动从 `dmdul_dict` 加载。
 
 ## 查看用户和表
@@ -164,6 +170,27 @@ HR_TEST_EMP_INFO_ddl.sql
 HR_TEST_EMP_INFO_data.csv
 ```
 
+导出达梦纯数据 DMP：
+
+```text
+DMDUL> set data_format dmp;
+DMDUL> unload table HR_TEST.EMP_INFO;
+```
+
+生成：
+
+```text
+HR_TEST_EMP_INFO_ddl.sql
+HR_TEST_EMP_INFO_data.dmp
+```
+
+DMP 使用 `bootstrap` 识别出的数据库字符集，支持 UTF-8、GB18030 和 EUC-KR。
+数据文件可在先执行 DDL 后，通过 `dimp DATA_ONLY=Y FAST_LOAD=Y` 按表装载。
+DM 当前 DMP 行格式不能保存 `TIME` 的小数秒；遇到非零小数秒时 DMDUL 会打印明确告警。
+`case_sensitive=auto` 会读取 `SYSTEM.DBF` 第 4 页偏移 `0x2C` 的建库大小写敏感标志，
+并写入 DMP 文件头，不依赖 `dm.ini`。若文件损坏导致该控制字节无法识别，可执行
+`set case_sensitive 0|1;` 显式覆盖，避免 `dimp` 等待参数确认。
+
 ## DROP / TRUNCATE 残留页恢复
 
 `recover table` 用于在表被 `TRUNCATE` 或 `DROP` 后，数据块尚未被新写入覆盖时，扫描数据文件中的残留行。它会使用字典中的字段定义解码行，并按页头里的 storage/assist id 过滤候选页。
@@ -182,33 +209,70 @@ DMDUL> load dictionary;
 DMDUL> recover table USERS1.T_TEST to users1_t_test_drop_recover;
 ```
 
-## 恢复一个用户
+## 导出对象字典
+
+`unload object` 只生成对象定义，不扫描和导出用户表数据：
+
+```text
+DMDUL> unload object HR_TEST;
+```
+
+默认生成 `HR_TEST_objects.sql`，其中包含该 owner 可恢复的用户定义、角色授权、表、
+索引、约束、注释、视图、序列、存储过程、函数、包、触发器、同义词和对象权限。
+导出全部 owner 的对象字典：
+
+```text
+DMDUL> unload object all;
+```
+
+默认生成 `DATABASE_objects.sql`。也可以使用 `to` 指定输出前缀：
+
+```text
+DMDUL> unload object HR_TEST to hr_test_dictionary;
+```
+
+## 恢复一个用户的表
 
 ```text
 DMDUL> unload user HR_TEST;
 ```
 
-默认生成：
+`unload user` 只负责该用户拥有的表。每张表按表名生成自己的建表 DDL 和数据文件；
+表 DDL 包含表、索引、约束、注释、表触发器和表权限，不再重复输出视图、序列、函数、
+包、同义词或用户定义。例如 SQL 格式会生成：
 
 ```text
-HR_TEST_ddl.sql
-HR_TEST_data.sql
+HR_TEST_EMP_INFO_ddl.sql
+HR_TEST_EMP_INFO_data.sql
+HR_TEST_T_LOG_HEAP_ddl.sql
+HR_TEST_T_LOG_HEAP_data.sql
 ```
 
-如果 `data_format=csv`，`unload user` 会生成一个用户级 DDL 文件，并按表分别生成
-CSV 文件；没有数据的表不会生成空 CSV。例如：
+如果 `data_format=csv`，每张表仍会生成自己的 DDL，数据写入对应 CSV；没有数据的表
+只保留 DDL，不生成空 CSV。例如：
 
 ```text
-HR_TEST_ddl.sql
+HR_TEST_EMP_INFO_ddl.sql
 HR_TEST_EMP_INFO_data.csv
-HR_TEST_T_LOG_HEAP_data.csv
+HR_TEST_T_LOG_HEAP_ddl.sql
 ```
+
+如果 `data_format=dmp`，同样按表生成 `<prefix>_<table>_data.dmp`，空表不生成 DMP。
+超大 LOB 从当前活动行的 locator 出发逐页流式写入，不会先把整个 LOB 读入内存；
+超过 4 GiB 的整表数据通过多个 DMP phase 持续输出。
+
+整个用户只扫描一次 SYSTEM.DBF 和一次所需数据文件，扫描过程中按表分流写入，
+不会因表数量增加而为每张表重复扫描完整 DBF 文件集。
 
 也可以指定输出前缀：
 
 ```text
 DMDUL> unload user HR_TEST to hr_test_all;
 ```
+
+此时文件前缀会变为 `hr_test_all_<table_name>`。
+
+`unload user all;` 已移除。整库导出统一使用 `unload database;`，避免两个命令表达同一操作。
 
 ## 恢复整库
 
@@ -235,6 +299,16 @@ DATABASE_HR_TEST_EMP_INFO_data.csv
 DATABASE_SYSDBA_T_data.csv
 ```
 
+如果 `data_format=dmp`，会生成一个全库 DDL 文件，并按 owner/table 分别生成纯数据 DMP：
+
+```text
+DATABASE_ddl.sql
+DATABASE_HR_TEST_EMP_INFO_data.dmp
+DATABASE_SYSDBA_T_data.dmp
+```
+
+每表一个 DMP 便于失败后逐表重试和并行执行 `dimp FAST_LOAD=Y`；没有数据的表不会生成空 DMP。
+
 也可以指定输出前缀：
 
 ```text
@@ -247,11 +321,27 @@ DMDUL> unload database to dmdb_all;
 命令后会同步写入：
 
 ```text
+db_name=DAMENG
+db_name_source=dm.ctl
+instance_name=DMSERVER
+instance_name_source=DM default
+extent_size=16
+extent_size_source=u32 @ 0x80
+page_size=8192
+page_size_source=u32 @ 0x84
+page_count=9472
+page_count_source=u32 @ 0x8C
+database_charset=UTF-8 (UNICODE_FLAG=1)
+unicode_flag=1
+charset_source=SYSTEM.DBF page 4 + 0x2D
+case_sensitive_value=0
+case_sensitive_source=SYSTEM.DBF page 4 + 0x2C
 system=D:\temp\oldpro\SYSTEM.DBF
 control=D:\temp\oldpro\dm.ctl
 data_dir=D:\temp\oldpro
 output_dir=
 data_format=sql
+case_sensitive=auto
 charset=auto
 log=
 ```
@@ -259,9 +349,11 @@ log=
 如果运行过程中手工修改了 `init.dul`，可以重新加载：
 
 ```text
-DMDUL> load init;
+DMDUL> load parameter;
 DMDUL> show parameter;
 ```
+
+`load init;` 作为兼容别名仍然可用。
 
 ## 退出
 

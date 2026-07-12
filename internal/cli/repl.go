@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -27,12 +28,14 @@ type interactiveSession struct {
 	charset         string
 	charsetExplicit bool
 	dataFormat      string
+	caseSensitive   string
 	outputDir       string
 	outputDirSet    bool
 	logPath         string
 	logPathSet      bool
 	logOpenPath     string
 	initSource      string
+	metadata        dm.DatabaseMetadata
 	dictionary      *dm.DictionaryInfo
 	logFile         *os.File
 	stderr          io.Writer
@@ -82,11 +85,14 @@ func RunInteractive(input io.Reader, stdout io.Writer, stderr io.Writer) error {
 }
 
 func newInteractiveSession() *interactiveSession {
-	return &interactiveSession{
-		systemPath: defaultSystemPath,
-		charset:    "auto",
-		dataFormat: "sql",
+	session := &interactiveSession{
+		systemPath:    defaultSystemPath,
+		charset:       "auto",
+		dataFormat:    "sql",
+		caseSensitive: "auto",
 	}
+	session.resetDatabaseMetadata()
+	return session
 }
 
 func (s *interactiveSession) execute(command string, stdout io.Writer) (bool, error) {
@@ -133,16 +139,20 @@ func printInteractiveHelp(stdout io.Writer) {
 	fmt.Fprintln(stdout, "      Load dictionary metadata from dmdul_dict text files.")
 	fmt.Fprintln(stdout, "  load init;")
 	fmt.Fprintln(stdout, "      Reload parameters from the effective init.dul file.")
+	fmt.Fprintln(stdout, "  load parameter;")
+	fmt.Fprintln(stdout, "      Reload configuration and persisted bootstrap parameters from init.dul.")
 	fmt.Fprintln(stdout, "  list user;")
 	fmt.Fprintln(stdout, "      List recovered users/owners and dictionary cache status.")
 	fmt.Fprintln(stdout, "  list table <owner>;")
 	fmt.Fprintln(stdout, "      List tables owned by one user.")
 	fmt.Fprintln(stdout, "  unload table <owner.table_name>;")
-	fmt.Fprintln(stdout, "      Export one table to <owner>_<table>_ddl.sql and <owner>_<table>_data.{sql|csv}.")
+	fmt.Fprintln(stdout, "      Export one table to <owner>_<table>_ddl.sql and <owner>_<table>_data.{sql|csv|dmp}.")
+	fmt.Fprintln(stdout, "  unload object <owner|all>;")
+	fmt.Fprintln(stdout, "      Export recovered dictionary DDL for one owner or the whole database.")
 	fmt.Fprintln(stdout, "  unload user <owner>;")
-	fmt.Fprintln(stdout, "      Export all tables for one owner to DDL plus SQL or per-table CSV data files.")
+	fmt.Fprintln(stdout, "      Export each owned table to its own DDL and SQL/CSV/DMP data files.")
 	fmt.Fprintln(stdout, "  unload database;")
-	fmt.Fprintln(stdout, "      Export all recovered users and tables to DDL plus SQL or per-table CSV data files.")
+	fmt.Fprintln(stdout, "      Export all recovered users and tables to DDL plus SQL or per-table CSV/DMP data files.")
 	fmt.Fprintln(stdout, "  recover table <owner.table_name>;")
 	fmt.Fprintln(stdout, "      Scan residual pages by storage/assist id for TRUNCATE/DROP table recovery.")
 	fmt.Fprintln(stdout, "  set system <SYSTEM.DBF path>;")
@@ -150,7 +160,8 @@ func printInteractiveHelp(stdout io.Writer) {
 	fmt.Fprintln(stdout, "  set control <dm.ctl path>;")
 	fmt.Fprintln(stdout, "  set output_dir <directory>;")
 	fmt.Fprintln(stdout, "      Output SQL directory. Defaults to data_dir when set, otherwise current directory.")
-	fmt.Fprintln(stdout, "  set data_format sql|csv;")
+	fmt.Fprintln(stdout, "  set data_format sql|csv|dmp;")
+	fmt.Fprintln(stdout, "  set case_sensitive auto|0|1;")
 	fmt.Fprintln(stdout, "  set charset auto|utf-8|gb18030|gbk|euc-kr;")
 	fmt.Fprintln(stdout, "  show parameter;")
 	fmt.Fprintln(stdout, "  exit;")
@@ -186,6 +197,7 @@ func (s *interactiveSession) executeSet(args []string, stdout io.Writer) error {
 		s.dictionary = nil
 		s.charset = "auto"
 		s.charsetExplicit = false
+		s.resetDatabaseMetadata()
 	case "data_dir", "datadir":
 		s.dataDir = value
 		s.dataDirSet = strings.TrimSpace(value) != ""
@@ -193,15 +205,23 @@ func (s *interactiveSession) executeSet(args []string, stdout io.Writer) error {
 		s.controlPath = value
 		s.controlProvided = strings.TrimSpace(value) != ""
 		s.dictionary = nil
+		s.resetDatabaseMetadata()
 	case "output_dir", "outdir":
 		s.outputDir = value
 		s.outputDirSet = true
 	case "data_format", "format":
 		value = strings.ToLower(strings.TrimSpace(value))
-		if value != "sql" && value != "csv" {
-			return fmt.Errorf("data_format must be sql or csv")
+		if value != "sql" && value != "csv" && value != "dmp" {
+			return fmt.Errorf("data_format must be sql, csv, or dmp")
 		}
 		s.dataFormat = value
+	case "case_sensitive":
+		normalized, ok := normalizeCaseSensitiveParameter(value)
+		if !ok {
+			return fmt.Errorf("case_sensitive must be auto, 0, or 1")
+		}
+		value = normalized
+		s.caseSensitive = normalized
 	case "charset":
 		s.charset = value
 		s.charsetExplicit = true
@@ -217,11 +237,16 @@ func (s *interactiveSession) executeSet(args []string, stdout io.Writer) error {
 }
 
 func (s *interactiveSession) executeShow(args []string, stdout io.Writer) error {
-	if len(args) == 0 || !strings.EqualFold(args[0], "parameter") {
+	if len(args) == 0 {
 		return fmt.Errorf("usage: show parameter")
 	}
-	s.printParameters(stdout)
-	return nil
+	switch strings.ToLower(args[0]) {
+	case "parameter", "parameters":
+		s.printParameters(stdout)
+		return nil
+	default:
+		return fmt.Errorf("usage: show parameter")
+	}
 }
 
 func (s *interactiveSession) executeList(args []string, stdout io.Writer) error {
@@ -247,21 +272,23 @@ func (s *interactiveSession) executeList(args []string, stdout io.Writer) error 
 
 func (s *interactiveSession) executeLoad(args []string, stdout io.Writer) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: load dictionary | load init")
+		return fmt.Errorf("usage: load dictionary | load parameter")
 	}
 	switch strings.ToLower(args[0]) {
 	case "dictionary":
 		return s.loadDictionaryFiles(stdout)
 	case "init":
-		return s.loadInitDULCommand(stdout)
+		return s.loadInitDULCommand(stdout, "init")
+	case "parameter", "parameters":
+		return s.loadInitDULCommand(stdout, "parameter")
 	default:
-		return fmt.Errorf("usage: load dictionary | load init")
+		return fmt.Errorf("usage: load dictionary | load parameter")
 	}
 }
 
 func (s *interactiveSession) executeUnload(args []string, stdout io.Writer) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: unload table <owner.table_name> | unload user <owner> | unload database")
+		return fmt.Errorf("usage: unload table <owner.table_name> | unload object <owner|all> | unload user <owner> | unload database")
 	}
 	if err := s.ensureDictionaryLoaded(); err != nil {
 		return err
@@ -272,6 +299,11 @@ func (s *interactiveSession) executeUnload(args []string, stdout io.Writer) erro
 			return fmt.Errorf("usage: unload table <owner.table_name>")
 		}
 		return s.unloadTable(args[1:], stdout)
+	case "object", "objects":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: unload object <owner|all>")
+		}
+		return s.unloadObject(args[1:], stdout)
 	case "user":
 		if len(args) < 2 {
 			return fmt.Errorf("usage: unload user <owner>")
@@ -280,7 +312,7 @@ func (s *interactiveSession) executeUnload(args []string, stdout io.Writer) erro
 	case "database", "db":
 		return s.unloadDatabase(args[1:], stdout)
 	default:
-		return fmt.Errorf("usage: unload table <owner.table_name> | unload user <owner> | unload database")
+		return fmt.Errorf("usage: unload table <owner.table_name> | unload object <owner|all> | unload user <owner> | unload database")
 	}
 }
 
@@ -301,10 +333,26 @@ func (s *interactiveSession) bootstrap(stdout io.Writer) error {
 	if err := dm.WriteControlDUL(controlDULPath, dataFiles); err != nil {
 		return fmt.Errorf("write control.dul: %w", err)
 	}
-	bootstrapCharset := s.bootstrapCharset(systemPath, ctlPath)
-	metadata := dm.InspectDatabaseMetadata(systemPath, ctlPath, "", bootstrapCharset)
-	s.emitBootstrapLine(stdout, fmt.Sprintf("[BOOTSTRAP] phase=metadata status=OK page_size=%d extent_size=%d page_count=%d charset=%q",
-		metadata.PageSize, metadata.ExtentSize, metadata.PageCount, metadata.Charset))
+	configuredCharset := defaultIfBlank(s.charset, "auto")
+	metadata := dm.InspectDatabaseMetadata(systemPath, ctlPath, "", configuredCharset)
+	bootstrapCharset := configuredCharset
+	if !s.charsetExplicit && metadata.HasCharsetFlag {
+		if detected, ok := charsetParameterFromDictionary(metadata.Charset); ok {
+			bootstrapCharset = detected
+		}
+	}
+	caseSensitiveLog := "unknown"
+	if metadata.HasCaseSensitive {
+		caseSensitiveLog = "0"
+		if metadata.CaseSensitive {
+			caseSensitiveLog = "1"
+		}
+	}
+	s.emitBootstrapLine(stdout, fmt.Sprintf("[BOOTSTRAP] phase=metadata status=OK db_name=%q db_source=%q instance_name=%q instance_source=%q page_size=%d page_size_source=%q extent_size=%d extent_size_source=%q page_count=%d page_count_source=%q charset=%q charset_source=%q unicode_flag=%d case_sensitive=%s case_sensitive_source=%q",
+		metadata.DatabaseName, metadata.DatabaseNameSrc, metadata.InstanceName, metadata.InstanceNameSrc,
+		metadata.PageSize, metadata.PageSizeSource, metadata.ExtentSize, metadata.ExtentSizeSource,
+		metadata.PageCount, metadata.PageCountSource, metadata.Charset, metadata.CharsetSource,
+		metadata.CharsetFlag, caseSensitiveLog, metadata.CaseSensitiveSource))
 	fileWarnings := false
 	for _, file := range dataFiles {
 		line, warning := formatBootstrapFileDiagnostic(file, metadata.PageSize)
@@ -334,6 +382,7 @@ func (s *interactiveSession) bootstrap(stdout io.Writer) error {
 	s.systemPath = systemPath
 	s.controlPath = ctlPath
 	s.controlProvided = ctlProvided
+	s.metadata = metadata
 	s.dictionary = dict
 	if detectedCharset, ok := charsetParameterFromDictionary(dict.Charset); ok {
 		s.charset = detectedCharset
@@ -359,11 +408,21 @@ func (s *interactiveSession) bootstrap(stdout io.Writer) error {
 	fmt.Fprintf(stdout, "control.dul: %s (data files: %d)\n", controlDULPath, len(dataFiles))
 	fmt.Fprintf(stdout, "dictionary dir: %s (users=%d tables=%d columns=%d views=%d sequences=%d routines=%d triggers=%d synonyms=%d tab_privs=%d)\n",
 		dictFiles.Dir, dictFiles.UserCount, dictFiles.TableCount, dictFiles.ColumnCount, dictFiles.ViewCount, dictFiles.SequenceCount, dictFiles.RoutineCount, dictFiles.TriggerCount, dictFiles.SynonymCount, dictFiles.TabPrivilegeCount)
+	fmt.Fprintf(stdout, "database name: %s (%s)\n", metadata.DatabaseName, metadata.DatabaseNameSrc)
+	fmt.Fprintf(stdout, "instance name: %s (%s)\n", metadata.InstanceName, metadata.InstanceNameSrc)
 	fmt.Fprintf(stdout, "page size: %d bytes\n", dict.PageSize)
 	fmt.Fprintf(stdout, "extent size: %d pages (%s)\n", dict.ExtentSize, dict.ExtentSizeSource)
 	fmt.Fprintf(stdout, "page count: %d\n", dict.PageCount)
 	fmt.Fprintf(stdout, "charset: %s (%s)\n", dict.Charset, dict.CharsetSource)
+	fmt.Fprintf(stdout, "unicode flag: %d (%s)\n", metadata.CharsetFlag, metadata.CharsetSource)
 	fmt.Fprintf(stdout, "charset parameter: %s\n", s.charset)
+	if dict.HasCaseSensitive {
+		caseSensitive := 0
+		if dict.CaseSensitive {
+			caseSensitive = 1
+		}
+		fmt.Fprintf(stdout, "case sensitive: %d (%s)\n", caseSensitive, dict.CaseSensitiveSource)
+	}
 	fmt.Fprintf(stdout, "objects loaded: %d\n", dict.ObjectCount)
 	fmt.Fprintf(stdout, "users loaded: %d\n", dict.UserCount)
 	fmt.Fprintf(stdout, "tables loaded: %d\n", dict.TableCount)
@@ -466,7 +525,24 @@ func (s *interactiveSession) printParameters(stdout io.Writer) {
 	fmt.Fprintf(stdout, "dict_dir   = %s\n", s.effectiveDictionaryDir())
 	fmt.Fprintf(stdout, "data_dir   = %s\n", defaultIfBlank(s.dataDir, "(SYSTEM.DBF directory)"))
 	fmt.Fprintf(stdout, "output_dir = %s\n", s.effectiveOutputDir())
+	fmt.Fprintf(stdout, "db_name    = %s (%s)\n", s.metadata.DatabaseName, s.metadata.DatabaseNameSrc)
+	fmt.Fprintf(stdout, "instance_name= %s (%s)\n", s.metadata.InstanceName, s.metadata.InstanceNameSrc)
+	fmt.Fprintf(stdout, "extent_size= %d pages (%s)\n", s.metadata.ExtentSize, s.metadata.ExtentSizeSource)
+	fmt.Fprintf(stdout, "page_size  = %d bytes (%s)\n", s.metadata.PageSize, s.metadata.PageSizeSource)
+	fmt.Fprintf(stdout, "page_count = %d (%s)\n", s.metadata.PageCount, defaultIfBlank(s.metadata.PageCountSource, "unknown"))
+	fmt.Fprintf(stdout, "db_charset = %s (%s)\n", s.metadata.Charset, s.metadata.CharsetSource)
+	if s.metadata.HasCharsetFlag {
+		fmt.Fprintf(stdout, "unicode_flag= %d (%s)\n", s.metadata.CharsetFlag, s.metadata.CharsetSource)
+	}
 	fmt.Fprintf(stdout, "data_format= %s\n", s.dataFormat)
+	fmt.Fprintf(stdout, "case_sensitive= %s\n", s.caseSensitive)
+	if s.metadata.HasCaseSensitive {
+		effective := 0
+		if s.metadata.CaseSensitive {
+			effective = 1
+		}
+		fmt.Fprintf(stdout, "case_effective= %d (%s)\n", effective, s.metadata.CaseSensitiveSource)
+	}
 	fmt.Fprintf(stdout, "charset    = %s\n", s.charset)
 	fmt.Fprintf(stdout, "log        = %s\n", s.effectiveLogPath())
 	if s.dictionary != nil {
@@ -623,10 +699,7 @@ func (s *interactiveSession) unloadTable(args []string, stdout io.Writer) error 
 		prefix = sanitizedFilePrefix(customPrefix)
 	}
 	ddlPath := s.outputPath(prefix + "_ddl.sql")
-	dataExt := "sql"
-	if s.dataFormat == "csv" {
-		dataExt = "csv"
-	}
+	dataExt := dataOutputExtension(s.dataFormat)
 	dataPath := s.outputPath(prefix + "_data." + dataExt)
 	if err := s.ensureOutputDir(); err != nil {
 		return err
@@ -639,42 +712,41 @@ func (s *interactiveSession) unloadTable(args []string, stdout io.Writer) error 
 		OwnerFilter:    table.Owner,
 		TableFilter:    table.Owner + "." + table.Name,
 		Charset:        s.charset,
+		TablesOnly:     true,
 		Dictionary:     s.dictionary,
 	})
 	if err != nil {
 		return err
 	}
 	data, err := dm.ExportData(dm.DataExportOptions{
-		SystemPath:     s.systemPath,
-		ControlPath:    s.controlPath,
-		ControlDULPath: s.effectiveControlDULPath(),
-		DataDir:        s.effectiveDataDir(),
-		OutputPath:     dataPath,
-		OwnerFilter:    table.Owner,
-		TableFilter:    table.Owner + "." + table.Name,
-		ExcludeTables:  "",
-		Charset:        s.charset,
-		OutputFormat:   s.dataFormat,
-		Dictionary:     s.dictionary,
+		SystemPath:       s.systemPath,
+		ControlPath:      s.controlPath,
+		ControlDULPath:   s.effectiveControlDULPath(),
+		DataDir:          s.effectiveDataDir(),
+		OutputPath:       dataPath,
+		OwnerFilter:      table.Owner,
+		TableFilter:      table.Owner + "." + table.Name,
+		ExcludeTables:    "",
+		Charset:          s.charset,
+		OutputFormat:     s.dataFormat,
+		DMPCaseSensitive: s.dmpCaseSensitiveValue(),
+		Dictionary:       s.dictionary,
 	})
 	if err != nil {
 		return err
 	}
 	fmt.Fprintf(stdout, "ddl output: %s\n", ddl.OutputPath)
-	if s.dataFormat == "csv" && data.OutputPath == "" {
+	if splitDataFormat(s.dataFormat) && data.OutputPath == "" {
 		fmt.Fprintln(stdout, "data output: skipped (no rows)")
 	} else {
 		fmt.Fprintf(stdout, "data output: %s\n", data.OutputPath)
 	}
 	fmt.Fprintf(stdout, "tables exported: %d\n", ddl.TableCount)
-	fmt.Fprintf(stdout, "views exported: %d\n", ddl.ViewCount)
-	fmt.Fprintf(stdout, "sequences exported: %d\n", ddl.SequenceCount)
-	fmt.Fprintf(stdout, "routines exported: %d\n", ddl.RoutineCount)
 	fmt.Fprintf(stdout, "triggers exported: %d\n", ddl.TriggerCount)
-	fmt.Fprintf(stdout, "synonyms exported: %d\n", ddl.SynonymCount)
 	fmt.Fprintf(stdout, "tab privileges exported: %d\n", ddl.TabPrivilegeCount)
 	fmt.Fprintf(stdout, "rows exported: %d\n", data.RowsExported)
 	fmt.Fprintf(stdout, "rows failed: %d\n", data.RowsFailed)
+	printDataExportWarnings(stdout, data)
 	return nil
 }
 
@@ -693,10 +765,7 @@ func (s *interactiveSession) recoverTable(args []string, stdout io.Writer) error
 		prefix = sanitizedFilePrefix(customPrefix)
 	}
 	ddlPath := s.outputPath(prefix + "_ddl.sql")
-	dataExt := "sql"
-	if s.dataFormat == "csv" {
-		dataExt = "csv"
-	}
+	dataExt := dataOutputExtension(s.dataFormat)
 	dataPath := s.outputPath(prefix + "_data." + dataExt)
 	if err := s.ensureOutputDir(); err != nil {
 		return err
@@ -709,31 +778,33 @@ func (s *interactiveSession) recoverTable(args []string, stdout io.Writer) error
 		OwnerFilter:    table.Owner,
 		TableFilter:    table.Owner + "." + table.Name,
 		Charset:        s.charset,
+		TablesOnly:     true,
 		Dictionary:     s.dictionary,
 	})
 	if err != nil {
 		return err
 	}
 	data, err := dm.ExportData(dm.DataExportOptions{
-		SystemPath:     s.systemPath,
-		ControlPath:    s.controlPath,
-		ControlDULPath: s.effectiveControlDULPath(),
-		DataDir:        s.effectiveDataDir(),
-		OutputPath:     dataPath,
-		OwnerFilter:    table.Owner,
-		TableFilter:    table.Owner + "." + table.Name,
-		ExcludeTables:  "",
-		Charset:        s.charset,
-		OutputFormat:   s.dataFormat,
-		RecoveryMode:   true,
-		Dictionary:     s.dictionary,
+		SystemPath:       s.systemPath,
+		ControlPath:      s.controlPath,
+		ControlDULPath:   s.effectiveControlDULPath(),
+		DataDir:          s.effectiveDataDir(),
+		OutputPath:       dataPath,
+		OwnerFilter:      table.Owner,
+		TableFilter:      table.Owner + "." + table.Name,
+		ExcludeTables:    "",
+		Charset:          s.charset,
+		OutputFormat:     s.dataFormat,
+		DMPCaseSensitive: s.dmpCaseSensitiveValue(),
+		RecoveryMode:     true,
+		Dictionary:       s.dictionary,
 	})
 	if err != nil {
 		return err
 	}
 	fmt.Fprintln(stdout, "recovery mode: on")
 	fmt.Fprintf(stdout, "ddl output: %s\n", ddl.OutputPath)
-	if s.dataFormat == "csv" && data.OutputPath == "" {
+	if splitDataFormat(s.dataFormat) && data.OutputPath == "" {
 		fmt.Fprintln(stdout, "data output: skipped (no rows)")
 	} else {
 		fmt.Fprintf(stdout, "data output: %s\n", data.OutputPath)
@@ -741,19 +812,23 @@ func (s *interactiveSession) recoverTable(args []string, stdout io.Writer) error
 	fmt.Fprintf(stdout, "tables exported: %d\n", ddl.TableCount)
 	fmt.Fprintf(stdout, "rows exported: %d\n", data.RowsExported)
 	fmt.Fprintf(stdout, "rows failed: %d\n", data.RowsFailed)
+	printDataExportWarnings(stdout, data)
 	return nil
 }
 
-func (s *interactiveSession) unloadUser(args []string, stdout io.Writer) error {
-	owner := normalizeIdentifierInput(args[0])
-	if !s.hasOwner(owner) {
+func (s *interactiveSession) unloadObject(args []string, stdout io.Writer) error {
+	ownerToken := normalizeIdentifierInput(args[0])
+	ownerFilter := ownerToken
+	prefix := sanitizedFilePrefix(ownerToken)
+	if strings.EqualFold(ownerToken, "all") || ownerToken == "*" || strings.EqualFold(ownerToken, "database") {
+		ownerFilter = "all"
+		prefix = "DATABASE"
+	} else if !s.hasOwner(ownerToken) {
 		return fmt.Errorf("user/owner %s not found in dictionary", args[0])
 	}
-	prefix := sanitizedFilePrefix(owner)
 	if customPrefix, ok := optionalToPrefix(args[1:]); ok {
 		prefix = sanitizedFilePrefix(customPrefix)
 	}
-	ddlPath := s.outputPath(prefix + "_ddl.sql")
 	if err := s.ensureOutputDir(); err != nil {
 		return err
 	}
@@ -761,8 +836,8 @@ func (s *interactiveSession) unloadUser(args []string, stdout io.Writer) error {
 		SystemPath:     s.systemPath,
 		ControlPath:    s.controlPath,
 		ControlDULPath: s.effectiveControlDULPath(),
-		OutputPath:     ddlPath,
-		OwnerFilter:    owner,
+		OutputPath:     s.outputPath(prefix + "_objects.sql"),
+		OwnerFilter:    ownerFilter,
 		TableFilter:    "all",
 		Charset:        s.charset,
 		Dictionary:     s.dictionary,
@@ -770,7 +845,10 @@ func (s *interactiveSession) unloadUser(args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "ddl output: %s\n", ddl.OutputPath)
+	fmt.Fprintf(stdout, "object ddl output: %s\n", ddl.OutputPath)
+	fmt.Fprintf(stdout, "users exported: %d\n", ddl.UserCount)
+	fmt.Fprintf(stdout, "roles exported: %d\n", ddl.RoleCount)
+	fmt.Fprintf(stdout, "role grants exported: %d\n", ddl.RoleGrantCount)
 	fmt.Fprintf(stdout, "tables exported: %d\n", ddl.TableCount)
 	fmt.Fprintf(stdout, "views exported: %d\n", ddl.ViewCount)
 	fmt.Fprintf(stdout, "sequences exported: %d\n", ddl.SequenceCount)
@@ -778,37 +856,87 @@ func (s *interactiveSession) unloadUser(args []string, stdout io.Writer) error {
 	fmt.Fprintf(stdout, "triggers exported: %d\n", ddl.TriggerCount)
 	fmt.Fprintf(stdout, "synonyms exported: %d\n", ddl.SynonymCount)
 	fmt.Fprintf(stdout, "tab privileges exported: %d\n", ddl.TabPrivilegeCount)
-	if s.dataFormat == "csv" {
-		files, rowsExported, rowsFailed, err := s.unloadUserCSV(prefix, owner, stdout)
-		if err != nil {
-			return err
-		}
-		fmt.Fprintf(stdout, "csv output dir: %s\n", s.effectiveOutputDir())
-		fmt.Fprintf(stdout, "csv files exported: %d\n", files)
-		fmt.Fprintf(stdout, "rows exported: %d\n", rowsExported)
-		fmt.Fprintf(stdout, "rows failed: %d\n", rowsFailed)
-		return nil
+	return nil
+}
+
+func (s *interactiveSession) unloadUser(args []string, stdout io.Writer) error {
+	owner := normalizeIdentifierInput(args[0])
+	if strings.EqualFold(owner, "all") || owner == "*" || strings.EqualFold(owner, "database") {
+		return fmt.Errorf("unload user all has been removed; use unload database")
 	}
-	dataPath := s.outputPath(prefix + "_data.sql")
+	if !s.hasOwner(owner) {
+		return fmt.Errorf("user/owner %s not found in dictionary", args[0])
+	}
+	prefix := sanitizedFilePrefix(owner)
+	if customPrefix, ok := optionalToPrefix(args[1:]); ok {
+		prefix = sanitizedFilePrefix(customPrefix)
+	}
+	if err := s.ensureOutputDir(); err != nil {
+		return err
+	}
+	ddl, err := dm.ExportDDL(dm.DDLExportOptions{
+		SystemPath:     s.systemPath,
+		ControlPath:    s.controlPath,
+		ControlDULPath: s.effectiveControlDULPath(),
+		TableOutputPath: func(_ string, table string, _ uint32) string {
+			tablePrefix := sanitizedFilePrefix(prefix + "_" + table)
+			return s.outputPath(tablePrefix + "_ddl.sql")
+		},
+		OwnerFilter: owner,
+		TableFilter: "all",
+		Charset:     s.charset,
+		TablesOnly:  true,
+		Dictionary:  s.dictionary,
+	})
+	if err != nil {
+		return err
+	}
+	dataExt := dataOutputExtension(s.dataFormat)
 	data, err := dm.ExportData(dm.DataExportOptions{
 		SystemPath:     s.systemPath,
 		ControlPath:    s.controlPath,
 		ControlDULPath: s.effectiveControlDULPath(),
 		DataDir:        s.effectiveDataDir(),
-		OutputPath:     dataPath,
-		OwnerFilter:    owner,
-		TableFilter:    "all",
-		ExcludeTables:  "",
-		Charset:        s.charset,
-		OutputFormat:   "sql",
-		Dictionary:     s.dictionary,
+		TableOutputPath: func(_ string, table string, _ uint32) string {
+			tablePrefix := sanitizedFilePrefix(prefix + "_" + table)
+			return s.outputPath(tablePrefix + "_data." + dataExt)
+		},
+		OwnerFilter:      owner,
+		TableFilter:      "all",
+		ExcludeTables:    "",
+		Charset:          s.charset,
+		OutputFormat:     s.dataFormat,
+		DMPCaseSensitive: s.dmpCaseSensitiveValue(),
+		Dictionary:       s.dictionary,
 	})
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "data output: %s\n", data.OutputPath)
+	dataOutputs := make(map[string]dm.DataTableOutput, len(data.TableOutputs))
+	for _, output := range data.TableOutputs {
+		dataOutputs[qualifiedTableOutputKey(output.Owner, output.Name)] = output
+	}
+	for _, output := range ddl.TableOutputs {
+		fmt.Fprintf(stdout, "table: %s.%s\n", output.Owner, output.Name)
+		fmt.Fprintf(stdout, "  ddl output: %s\n", output.OutputPath)
+		if dataOutput, ok := dataOutputs[qualifiedTableOutputKey(output.Owner, output.Name)]; ok {
+			fmt.Fprintf(stdout, "  data output: %s\n", dataOutput.OutputPath)
+		} else {
+			table, found := s.findTable(output.Owner, output.Name)
+			if found && table.Temporary {
+				fmt.Fprintln(stdout, "  data output: skipped (temporary table)")
+			} else {
+				fmt.Fprintln(stdout, "  data output: skipped (no rows)")
+			}
+		}
+	}
+	fmt.Fprintf(stdout, "output dir: %s\n", s.effectiveOutputDir())
+	fmt.Fprintf(stdout, "tables exported: %d\n", len(ddl.TableOutputs))
+	fmt.Fprintf(stdout, "ddl files exported: %d\n", len(ddl.TableOutputs))
+	fmt.Fprintf(stdout, "data files exported: %d\n", len(data.TableOutputs))
 	fmt.Fprintf(stdout, "rows exported: %d\n", data.RowsExported)
 	fmt.Fprintf(stdout, "rows failed: %d\n", data.RowsFailed)
+	printDataExportWarnings(stdout, data)
 	return nil
 }
 
@@ -843,30 +971,34 @@ func (s *interactiveSession) unloadDatabase(args []string, stdout io.Writer) err
 	fmt.Fprintf(stdout, "triggers exported: %d\n", ddl.TriggerCount)
 	fmt.Fprintf(stdout, "synonyms exported: %d\n", ddl.SynonymCount)
 	fmt.Fprintf(stdout, "tab privileges exported: %d\n", ddl.TabPrivilegeCount)
-	if s.dataFormat == "csv" {
-		files, rowsExported, rowsFailed, err := s.unloadDatabaseCSV(prefix, stdout)
+	if splitDataFormat(s.dataFormat) {
+		files, rowsExported, rowsFailed, timeFractionLoss, err := s.unloadDatabaseSplitData(prefix, s.dataFormat, stdout)
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(stdout, "csv output dir: %s\n", s.effectiveOutputDir())
-		fmt.Fprintf(stdout, "csv files exported: %d\n", files)
+		fmt.Fprintf(stdout, "%s output dir: %s\n", s.dataFormat, s.effectiveOutputDir())
+		fmt.Fprintf(stdout, "%s files exported: %d\n", s.dataFormat, files)
 		fmt.Fprintf(stdout, "rows exported: %d\n", rowsExported)
 		fmt.Fprintf(stdout, "rows failed: %d\n", rowsFailed)
+		if timeFractionLoss > 0 {
+			fmt.Fprintf(stdout, "warning: TIME fractional seconds are not representable in DM DMP and were cleared in %d row(s)\n", timeFractionLoss)
+		}
 		return nil
 	}
 	dataPath := s.outputPath(prefix + "_data.sql")
 	data, err := dm.ExportData(dm.DataExportOptions{
-		SystemPath:     s.systemPath,
-		ControlPath:    s.controlPath,
-		ControlDULPath: s.effectiveControlDULPath(),
-		DataDir:        s.effectiveDataDir(),
-		OutputPath:     dataPath,
-		OwnerFilter:    "all",
-		TableFilter:    "all",
-		ExcludeTables:  "",
-		Charset:        s.charset,
-		OutputFormat:   "sql",
-		Dictionary:     s.dictionary,
+		SystemPath:       s.systemPath,
+		ControlPath:      s.controlPath,
+		ControlDULPath:   s.effectiveControlDULPath(),
+		DataDir:          s.effectiveDataDir(),
+		OutputPath:       dataPath,
+		OwnerFilter:      "all",
+		TableFilter:      "all",
+		ExcludeTables:    "",
+		Charset:          s.charset,
+		OutputFormat:     "sql",
+		DMPCaseSensitive: s.dmpCaseSensitiveValue(),
+		Dictionary:       s.dictionary,
 	})
 	if err != nil {
 		return err
@@ -874,83 +1006,94 @@ func (s *interactiveSession) unloadDatabase(args []string, stdout io.Writer) err
 	fmt.Fprintf(stdout, "data output: %s\n", data.OutputPath)
 	fmt.Fprintf(stdout, "rows exported: %d\n", data.RowsExported)
 	fmt.Fprintf(stdout, "rows failed: %d\n", data.RowsFailed)
+	printDataExportWarnings(stdout, data)
 	return nil
 }
 
-func (s *interactiveSession) unloadUserCSV(prefix string, owner string, stdout io.Writer) (int, int, int, error) {
-	files := 0
-	rowsExported := 0
-	rowsFailed := 0
-	for _, table := range s.dictionary.Tables {
-		if !strings.EqualFold(table.Owner, owner) || table.Temporary {
-			continue
-		}
-		tablePrefix := sanitizedFilePrefix(prefix + "_" + table.Name)
-		dataPath := s.outputPath(tablePrefix + "_data.csv")
-		data, err := dm.ExportData(dm.DataExportOptions{
-			SystemPath:     s.systemPath,
-			ControlPath:    s.controlPath,
-			ControlDULPath: s.effectiveControlDULPath(),
-			DataDir:        s.effectiveDataDir(),
-			OutputPath:     dataPath,
-			OwnerFilter:    owner,
-			TableFilter:    table.Owner + "." + table.Name,
-			ExcludeTables:  "",
-			Charset:        s.charset,
-			OutputFormat:   "csv",
-			Dictionary:     s.dictionary,
-		})
-		if err != nil {
-			return files, rowsExported, rowsFailed, err
-		}
-		rowsExported += data.RowsExported
-		rowsFailed += data.RowsFailed
-		if data.OutputPath == "" {
-			fmt.Fprintf(stdout, "csv skipped: %s.%s (no rows)\n", table.Owner, table.Name)
-			continue
-		}
-		files++
-		fmt.Fprintf(stdout, "csv output: %s\n", data.OutputPath)
+func (s *interactiveSession) unloadDatabaseSplitData(prefix string, format string, stdout io.Writer) (int, int, int, int, error) {
+	extension := dataOutputExtension(format)
+	data, err := dm.ExportData(dm.DataExportOptions{
+		SystemPath:     s.systemPath,
+		ControlPath:    s.controlPath,
+		ControlDULPath: s.effectiveControlDULPath(),
+		DataDir:        s.effectiveDataDir(),
+		TableOutputPath: func(owner string, table string, _ uint32) string {
+			tablePrefix := sanitizedFilePrefix(prefix + "_" + owner + "_" + table)
+			return s.outputPath(tablePrefix + "_data." + extension)
+		},
+		OwnerFilter:      "all",
+		TableFilter:      "all",
+		ExcludeTables:    "",
+		Charset:          s.charset,
+		OutputFormat:     format,
+		DMPCaseSensitive: s.dmpCaseSensitiveValue(),
+		Dictionary:       s.dictionary,
+	})
+	if err != nil {
+		return 0, 0, 0, 0, err
 	}
-	return files, rowsExported, rowsFailed, nil
+	outputs := make(map[string]bool, len(data.TableOutputs))
+	for _, output := range data.TableOutputs {
+		outputs[qualifiedTableOutputKey(output.Owner, output.Name)] = true
+		fmt.Fprintf(stdout, "%s output: %s\n", format, output.OutputPath)
+	}
+	for _, table := range data.TableRowCounts {
+		if !outputs[qualifiedTableOutputKey(table.Owner, table.Name)] {
+			fmt.Fprintf(stdout, "%s skipped: %s.%s (no rows)\n", format, table.Owner, table.Name)
+		}
+	}
+	return len(data.TableOutputs), data.RowsExported, data.RowsFailed, data.TimeFractionLoss, nil
 }
 
-func (s *interactiveSession) unloadDatabaseCSV(prefix string, stdout io.Writer) (int, int, int, error) {
-	files := 0
-	rowsExported := 0
-	rowsFailed := 0
-	for _, table := range s.dictionary.Tables {
-		if table.Temporary {
-			continue
-		}
-		tablePrefix := sanitizedFilePrefix(prefix + "_" + table.Owner + "_" + table.Name)
-		dataPath := s.outputPath(tablePrefix + "_data.csv")
-		data, err := dm.ExportData(dm.DataExportOptions{
-			SystemPath:     s.systemPath,
-			ControlPath:    s.controlPath,
-			ControlDULPath: s.effectiveControlDULPath(),
-			DataDir:        s.effectiveDataDir(),
-			OutputPath:     dataPath,
-			OwnerFilter:    table.Owner,
-			TableFilter:    table.Owner + "." + table.Name,
-			ExcludeTables:  "",
-			Charset:        s.charset,
-			OutputFormat:   "csv",
-			Dictionary:     s.dictionary,
-		})
-		if err != nil {
-			return files, rowsExported, rowsFailed, err
-		}
-		rowsExported += data.RowsExported
-		rowsFailed += data.RowsFailed
-		if data.OutputPath == "" {
-			fmt.Fprintf(stdout, "csv skipped: %s.%s (no rows)\n", table.Owner, table.Name)
-			continue
-		}
-		files++
-		fmt.Fprintf(stdout, "csv output: %s\n", data.OutputPath)
+func dataOutputExtension(format string) string {
+	switch strings.ToLower(strings.TrimSpace(format)) {
+	case "csv":
+		return "csv"
+	case "dmp":
+		return "dmp"
+	default:
+		return "sql"
 	}
-	return files, rowsExported, rowsFailed, nil
+}
+
+func splitDataFormat(format string) bool {
+	format = strings.ToLower(strings.TrimSpace(format))
+	return format == "csv" || format == "dmp"
+}
+
+func printDataExportWarnings(stdout io.Writer, result *dm.DataExportResult) {
+	if result != nil && result.TimeFractionLoss > 0 {
+		fmt.Fprintf(stdout, "warning: TIME fractional seconds are not representable in DM DMP and were cleared in %d row(s)\n", result.TimeFractionLoss)
+	}
+}
+
+func normalizeCaseSensitiveParameter(value string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "auto", "":
+		return "auto", true
+	case "1", "y", "yes", "true":
+		return "1", true
+	case "0", "n", "no", "false":
+		return "0", true
+	default:
+		return "", false
+	}
+}
+
+func (s *interactiveSession) dmpCaseSensitiveValue() *bool {
+	value, ok := normalizeCaseSensitiveParameter(s.caseSensitive)
+	if !ok {
+		return nil
+	}
+	if value == "auto" {
+		if s.dictionary == nil || !s.dictionary.HasCaseSensitive {
+			return nil
+		}
+		enabled := s.dictionary.CaseSensitive
+		return &enabled
+	}
+	enabled := value == "1"
+	return &enabled
 }
 
 func (s *interactiveSession) findTable(owner string, tableName string) (dm.DictionaryTable, bool) {
@@ -1000,6 +1143,7 @@ func (s *interactiveSession) loadDictionaryFiles(stdout io.Writer) error {
 	if detectedCharset, ok := charsetParameterFromDictionary(dict.Charset); ok && !s.charsetExplicit {
 		s.charset = detectedCharset
 	}
+	s.applyDictionaryMetadata(dict)
 	debug.FreeOSMemory()
 	if stdout != io.Discard {
 		fmt.Fprintf(stdout, "dictionary loaded: %s\n", files.Dir)
@@ -1075,18 +1219,23 @@ func (s *interactiveSession) loadConfigFile(stderr io.Writer) {
 	}
 }
 
-func (s *interactiveSession) loadInitDULCommand(stdout io.Writer) error {
+func (s *interactiveSession) loadInitDULCommand(stdout io.Writer, commandName string) error {
 	path := s.effectiveInitDULPath()
 	if err := s.loadInitDUL(path); err != nil {
 		return err
 	}
 	s.dictionary = nil
-	fmt.Fprintf(stdout, "init loaded: %s\n", path)
+	if commandName == "parameter" {
+		fmt.Fprintf(stdout, "parameters loaded: %s\n", path)
+	} else {
+		fmt.Fprintf(stdout, "init loaded: %s\n", path)
+	}
 	return nil
 }
 
 func (s *interactiveSession) loadInitDUL(path string) error {
 	s.charsetExplicit = false
+	metadata := dm.DefaultDatabaseMetadata()
 	file, err := os.Open(path)
 	if err != nil {
 		return err
@@ -1116,11 +1265,62 @@ func (s *interactiveSession) loadInitDUL(path string) error {
 			s.dataDirSet = value != ""
 		case "data_format", "format":
 			value = strings.ToLower(value)
-			if value == "sql" || value == "csv" {
+			if value == "sql" || value == "csv" || value == "dmp" {
 				s.dataFormat = value
+			}
+		case "case_sensitive":
+			if normalized, ok := normalizeCaseSensitiveParameter(value); ok {
+				s.caseSensitive = normalized
 			}
 		case "charset":
 			s.charset = value
+		case "db_name", "database_name":
+			metadata.DatabaseName = defaultIfBlank(value, dm.DefaultDatabaseName)
+		case "db_name_source", "database_name_source":
+			metadata.DatabaseNameSrc = defaultIfBlank(value, "DM default")
+		case "instance_name":
+			metadata.InstanceName = defaultIfBlank(value, dm.DefaultInstanceName)
+		case "instance_name_source":
+			metadata.InstanceNameSrc = defaultIfBlank(value, "DM default")
+		case "extent_size":
+			if parsed, ok := parsePersistedUint32(value); ok {
+				metadata.ExtentSize = parsed
+			}
+		case "extent_size_source":
+			metadata.ExtentSizeSource = value
+		case "page_size":
+			if parsed, ok := parsePersistedUint32(value); ok {
+				metadata.PageSize = parsed
+			}
+		case "page_size_source":
+			metadata.PageSizeSource = value
+		case "page_count":
+			if parsed, ok := parsePersistedUint32(value); ok {
+				metadata.PageCount = parsed
+			}
+		case "page_count_source":
+			metadata.PageCountSource = value
+		case "database_charset", "db_charset":
+			metadata.Charset = value
+		case "unicode_flag", "charset_flag":
+			if parsed, ok := parsePersistedUint8(value); ok {
+				metadata.CharsetFlag = parsed
+				metadata.HasCharsetFlag = true
+				if display, ok := databaseCharsetDisplay(parsed); ok {
+					metadata.Charset = display
+				}
+			}
+		case "charset_source":
+			metadata.CharsetSource = value
+		case "case_sensitive_value", "case_effective":
+			if normalized, ok := normalizeCaseSensitiveParameter(value); ok && normalized != "auto" {
+				metadata.CaseSensitive = normalized == "1"
+				metadata.HasCaseSensitive = true
+			}
+		case "case_sensitive_source":
+			metadata.CaseSensitiveSource = value
+		case "ini_path":
+			metadata.IniPath = value
 		case "output_dir", "outdir":
 			s.outputDir = value
 			s.outputDirSet = value != ""
@@ -1132,6 +1332,12 @@ func (s *interactiveSession) loadInitDUL(path string) error {
 	if err := scanner.Err(); err != nil {
 		return err
 	}
+	metadata.SystemPath = s.systemPath
+	metadata.ControlPath = s.controlPath
+	if strings.TrimSpace(metadata.IniPath) == "" {
+		metadata.IniPath = dm.DefaultIniPathForSystem(s.systemPath)
+	}
+	s.metadata = metadata
 	s.initSource = path
 	return nil
 }
@@ -1156,9 +1362,41 @@ func (s *interactiveSession) initDULContent() string {
 	out.WriteString(fmt.Sprintf("# init_load=%s\n", defaultIfBlank(s.initSource, "(not loaded)")))
 	if s.dictionary != nil {
 		out.WriteString(fmt.Sprintf("# dictionary=%s\n", defaultIfBlank(s.dictionary.Source, "memory")))
+		if s.dictionary.HasCaseSensitive {
+			effective := 0
+			if s.dictionary.CaseSensitive {
+				effective = 1
+			}
+			out.WriteString(fmt.Sprintf("# effective_case_sensitive=%d (%s)\n", effective, s.dictionary.CaseSensitiveSource))
+		}
 	} else {
 		out.WriteString("# dictionary=not loaded\n")
 	}
+	out.WriteString("# Bootstrap database parameters. Sources are persisted for offline reuse.\n")
+	out.WriteString(fmt.Sprintf("db_name=%s\n", s.metadata.DatabaseName))
+	out.WriteString(fmt.Sprintf("db_name_source=%s\n", s.metadata.DatabaseNameSrc))
+	out.WriteString(fmt.Sprintf("instance_name=%s\n", s.metadata.InstanceName))
+	out.WriteString(fmt.Sprintf("instance_name_source=%s\n", s.metadata.InstanceNameSrc))
+	out.WriteString(fmt.Sprintf("extent_size=%d\n", s.metadata.ExtentSize))
+	out.WriteString(fmt.Sprintf("extent_size_source=%s\n", s.metadata.ExtentSizeSource))
+	out.WriteString(fmt.Sprintf("page_size=%d\n", s.metadata.PageSize))
+	out.WriteString(fmt.Sprintf("page_size_source=%s\n", s.metadata.PageSizeSource))
+	out.WriteString(fmt.Sprintf("page_count=%d\n", s.metadata.PageCount))
+	out.WriteString(fmt.Sprintf("page_count_source=%s\n", s.metadata.PageCountSource))
+	out.WriteString(fmt.Sprintf("database_charset=%s\n", s.metadata.Charset))
+	if s.metadata.HasCharsetFlag {
+		out.WriteString(fmt.Sprintf("unicode_flag=%d\n", s.metadata.CharsetFlag))
+	}
+	out.WriteString(fmt.Sprintf("charset_source=%s\n", s.metadata.CharsetSource))
+	if s.metadata.HasCaseSensitive {
+		caseSensitive := 0
+		if s.metadata.CaseSensitive {
+			caseSensitive = 1
+		}
+		out.WriteString(fmt.Sprintf("case_sensitive_value=%d\n", caseSensitive))
+	}
+	out.WriteString(fmt.Sprintf("case_sensitive_source=%s\n", s.metadata.CaseSensitiveSource))
+	out.WriteString(fmt.Sprintf("ini_path=%s\n", s.metadata.IniPath))
 	out.WriteString(fmt.Sprintf("system=%s\n", s.systemPath))
 	out.WriteString(fmt.Sprintf("control=%s\n", s.controlPath))
 	if s.dataDirSet {
@@ -1172,6 +1410,7 @@ func (s *interactiveSession) initDULContent() string {
 		out.WriteString("output_dir=\n")
 	}
 	out.WriteString(fmt.Sprintf("data_format=%s\n", s.dataFormat))
+	out.WriteString(fmt.Sprintf("case_sensitive=%s\n", s.caseSensitive))
 	out.WriteString(fmt.Sprintf("charset=%s\n", s.charset))
 	if s.logPathSet {
 		out.WriteString(fmt.Sprintf("log=%s\n", s.logPath))
@@ -1333,8 +1572,88 @@ func sanitizedFilePrefix(value string) string {
 	return result
 }
 
+func qualifiedTableOutputKey(owner string, table string) string {
+	return strings.ToUpper(strings.TrimSpace(owner)) + "\x00" + strings.ToUpper(strings.TrimSpace(table))
+}
+
 func normalizeParameterName(value string) string {
 	return strings.ReplaceAll(strings.ToLower(strings.TrimSpace(value)), "-", "_")
+}
+
+func (s *interactiveSession) resetDatabaseMetadata() {
+	metadata := dm.DefaultDatabaseMetadata()
+	metadata.SystemPath = s.systemPath
+	metadata.ControlPath = s.controlPath
+	metadata.IniPath = dm.DefaultIniPathForSystem(s.systemPath)
+	s.metadata = metadata
+}
+
+func (s *interactiveSession) applyDictionaryMetadata(dict *dm.DictionaryInfo) {
+	if dict == nil {
+		return
+	}
+	s.metadata.SystemPath = defaultIfBlank(dict.SystemPath, s.systemPath)
+	s.metadata.ControlPath = defaultIfBlank(dict.ControlPath, s.controlPath)
+	if dict.ExtentSize != 0 {
+		s.metadata.ExtentSize = dict.ExtentSize
+		s.metadata.ExtentSizeSource = defaultIfBlank(dict.ExtentSizeSource, "dmdul_dict/meta.tsv")
+	}
+	if dict.PageSize != 0 {
+		s.metadata.PageSize = dict.PageSize
+		s.metadata.PageSizeSource = "dmdul_dict/meta.tsv"
+	}
+	s.metadata.PageCount = dict.PageCount
+	s.metadata.PageCountSource = "dmdul_dict/meta.tsv"
+	if strings.TrimSpace(dict.Charset) != "" {
+		s.metadata.Charset = dict.Charset
+		s.metadata.CharsetSource = defaultIfBlank(dict.CharsetSource, "dmdul_dict/meta.tsv")
+		if flag, ok := unicodeFlagFromCharset(dict.Charset); ok {
+			s.metadata.CharsetFlag = flag
+			s.metadata.HasCharsetFlag = true
+		}
+	}
+	if dict.HasCaseSensitive {
+		s.metadata.CaseSensitive = dict.CaseSensitive
+		s.metadata.HasCaseSensitive = true
+		s.metadata.CaseSensitiveSource = defaultIfBlank(dict.CaseSensitiveSource, "dmdul_dict/meta.tsv")
+	}
+}
+
+func parsePersistedUint32(value string) (uint32, bool) {
+	parsed, err := strconv.ParseUint(strings.TrimSpace(value), 10, 32)
+	return uint32(parsed), err == nil
+}
+
+func parsePersistedUint8(value string) (uint8, bool) {
+	parsed, err := strconv.ParseUint(strings.TrimSpace(value), 10, 8)
+	return uint8(parsed), err == nil
+}
+
+func databaseCharsetDisplay(flag uint8) (string, bool) {
+	switch flag {
+	case 0:
+		return "GB18030 (UNICODE_FLAG=0)", true
+	case 1:
+		return "UTF-8 (UNICODE_FLAG=1)", true
+	case 2:
+		return "EUC-KR (UNICODE_FLAG=2)", true
+	default:
+		return fmt.Sprintf("unknown (UNICODE_FLAG=%d)", flag), false
+	}
+}
+
+func unicodeFlagFromCharset(value string) (uint8, bool) {
+	value = strings.ToUpper(strings.TrimSpace(value))
+	switch {
+	case strings.Contains(value, "UNICODE_FLAG=0") || strings.Contains(value, "GB18030") || strings.Contains(value, "GBK"):
+		return 0, true
+	case strings.Contains(value, "UNICODE_FLAG=1") || strings.Contains(value, "UTF-8") || strings.Contains(value, "UTF8"):
+		return 1, true
+	case strings.Contains(value, "UNICODE_FLAG=2") || strings.Contains(value, "EUC-KR") || strings.Contains(value, "EUCKR"):
+		return 2, true
+	default:
+		return 0, false
+	}
 }
 
 func charsetParameterFromDictionary(value string) (string, bool) {

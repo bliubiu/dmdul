@@ -1,0 +1,1107 @@
+package dm
+
+import (
+	"compress/zlib"
+	"crypto/md5"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"hash"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"unicode/utf8"
+
+	"golang.org/x/text/encoding/korean"
+	"golang.org/x/text/encoding/simplifiedchinese"
+	"golang.org/x/text/transform"
+)
+
+const (
+	DMPHeaderSize            = 4096
+	dmpPayloadEndOffset      = 0x10D
+	dmpEncodingCodeOffset    = 0x115
+	dmpDescriptionLenOffset  = 0x116
+	dmpDescriptionOffset     = 0x118
+	dmpCompressionOffset     = 0x318
+	dmpRowFormatFlagOffset   = 0x320
+	dmpCaseSensitiveOffset   = 0x435
+	dmpExtentSizeOffset      = 0x436
+	dmpPageSizeOffset        = 0x43A
+	dmpCharsetFlagOffset     = 0x43E
+	dmpPageCheckOffset       = 0x440
+	dmpEncryptionNameOffset  = 0x745
+	dmpBuildStringOffset     = 0x846
+	dmpObjectCountOffset     = 0xA4A
+	dmpPayloadMD5Offset      = 0xA56
+	dmpCompressionLevelOff   = 0xA66
+	dmpHeaderChecksumOffset  = 0xFFF
+	dmpTableIndexMarker      = 0x9CD81630
+	dmpFieldNull             = 0xFFFD
+	dmpFieldLong             = 0xFFFE
+	dmpMaxShortFieldLength   = dmpFieldNull - 1
+	dmpCurrentLogicalVersion = 26
+	dmpDataPhaseSizeLimit    = 8 << 20
+	dmpStreamBufferSize      = 64 << 10
+)
+
+var dmpFooterMagic = [8]byte{0x9B, 0xA0, 0x78, 0xC6, 0xD5, 0x0C, 0xF2, 0x85}
+
+type DMPExportMode uint32
+
+const (
+	DMPModeFull    DMPExportMode = 1
+	DMPModeSchemas DMPExportMode = 2
+	DMPModeTables  DMPExportMode = 3
+	DMPModeOwner   DMPExportMode = 4
+)
+
+func (m DMPExportMode) String() string {
+	switch m {
+	case DMPModeFull:
+		return "FULL"
+	case DMPModeSchemas:
+		return "SCHEMAS"
+	case DMPModeTables:
+		return "TABLES"
+	case DMPModeOwner:
+		return "OWNER"
+	default:
+		return fmt.Sprintf("UNKNOWN(%d)", uint32(m))
+	}
+}
+
+type DMPInfo struct {
+	Path                string
+	FileSize            int64
+	InternalVersion     uint32
+	LogicalVersion      uint32
+	Mode                DMPExportMode
+	PayloadEnd          uint64
+	Description         string
+	Charset             string
+	CharsetFlag         uint16
+	EncodingCode        uint8
+	CharsetHeaderValid  bool
+	CaseSensitive       bool
+	ExtentSize          uint32
+	PageSize            uint32
+	PageCheck           uint32
+	Compressed          bool
+	CompressionLevel    uint8
+	RowFormatFlag       uint32
+	ObjectCount         uint32
+	EncryptionName      string
+	BuildString         string
+	StoredPayloadMD5    [md5.Size]byte
+	ActualPayloadMD5    [md5.Size]byte
+	PayloadMD5Valid     bool
+	HeaderXOR           byte
+	HeaderChecksumValid bool
+	FooterMagicValid    bool
+	SchemaRecordOffset  uint64
+	Schema              string
+	Owner               string
+	Tables              []DMPTableIndex
+	FooterParseError    string
+}
+
+type DMPTableIndex struct {
+	ObjectID       uint32
+	Name           string
+	MetadataOffset uint64
+	PhaseOffsets   []uint64
+	RowCount       uint64
+}
+
+type dmpCharsetHeader struct {
+	Name         string
+	Flag         uint16
+	EncodingCode uint8
+}
+
+var dmpCharsetHeaders = []dmpCharsetHeader{
+	{Name: "GB18030", Flag: 0, EncodingCode: 10},
+	{Name: "UTF-8", Flag: 1, EncodingCode: 1},
+	{Name: "EUC-KR", Flag: 2, EncodingCode: 6},
+}
+
+func InspectDMP(path string) (*DMPInfo, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open dmp: %w", err)
+	}
+	defer file.Close()
+
+	stat, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat dmp: %w", err)
+	}
+	if stat.Size() < DMPHeaderSize {
+		return nil, fmt.Errorf("dmp is shorter than the %d-byte header", DMPHeaderSize)
+	}
+
+	header := make([]byte, DMPHeaderSize)
+	if _, err := io.ReadFull(file, header); err != nil {
+		return nil, fmt.Errorf("read dmp header: %w", err)
+	}
+	charsetFlag := binary.LittleEndian.Uint16(header[dmpCharsetFlagOffset : dmpCharsetFlagOffset+2])
+	encodingCode := header[dmpEncodingCodeOffset]
+	charset, charsetValid := dmpCharsetFromHeader(charsetFlag, encodingCode)
+	info := &DMPInfo{
+		Path:               path,
+		FileSize:           stat.Size(),
+		InternalVersion:    binary.LittleEndian.Uint32(header[0:4]),
+		Mode:               DMPExportMode(binary.LittleEndian.Uint32(header[8:12])),
+		PayloadEnd:         binary.LittleEndian.Uint64(header[dmpPayloadEndOffset : dmpPayloadEndOffset+8]),
+		Charset:            charset.Name,
+		CharsetFlag:        charsetFlag,
+		EncodingCode:       encodingCode,
+		CharsetHeaderValid: charsetValid,
+		CaseSensitive:      header[dmpCaseSensitiveOffset] != 0,
+		ExtentSize:         binary.LittleEndian.Uint32(header[dmpExtentSizeOffset : dmpExtentSizeOffset+4]),
+		PageSize:           binary.LittleEndian.Uint32(header[dmpPageSizeOffset : dmpPageSizeOffset+4]),
+		PageCheck:          binary.LittleEndian.Uint32(header[dmpPageCheckOffset : dmpPageCheckOffset+4]),
+		Compressed:         header[dmpCompressionOffset] != 0,
+		CompressionLevel:   header[dmpCompressionLevelOff],
+		RowFormatFlag:      binary.LittleEndian.Uint32(header[dmpRowFormatFlagOffset : dmpRowFormatFlagOffset+4]),
+		ObjectCount:        binary.LittleEndian.Uint32(header[dmpObjectCountOffset : dmpObjectCountOffset+4]),
+		EncryptionName:     dmpCString(header, dmpEncryptionNameOffset, 64),
+		BuildString:        dmpCString(header, dmpBuildStringOffset, 128),
+		HeaderXOR:          dmpXOR(header),
+	}
+	info.Description = decodeDMPText(dmpHeaderDescription(header), info.Charset)
+	if info.InternalVersion >= 8 {
+		info.LogicalVersion = info.InternalVersion - 8
+	}
+	copy(info.StoredPayloadMD5[:], header[dmpPayloadMD5Offset:dmpPayloadMD5Offset+md5.Size])
+	info.HeaderChecksumValid = info.HeaderXOR == 0
+
+	if info.PayloadEnd < DMPHeaderSize || info.PayloadEnd > uint64(stat.Size()) {
+		return nil, fmt.Errorf("invalid dmp payload end 0x%X for file size %d", info.PayloadEnd, stat.Size())
+	}
+	if _, err := file.Seek(DMPHeaderSize, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("seek dmp payload: %w", err)
+	}
+	payloadHash := md5.New()
+	if _, err := io.Copy(payloadHash, file); err != nil {
+		return nil, fmt.Errorf("hash dmp payload: %w", err)
+	}
+	copy(info.ActualPayloadMD5[:], payloadHash.Sum(nil))
+	info.PayloadMD5Valid = info.StoredPayloadMD5 == info.ActualPayloadMD5
+
+	if err := inspectDMPFooter(file, info); err != nil {
+		info.FooterParseError = err.Error()
+	}
+	return info, nil
+}
+
+func dmpHeaderDescription(header []byte) []byte {
+	length := int(binary.LittleEndian.Uint16(header[dmpDescriptionLenOffset : dmpDescriptionLenOffset+2]))
+	if length <= 0 || dmpDescriptionOffset+length > len(header) {
+		return nil
+	}
+	return header[dmpDescriptionOffset : dmpDescriptionOffset+length]
+}
+
+func dmpCharsetFromHeader(flag uint16, encodingCode uint8) (dmpCharsetHeader, bool) {
+	for _, charset := range dmpCharsetHeaders {
+		if charset.Flag == flag && charset.EncodingCode == encodingCode {
+			return charset, true
+		}
+	}
+	return dmpCharsetHeader{Name: fmt.Sprintf("unknown(flag=%d,code=%d)", flag, encodingCode), Flag: flag, EncodingCode: encodingCode}, false
+}
+
+func dmpCharsetFromName(value string) (dmpCharsetHeader, error) {
+	if strings.TrimSpace(value) == "" {
+		value = "UTF-8"
+	}
+	normalized := normalizeCharsetToken(value)
+	for _, charset := range dmpCharsetHeaders {
+		if normalized == charset.Name || normalized == fmt.Sprintf("%d", charset.Flag) {
+			return charset, nil
+		}
+	}
+	return dmpCharsetHeader{}, fmt.Errorf("unsupported dmp charset %q; use utf-8, gb18030, or euc-kr", value)
+}
+
+func decodeDMPText(raw []byte, charset string) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	if value, ok := decodeWithCharset(raw, charset); ok {
+		return value
+	}
+	return string(raw)
+}
+
+func encodeDMPText(value string, charset dmpCharsetHeader) ([]byte, error) {
+	if !utf8.ValidString(value) {
+		return nil, fmt.Errorf("dmp text is not valid UTF-8")
+	}
+	if value == "" {
+		return nil, nil
+	}
+	if charset.Name == "UTF-8" {
+		return []byte(value), nil
+	}
+	var transformer transform.Transformer
+	switch charset.Name {
+	case "GB18030":
+		transformer = simplifiedchinese.GB18030.NewEncoder()
+	case "EUC-KR":
+		transformer = korean.EUCKR.NewEncoder()
+	default:
+		return nil, fmt.Errorf("unsupported dmp charset %q", charset.Name)
+	}
+	encoded, _, err := transform.String(transformer, value)
+	if err != nil {
+		return nil, fmt.Errorf("encode dmp text as %s: %w", charset.Name, err)
+	}
+	return []byte(encoded), nil
+}
+
+func dmpCString(raw []byte, offset int, maxLength int) string {
+	if offset < 0 || offset >= len(raw) || maxLength <= 0 {
+		return ""
+	}
+	end := offset + maxLength
+	if end > len(raw) {
+		end = len(raw)
+	}
+	value := raw[offset:end]
+	if nul := strings.IndexByte(string(value), 0); nul >= 0 {
+		value = value[:nul]
+	}
+	return string(value)
+}
+
+func dmpXOR(raw []byte) byte {
+	var result byte
+	for _, value := range raw {
+		result ^= value
+	}
+	return result
+}
+
+func inspectDMPFooter(file *os.File, info *DMPInfo) error {
+	footerLength := info.FileSize - int64(info.PayloadEnd)
+	if footerLength < int64(len(dmpFooterMagic)) {
+		return fmt.Errorf("dmp footer is too short")
+	}
+	if footerLength > 64<<20 {
+		return fmt.Errorf("dmp footer exceeds 64 MiB inspection limit")
+	}
+	footer := make([]byte, footerLength)
+	if _, err := file.ReadAt(footer, int64(info.PayloadEnd)); err != nil {
+		return fmt.Errorf("read dmp footer: %w", err)
+	}
+	info.FooterMagicValid = string(footer[:8]) == string(dmpFooterMagic[:])
+	if !info.FooterMagicValid {
+		return fmt.Errorf("dmp footer magic mismatch")
+	}
+
+	reader := dmpFooterReader{raw: footer, offset: 8, compressed: info.Compressed}
+	if _, err := reader.uint16(); err != nil {
+		return err
+	}
+	schemaRecordOffset, err := reader.uint64()
+	if err != nil {
+		return err
+	}
+	info.SchemaRecordOffset = schemaRecordOffset
+	schemaRaw, err := reader.bytes16()
+	if err != nil {
+		return err
+	}
+	info.Schema = decodeDMPText(schemaRaw, info.Charset)
+	ownerRaw, err := reader.bytes16()
+	if err != nil {
+		return err
+	}
+	info.Owner = decodeDMPText(ownerRaw, info.Charset)
+
+	for reader.offset < len(reader.raw) {
+		marker, err := reader.uint32()
+		if err != nil {
+			return err
+		}
+		if marker != dmpTableIndexMarker {
+			return fmt.Errorf("unexpected footer table marker 0x%08X at +0x%X", marker, reader.offset-4)
+		}
+		if _, err := reader.uint16(); err != nil {
+			return err
+		}
+		metadataOffset, err := reader.uint64()
+		if err != nil {
+			return err
+		}
+		objectID, err := reader.uint32()
+		if err != nil {
+			return err
+		}
+		nameRaw, err := reader.bytes16()
+		if err != nil {
+			return err
+		}
+		name := decodeDMPText(nameRaw, info.Charset)
+		phaseCount, err := reader.uint32()
+		if err != nil {
+			return err
+		}
+		if phaseCount > 1024 {
+			return fmt.Errorf("unreasonable dmp phase count %d", phaseCount)
+		}
+		table := DMPTableIndex{ObjectID: objectID, Name: name, MetadataOffset: metadataOffset}
+		for i := uint32(0); i < phaseCount; i++ {
+			if _, err := reader.uint16(); err != nil {
+				return err
+			}
+			phaseOffset, err := reader.uint64()
+			if err != nil {
+				return err
+			}
+			table.PhaseOffsets = append(table.PhaseOffsets, phaseOffset)
+			if rows, ok := dmpPhaseRowCount(file, phaseOffset, info.FileSize); ok {
+				table.RowCount += uint64(rows)
+			}
+		}
+		info.Tables = append(info.Tables, table)
+	}
+	return nil
+}
+
+func dmpPhaseRowCount(file *os.File, offset uint64, fileSize int64) (uint32, bool) {
+	if offset > uint64(fileSize-20) {
+		return 0, false
+	}
+	header := make([]byte, 20)
+	if _, err := file.ReadAt(header, int64(offset)); err != nil {
+		return 0, false
+	}
+	if binary.LittleEndian.Uint16(header[0:2]) != 2 || binary.LittleEndian.Uint16(header[2:4]) != 0xFFFF {
+		return 0, false
+	}
+	if binary.LittleEndian.Uint32(header[8:12]) < 2 {
+		return 0, false
+	}
+	rows := binary.LittleEndian.Uint32(header[16:20])
+	if rows == ^uint32(0) {
+		return 0, false
+	}
+	return rows, true
+}
+
+type dmpFooterReader struct {
+	raw        []byte
+	offset     int
+	compressed bool
+}
+
+func (r *dmpFooterReader) take(length int) ([]byte, error) {
+	if length < 0 || r.offset+length > len(r.raw) {
+		return nil, io.ErrUnexpectedEOF
+	}
+	value := r.raw[r.offset : r.offset+length]
+	r.offset += length
+	return value, nil
+}
+
+func (r *dmpFooterReader) uint16() (uint16, error) {
+	raw, err := r.take(2)
+	if err != nil {
+		return 0, err
+	}
+	return binary.LittleEndian.Uint16(raw), nil
+}
+
+func (r *dmpFooterReader) uint32() (uint32, error) {
+	raw, err := r.take(4)
+	if err != nil {
+		return 0, err
+	}
+	return binary.LittleEndian.Uint32(raw), nil
+}
+
+func (r *dmpFooterReader) uint64() (uint64, error) {
+	raw, err := r.take(8)
+	if err != nil {
+		return 0, err
+	}
+	return binary.LittleEndian.Uint64(raw), nil
+}
+
+func (r *dmpFooterReader) bytes16() ([]byte, error) {
+	length, err := r.uint16()
+	if err != nil {
+		return nil, err
+	}
+	raw, err := r.take(int(length))
+	if err != nil {
+		return nil, err
+	}
+	if !r.compressed {
+		return raw, nil
+	}
+	reader, err := zlib.NewReader(strings.NewReader(string(raw)))
+	if err != nil {
+		return nil, fmt.Errorf("open compressed dmp string: %w", err)
+	}
+	decompressed, readErr := io.ReadAll(reader)
+	closeErr := reader.Close()
+	if readErr != nil {
+		return nil, fmt.Errorf("read compressed dmp string: %w", readErr)
+	}
+	if closeErr != nil {
+		return nil, fmt.Errorf("close compressed dmp string: %w", closeErr)
+	}
+	return decompressed, nil
+}
+
+type DMPDataOptions struct {
+	OutputPath     string
+	LogicalVersion uint32
+	RowFormatFlag  uint32
+	Charset        string
+	CaseSensitive  *bool
+	ExtentSize     uint32
+	PageSize       uint32
+	PageCheck      *uint32
+	Schema         string
+	Table          string
+	TableID        uint32
+	ColumnCount    uint16
+}
+
+type DMPField struct {
+	Data   []byte
+	Reader io.Reader
+	Length uint64
+	Null   bool
+	Long   bool
+}
+
+func DMPNullField() DMPField {
+	return DMPField{Null: true}
+}
+
+func DMPShortField(data []byte) DMPField {
+	return DMPField{Data: data}
+}
+
+func DMPLongField(data []byte) DMPField {
+	return DMPField{Data: data, Long: true}
+}
+
+func DMPLongReaderField(reader io.Reader, length uint64) DMPField {
+	return DMPField{Reader: reader, Length: length, Long: true}
+}
+
+type dmpDataPhase struct {
+	offset             uint64
+	number             uint32
+	rowsCompleted      uint32
+	startsContinuation bool
+	active             bool
+}
+
+type DMPDataWriter struct {
+	file           *os.File
+	opts           DMPDataOptions
+	phase1Offset   uint64
+	phase2Offset   uint64
+	rowCount       uint32
+	charset        dmpCharsetHeader
+	schemaBytes    []byte
+	tableBytes     []byte
+	phaseOffsets   []uint64
+	currentPhase   dmpDataPhase
+	phaseSizeLimit uint64
+	inRow          bool
+	closed         bool
+}
+
+func NewDMPDataWriter(opts DMPDataOptions) (*DMPDataWriter, error) {
+	if strings.TrimSpace(opts.OutputPath) == "" {
+		return nil, fmt.Errorf("dmp output path is required")
+	}
+	if opts.LogicalVersion == 0 {
+		opts.LogicalVersion = dmpCurrentLogicalVersion
+	}
+	if opts.LogicalVersion < 9 || opts.LogicalVersion > dmpCurrentLogicalVersion {
+		return nil, fmt.Errorf("unsupported dmp logical version %d", opts.LogicalVersion)
+	}
+	if opts.RowFormatFlag == 0 {
+		opts.RowFormatFlag = 1
+	}
+	if opts.RowFormatFlag != 1 {
+		return nil, fmt.Errorf("unsupported dmp row-format flag %d; only the verified value 1 is currently writable", opts.RowFormatFlag)
+	}
+	if opts.ExtentSize == 0 {
+		opts.ExtentSize = 16
+	}
+	if opts.PageSize == 0 {
+		opts.PageSize = 8192
+	}
+	charset, err := dmpCharsetFromName(opts.Charset)
+	if err != nil {
+		return nil, err
+	}
+	opts.Charset = charset.Name
+	if opts.Schema == "" || opts.Table == "" {
+		return nil, fmt.Errorf("dmp schema and table names are required")
+	}
+	schemaBytes, err := encodeDMPText(opts.Schema, charset)
+	if err != nil {
+		return nil, fmt.Errorf("encode dmp schema: %w", err)
+	}
+	tableBytes, err := encodeDMPText(opts.Table, charset)
+	if err != nil {
+		return nil, fmt.Errorf("encode dmp table: %w", err)
+	}
+	if len(schemaBytes) > 0xFFFF || len(tableBytes) > 0xFFFF {
+		return nil, fmt.Errorf("dmp schema or table name is too long")
+	}
+	if opts.ColumnCount == 0 {
+		return nil, fmt.Errorf("dmp column count must be positive")
+	}
+	if dir := filepath.Dir(opts.OutputPath); dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return nil, fmt.Errorf("create dmp output directory: %w", err)
+		}
+	}
+	file, err := os.Create(opts.OutputPath)
+	if err != nil {
+		return nil, fmt.Errorf("create dmp output: %w", err)
+	}
+	writer := &DMPDataWriter{
+		file: file, opts: opts, phase1Offset: DMPHeaderSize,
+		charset: charset, schemaBytes: schemaBytes, tableBytes: tableBytes,
+		phaseSizeLimit: dmpDataPhaseSizeLimit,
+	}
+	if err := writer.writePreamble(); err != nil {
+		_ = writer.Abort()
+		return nil, err
+	}
+	return writer, nil
+}
+
+func (w *DMPDataWriter) writePreamble() error {
+	if _, err := w.file.Write(make([]byte, DMPHeaderSize)); err != nil {
+		return fmt.Errorf("write dmp header placeholder: %w", err)
+	}
+	if err := writeDMPUint16(w.file, 2); err != nil {
+		return err
+	}
+	if err := writeDMPUint16(w.file, 0xFFFF); err != nil {
+		return err
+	}
+	for _, value := range []uint32{w.opts.TableID, 1, 0, 0} {
+		if err := writeDMPUint32(w.file, value); err != nil {
+			return err
+		}
+	}
+	if _, err := w.file.Write([]byte{0}); err != nil {
+		return err
+	}
+	if err := writeDMPString32(w.file, w.tableBytes); err != nil {
+		return err
+	}
+	if err := writeDMPUint16(w.file, 14); err != nil {
+		return err
+	}
+	if err := writeDMPUint16(w.file, 0xFFFF); err != nil {
+		return err
+	}
+	if err := writeDMPUint16(w.file, w.opts.ColumnCount); err != nil {
+		return err
+	}
+	position, err := w.file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+	w.phase2Offset = uint64(position)
+	w.phaseOffsets = append(w.phaseOffsets, w.phase1Offset)
+	return w.startDataPhase(false)
+}
+
+func (w *DMPDataWriter) WriteRow(fields []DMPField) error {
+	if w.closed {
+		return fmt.Errorf("dmp writer is closed")
+	}
+	if w.file == nil {
+		if err := w.resume(); err != nil {
+			return err
+		}
+	}
+	if len(fields) != int(w.opts.ColumnCount) {
+		return fmt.Errorf("dmp row has %d fields, want %d", len(fields), w.opts.ColumnCount)
+	}
+	if w.rowCount == ^uint32(0) {
+		return fmt.Errorf("dmp row count exceeds uint32")
+	}
+	w.inRow = true
+	for _, field := range fields {
+		if field.Null {
+			if field.Reader != nil || len(field.Data) != 0 || field.Length != 0 {
+				return fmt.Errorf("null dmp field cannot contain data")
+			}
+			if err := w.writePhaseUint16(dmpFieldNull); err != nil {
+				return err
+			}
+			continue
+		}
+		if field.Reader != nil && field.Data != nil {
+			return fmt.Errorf("dmp field cannot use Data and Reader together")
+		}
+		length := uint64(len(field.Data))
+		if field.Reader != nil {
+			length = field.Length
+		} else if field.Length != 0 && field.Length != length {
+			return fmt.Errorf("dmp field length %d does not match data length %d", field.Length, length)
+		}
+		if field.Long || length > dmpMaxShortFieldLength {
+			if err := w.ensurePhaseCapacity(10); err != nil {
+				return err
+			}
+			if err := writeDMPUint16(w.file, dmpFieldLong); err != nil {
+				return err
+			}
+			if err := writeDMPUint64(w.file, length); err != nil {
+				return err
+			}
+		} else {
+			if err := w.writePhaseUint16(uint16(length)); err != nil {
+				return err
+			}
+		}
+		if field.Reader != nil {
+			if err := w.writePhaseReader(field.Reader, length); err != nil {
+				return fmt.Errorf("write streamed dmp field: %w", err)
+			}
+		} else if err := w.writePhaseBytes(field.Data); err != nil {
+			return fmt.Errorf("write dmp field: %w", err)
+		}
+	}
+	w.inRow = false
+	w.currentPhase.rowsCompleted++
+	w.rowCount++
+	return nil
+}
+
+func (w *DMPDataWriter) startDataPhase(continuation bool) error {
+	if uint64(len(w.phaseOffsets)) >= uint64(^uint32(0)) {
+		return fmt.Errorf("dmp phase count exceeds uint32")
+	}
+	position, err := w.file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+	offset := uint64(position)
+	number := uint32(len(w.phaseOffsets) + 1)
+	w.phaseOffsets = append(w.phaseOffsets, offset)
+	w.currentPhase = dmpDataPhase{
+		offset: offset, number: number, startsContinuation: continuation, active: true,
+	}
+	if err := writeDMPUint16(w.file, 2); err != nil {
+		return err
+	}
+	if err := writeDMPUint16(w.file, 0xFFFF); err != nil {
+		return err
+	}
+	for _, value := range []uint32{w.opts.TableID, number, 0, 0} {
+		if err := writeDMPUint32(w.file, value); err != nil {
+			return err
+		}
+	}
+	if _, err := w.file.Write([]byte{0}); err != nil {
+		return err
+	}
+	if err := writeDMPString32(w.file, w.tableBytes); err != nil {
+		return err
+	}
+	position, err = w.file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+	if uint64(position)-offset >= w.phaseSizeLimit {
+		return fmt.Errorf("dmp phase size limit %d is too small for the phase header", w.phaseSizeLimit)
+	}
+	return nil
+}
+
+func (w *DMPDataWriter) finishDataPhase() error {
+	if !w.currentPhase.active {
+		return nil
+	}
+	position, err := w.file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+	length := uint64(position) - w.currentPhase.offset
+	if length > uint64(^uint32(0)) {
+		return fmt.Errorf("dmp table phase exceeds uint32 length")
+	}
+	rows := w.currentPhase.rowsCompleted
+	if rows == 0 && (w.currentPhase.startsContinuation || w.inRow) {
+		rows = ^uint32(0)
+	}
+	if err := patchDMPUint32(w.file, int64(w.currentPhase.offset+12), uint32(length)); err != nil {
+		return err
+	}
+	if err := patchDMPUint32(w.file, int64(w.currentPhase.offset+16), rows); err != nil {
+		return err
+	}
+	w.currentPhase.active = false
+	return nil
+}
+
+func (w *DMPDataWriter) phaseRemaining() (uint64, error) {
+	position, err := w.file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return 0, err
+	}
+	used := uint64(position) - w.currentPhase.offset
+	if used >= w.phaseSizeLimit {
+		return 0, nil
+	}
+	return w.phaseSizeLimit - used, nil
+}
+
+func (w *DMPDataWriter) ensurePhaseCapacity(length uint64) error {
+	remaining, err := w.phaseRemaining()
+	if err != nil {
+		return err
+	}
+	if remaining >= length {
+		return nil
+	}
+	if err := w.finishDataPhase(); err != nil {
+		return err
+	}
+	if err := w.startDataPhase(w.inRow); err != nil {
+		return err
+	}
+	remaining, err = w.phaseRemaining()
+	if err != nil {
+		return err
+	}
+	if remaining < length {
+		return fmt.Errorf("dmp phase has %d bytes available, need %d", remaining, length)
+	}
+	return nil
+}
+
+func (w *DMPDataWriter) writePhaseUint16(value uint16) error {
+	if err := w.ensurePhaseCapacity(2); err != nil {
+		return err
+	}
+	return writeDMPUint16(w.file, value)
+}
+
+func (w *DMPDataWriter) writePhaseBytes(data []byte) error {
+	for len(data) > 0 {
+		remaining, err := w.phaseRemaining()
+		if err != nil {
+			return err
+		}
+		if remaining == 0 {
+			if err := w.finishDataPhase(); err != nil {
+				return err
+			}
+			if err := w.startDataPhase(w.inRow); err != nil {
+				return err
+			}
+			continue
+		}
+		length := uint64(len(data))
+		if length > remaining {
+			length = remaining
+		}
+		if _, err := w.file.Write(data[:int(length)]); err != nil {
+			return err
+		}
+		data = data[int(length):]
+	}
+	return nil
+}
+
+func (w *DMPDataWriter) writePhaseReader(reader io.Reader, length uint64) error {
+	buffer := make([]byte, dmpStreamBufferSize)
+	remainingTotal := length
+	for remainingTotal > 0 {
+		remainingPhase, err := w.phaseRemaining()
+		if err != nil {
+			return err
+		}
+		if remainingPhase == 0 {
+			if err := w.finishDataPhase(); err != nil {
+				return err
+			}
+			if err := w.startDataPhase(w.inRow); err != nil {
+				return err
+			}
+			continue
+		}
+		length := remainingTotal
+		if length > remainingPhase {
+			length = remainingPhase
+		}
+		if length > uint64(len(buffer)) {
+			length = uint64(len(buffer))
+		}
+		if _, err := io.ReadFull(reader, buffer[:int(length)]); err != nil {
+			return err
+		}
+		if _, err := w.file.Write(buffer[:int(length)]); err != nil {
+			return err
+		}
+		remainingTotal -= length
+	}
+	return nil
+}
+
+func (w *DMPDataWriter) Close() (*DMPInfo, error) {
+	if w.closed {
+		return nil, fmt.Errorf("dmp writer is closed")
+	}
+	if w.file == nil {
+		if err := w.resume(); err != nil {
+			return nil, err
+		}
+	}
+	w.closed = true
+	if w.inRow {
+		_ = w.file.Close()
+		return nil, fmt.Errorf("cannot close dmp writer with an incomplete row")
+	}
+	if err := w.finishDataPhase(); err != nil {
+		_ = w.file.Close()
+		return nil, err
+	}
+	payloadEndPosition, err := w.file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		_ = w.file.Close()
+		return nil, err
+	}
+	payloadEnd := uint64(payloadEndPosition)
+	phase1Length := w.phase2Offset - w.phase1Offset
+	if phase1Length > uint64(^uint32(0)) {
+		_ = w.file.Close()
+		return nil, fmt.Errorf("dmp table phase exceeds uint32 length")
+	}
+	if err := w.writeFooter(); err != nil {
+		_ = w.file.Close()
+		return nil, err
+	}
+	if err := patchDMPUint32(w.file, int64(w.phase1Offset+12), uint32(phase1Length)); err != nil {
+		_ = w.file.Close()
+		return nil, err
+	}
+	payloadHash, err := hashDMPPayload(w.file)
+	if err != nil {
+		_ = w.file.Close()
+		return nil, err
+	}
+	header := make([]byte, DMPHeaderSize)
+	binary.LittleEndian.PutUint32(header[0:4], w.opts.LogicalVersion+8)
+	binary.LittleEndian.PutUint32(header[4:8], 1)
+	binary.LittleEndian.PutUint32(header[8:12], uint32(DMPModeTables))
+	binary.LittleEndian.PutUint64(header[dmpPayloadEndOffset:dmpPayloadEndOffset+8], payloadEnd)
+	header[dmpEncodingCodeOffset] = w.charset.EncodingCode
+	binary.LittleEndian.PutUint32(header[dmpRowFormatFlagOffset:dmpRowFormatFlagOffset+4], w.opts.RowFormatFlag)
+	caseSensitive := true
+	if w.opts.CaseSensitive != nil {
+		caseSensitive = *w.opts.CaseSensitive
+	}
+	if caseSensitive {
+		header[dmpCaseSensitiveOffset] = 1
+	}
+	binary.LittleEndian.PutUint32(header[dmpExtentSizeOffset:dmpExtentSizeOffset+4], w.opts.ExtentSize)
+	binary.LittleEndian.PutUint32(header[dmpPageSizeOffset:dmpPageSizeOffset+4], w.opts.PageSize)
+	binary.LittleEndian.PutUint16(header[dmpCharsetFlagOffset:dmpCharsetFlagOffset+2], w.charset.Flag)
+	pageCheck := uint32(3)
+	if w.opts.PageCheck != nil {
+		pageCheck = *w.opts.PageCheck
+	}
+	binary.LittleEndian.PutUint32(header[dmpPageCheckOffset:dmpPageCheckOffset+4], pageCheck)
+	binary.LittleEndian.PutUint32(header[dmpObjectCountOffset:dmpObjectCountOffset+4], 0)
+	copy(header[dmpPayloadMD5Offset:dmpPayloadMD5Offset+md5.Size], payloadHash.Sum(nil))
+	header[dmpHeaderChecksumOffset] = dmpXOR(header)
+	if _, err := w.file.WriteAt(header, 0); err != nil {
+		_ = w.file.Close()
+		return nil, fmt.Errorf("write final dmp header: %w", err)
+	}
+	if err := w.file.Sync(); err != nil {
+		_ = w.file.Close()
+		return nil, fmt.Errorf("sync dmp output: %w", err)
+	}
+	if err := w.file.Close(); err != nil {
+		return nil, fmt.Errorf("close dmp output: %w", err)
+	}
+	w.file = nil
+	return InspectDMP(w.opts.OutputPath)
+}
+
+// suspend releases the operating-system file handle without finalizing the
+// dump. The writer can be resumed later, which keeps per-table DMP exports
+// bounded when a database contains thousands of tables.
+func (w *DMPDataWriter) suspend() error {
+	if w == nil || w.closed || w.file == nil {
+		return nil
+	}
+	if w.inRow {
+		return fmt.Errorf("cannot suspend dmp writer with an incomplete row")
+	}
+	if err := w.file.Sync(); err != nil {
+		return fmt.Errorf("sync dmp output before suspend: %w", err)
+	}
+	if err := w.file.Close(); err != nil {
+		return fmt.Errorf("suspend dmp output: %w", err)
+	}
+	w.file = nil
+	return nil
+}
+
+func (w *DMPDataWriter) resume() error {
+	if w == nil || w.closed {
+		return fmt.Errorf("dmp writer is closed")
+	}
+	if w.file != nil {
+		return nil
+	}
+	file, err := os.OpenFile(w.opts.OutputPath, os.O_RDWR, 0644)
+	if err != nil {
+		return fmt.Errorf("resume dmp output: %w", err)
+	}
+	if _, err := file.Seek(0, io.SeekEnd); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("seek resumed dmp output: %w", err)
+	}
+	w.file = file
+	return nil
+}
+
+func (w *DMPDataWriter) writeFooter() error {
+	if _, err := w.file.Write(dmpFooterMagic[:]); err != nil {
+		return err
+	}
+	if err := writeDMPUint16(w.file, 0); err != nil {
+		return err
+	}
+	if err := writeDMPUint64(w.file, w.phase1Offset); err != nil {
+		return err
+	}
+	if err := writeDMPString16(w.file, w.schemaBytes); err != nil {
+		return err
+	}
+	if err := writeDMPString16(w.file, w.schemaBytes); err != nil {
+		return err
+	}
+	if err := writeDMPUint32(w.file, dmpTableIndexMarker); err != nil {
+		return err
+	}
+	if err := writeDMPUint16(w.file, 0); err != nil {
+		return err
+	}
+	if err := writeDMPUint64(w.file, w.phase1Offset); err != nil {
+		return err
+	}
+	if err := writeDMPUint32(w.file, w.opts.TableID); err != nil {
+		return err
+	}
+	if err := writeDMPString16(w.file, w.tableBytes); err != nil {
+		return err
+	}
+	if err := writeDMPUint32(w.file, uint32(len(w.phaseOffsets))); err != nil {
+		return err
+	}
+	for _, offset := range w.phaseOffsets {
+		if err := writeDMPUint16(w.file, 0); err != nil {
+			return err
+		}
+		if err := writeDMPUint64(w.file, offset); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (w *DMPDataWriter) Abort() error {
+	if w.closed {
+		return nil
+	}
+	w.closed = true
+	var closeErr error
+	if w.file != nil {
+		closeErr = w.file.Close()
+	}
+	w.file = nil
+	removeErr := os.Remove(w.opts.OutputPath)
+	return errors.Join(closeErr, removeErr)
+}
+
+func hashDMPPayload(file *os.File) (hash.Hash, error) {
+	if _, err := file.Seek(DMPHeaderSize, io.SeekStart); err != nil {
+		return nil, err
+	}
+	payloadHash := md5.New()
+	if _, err := io.Copy(payloadHash, file); err != nil {
+		return nil, err
+	}
+	return payloadHash, nil
+}
+
+func writeDMPUint16(writer io.Writer, value uint16) error {
+	var raw [2]byte
+	binary.LittleEndian.PutUint16(raw[:], value)
+	_, err := writer.Write(raw[:])
+	return err
+}
+
+func writeDMPUint32(writer io.Writer, value uint32) error {
+	var raw [4]byte
+	binary.LittleEndian.PutUint32(raw[:], value)
+	_, err := writer.Write(raw[:])
+	return err
+}
+
+func writeDMPUint64(writer io.Writer, value uint64) error {
+	var raw [8]byte
+	binary.LittleEndian.PutUint64(raw[:], value)
+	_, err := writer.Write(raw[:])
+	return err
+}
+
+func writeDMPString16(writer io.Writer, value []byte) error {
+	if len(value) > 0xFFFF {
+		return fmt.Errorf("dmp string exceeds uint16 length")
+	}
+	if err := writeDMPUint16(writer, uint16(len(value))); err != nil {
+		return err
+	}
+	_, err := writer.Write(value)
+	return err
+}
+
+func writeDMPString32(writer io.Writer, value []byte) error {
+	if uint64(len(value)) > uint64(^uint32(0)) {
+		return fmt.Errorf("dmp string exceeds uint32 length")
+	}
+	if err := writeDMPUint32(writer, uint32(len(value))); err != nil {
+		return err
+	}
+	_, err := writer.Write(value)
+	return err
+}
+
+func patchDMPUint32(file *os.File, offset int64, value uint32) error {
+	var raw [4]byte
+	binary.LittleEndian.PutUint32(raw[:], value)
+	if _, err := file.WriteAt(raw[:], offset); err != nil {
+		return fmt.Errorf("patch dmp uint32 at 0x%X: %w", offset, err)
+	}
+	return nil
+}

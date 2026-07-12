@@ -22,7 +22,7 @@ func TestRunHelp(t *testing.T) {
 	if !strings.Contains(stdout.String(), "dmdul") {
 		t.Fatalf("help output should mention dmdul, got %q", stdout.String())
 	}
-	for _, want := range []string{"bootstrap;", "unload database;", "recover table"} {
+	for _, want := range []string{"bootstrap;", "unload object <owner|all>;", "unload database;", "recover table"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("help output should contain %q, got %q", want, stdout.String())
 		}
@@ -31,6 +31,9 @@ func TestRunHelp(t *testing.T) {
 		if strings.Contains(stdout.String(), removed) {
 			t.Fatalf("help output should not advertise removed command %q", removed)
 		}
+	}
+	if strings.Contains(stdout.String(), "show dmp") {
+		t.Fatal("help output should not advertise the experimental show dmp command")
 	}
 	if stderr.Len() != 0 {
 		t.Fatalf("stderr should be empty, got %q", stderr.String())
@@ -58,7 +61,7 @@ func TestRunInteractiveHelpAndExit(t *testing.T) {
 		t.Fatalf("RunInteractive returned error: %v", err)
 	}
 	output := stdout.String()
-	for _, want := range []string{"dmdul: Release v0.1.2", "Dameng Database Offline Recovery & Data Unloader", "Copyright (c) 2026 greatfinish", "https://github.com/greatfinish/dmdul", "DMDUL>", "bootstrap;", "list user;", "unload table", "unload database", "recover table", "bye"} {
+	for _, want := range []string{"dmdul: Release v0.1.2", "Dameng Database Offline Recovery & Data Unloader", "Copyright (c) 2026 greatfinish", "https://github.com/greatfinish/dmdul", "DMDUL>", "bootstrap;", "list user;", "unload table", "unload object", "unload database", "recover table", "bye"} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("interactive output should contain %q, got %q", want, output)
 		}
@@ -156,6 +159,64 @@ func TestInteractiveLoadInitDULCommand(t *testing.T) {
 	}
 }
 
+func TestInteractiveLoadParameterRestoresBootstrapMetadata(t *testing.T) {
+	previousDir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd failed: %v", err)
+	}
+	dir := t.TempDir()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("Chdir failed: %v", err)
+	}
+	defer func() {
+		if err := os.Chdir(previousDir); err != nil {
+			t.Fatalf("restore Chdir failed: %v", err)
+		}
+	}()
+
+	content := strings.Join([]string{
+		"system=D:\\manual\\SYSTEM.DBF",
+		"db_name=DMTEST",
+		"db_name_source=dm.ctl",
+		"instance_name=DMTEST01",
+		"instance_name_source=dm.ini",
+		"extent_size=64",
+		"extent_size_source=u32 @ 0x80",
+		"page_size=32768",
+		"page_size_source=u32 @ 0x84",
+		"page_count=100",
+		"page_count_source=u32 @ 0x8C",
+		"database_charset=EUC-KR (UNICODE_FLAG=2)",
+		"unicode_flag=2",
+		"charset_source=SYSTEM.DBF page 4 + 0x2D",
+		"case_sensitive=auto",
+		"case_sensitive_value=0",
+		"case_sensitive_source=SYSTEM.DBF page 4 + 0x2C",
+	}, "\n") + "\n"
+	if err := os.WriteFile(defaultInitDULPath, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if err := RunInteractive(strings.NewReader("load parameter;\nshow parameter;\nexit;\n"), &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"parameters loaded: init.dul",
+		"db_name    = DMTEST (dm.ctl)",
+		"instance_name= DMTEST01 (dm.ini)",
+		"extent_size= 64 pages (u32 @ 0x80)",
+		"page_size  = 32768 bytes (u32 @ 0x84)",
+		"unicode_flag= 2 (SYSTEM.DBF page 4 + 0x2D)",
+		"case_effective= 0 (SYSTEM.DBF page 4 + 0x2C)",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("output missing %q: %s", want, stdout.String())
+		}
+	}
+}
+
 func TestInteractiveLoadDictionaryUpdatesAutoCharset(t *testing.T) {
 	previousDir, err := os.Getwd()
 	if err != nil {
@@ -172,11 +233,14 @@ func TestInteractiveLoadDictionaryUpdatesAutoCharset(t *testing.T) {
 	}()
 
 	if _, err := dm.WriteDictionaryFiles(filepath.Join(dir, dm.DefaultDictionaryDirName), &dm.DictionaryInfo{
-		SystemPath:    `D:\manual\SYSTEM.DBF`,
-		Source:        "SYSTEM.DBF",
-		Charset:       "GB18030 (UNICODE_FLAG=0)",
-		CharsetSource: "test",
-		Users:         []dm.DictionaryUser{{ID: 1, Name: "HR_TEST"}},
+		SystemPath:          `D:\manual\SYSTEM.DBF`,
+		Source:              "SYSTEM.DBF",
+		Charset:             "GB18030 (UNICODE_FLAG=0)",
+		CharsetSource:       "test",
+		CaseSensitive:       false,
+		CaseSensitiveSource: "SYSTEM.DBF page 4 + 0x2C",
+		HasCaseSensitive:    true,
+		Users:               []dm.DictionaryUser{{ID: 1, Name: "HR_TEST"}},
 	}); err != nil {
 		t.Fatalf("WriteDictionaryFiles failed: %v", err)
 	}
@@ -188,6 +252,9 @@ func TestInteractiveLoadDictionaryUpdatesAutoCharset(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "charset    = gb18030") {
 		t.Fatalf("load dictionary should update charset, got %q", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "case_effective= 0 (SYSTEM.DBF page 4 + 0x2C)") {
+		t.Fatalf("load dictionary should resolve case_sensitive=auto, got %q", stdout.String())
 	}
 }
 
@@ -312,6 +379,269 @@ func TestInteractiveUnloadDatabaseSQLAutoLoadsDictionary(t *testing.T) {
 	})
 }
 
+func TestInteractiveUnloadObjectExportsOwnerDictionary(t *testing.T) {
+	cwd, outDir := setupUnloadDatabaseFixture(t)
+	runInDir(t, cwd, func() {
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+		input := "set output_dir " + outDir + ";\nunload object APP;\nexit;\n"
+		if err := RunInteractive(strings.NewReader(input), &stdout, &stderr); err != nil {
+			t.Fatalf("RunInteractive returned error: %v", err)
+		}
+		output := stdout.String()
+		for _, want := range []string{
+			"object ddl output:",
+			"APP_objects.sql",
+			"users exported: 1",
+			"tables exported: 2",
+			"views exported: 1",
+			"sequences exported: 1",
+			"routines exported: 1",
+			"triggers exported: 1",
+		} {
+			if !strings.Contains(output, want) {
+				t.Fatalf("interactive output should contain %q, got %q", want, output)
+			}
+		}
+		ddl := readTestFile(t, filepath.Join(outDir, "APP_objects.sql"))
+		for _, want := range []string{
+			"CREATE USER APP",
+			"CREATE TABLE APP.WITH_ROWS",
+			"CREATE TABLE APP.EMPTY_TABLE",
+			"CREATE SEQUENCE APP.SEQ_WITH_ROWS",
+			"CREATE OR REPLACE FUNCTION APP.F_WITH_ROWS",
+			"CREATE OR REPLACE VIEW APP.V_WITH_ROWS",
+			"CREATE OR REPLACE TRIGGER APP.TRG_WITH_ROWS",
+		} {
+			if !strings.Contains(ddl, want) {
+				t.Fatalf("APP_objects.sql should contain %q, got %q", want, ddl)
+			}
+		}
+		if _, err := os.Stat(filepath.Join(outDir, "APP_data.sql")); !os.IsNotExist(err) {
+			t.Fatalf("unload object must not create data output, stat err=%v", err)
+		}
+	})
+}
+
+func TestInteractiveUnloadObjectKeepsUserWithoutTables(t *testing.T) {
+	cwd, outDir := setupUnloadDatabaseFixture(t)
+	runInDir(t, cwd, func() {
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+		input := "set output_dir " + outDir + ";\nunload object NO_TABLE;\nexit;\n"
+		if err := RunInteractive(strings.NewReader(input), &stdout, &stderr); err != nil {
+			t.Fatalf("RunInteractive returned error: %v", err)
+		}
+		output := stdout.String()
+		for _, want := range []string{"NO_TABLE_objects.sql", "users exported: 1", "tables exported: 0"} {
+			if !strings.Contains(output, want) {
+				t.Fatalf("interactive output should contain %q, got %q", want, output)
+			}
+		}
+		ddl := readTestFile(t, filepath.Join(outDir, "NO_TABLE_objects.sql"))
+		if !strings.Contains(ddl, "CREATE USER NO_TABLE") {
+			t.Fatalf("owner without tables must still be created, got %q", ddl)
+		}
+		if strings.Contains(ddl, "CREATE TABLE") {
+			t.Fatalf("owner without tables must not acquire another owner's table DDL, got %q", ddl)
+		}
+	})
+}
+
+func TestInteractiveUnloadUserSQLExportsPerTableFiles(t *testing.T) {
+	cwd, outDir := setupUnloadDatabaseFixture(t)
+	runInDir(t, cwd, func() {
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+		input := "set output_dir " + outDir + ";\nunload user APP;\nexit;\n"
+		if err := RunInteractive(strings.NewReader(input), &stdout, &stderr); err != nil {
+			t.Fatalf("RunInteractive returned error: %v", err)
+		}
+		output := stdout.String()
+		for _, want := range []string{
+			"table: APP.WITH_ROWS",
+			"APP_WITH_ROWS_ddl.sql",
+			"APP_WITH_ROWS_data.sql",
+			"table: APP.EMPTY_TABLE",
+			"APP_EMPTY_TABLE_ddl.sql",
+			"APP_EMPTY_TABLE_data.sql",
+			"tables exported: 2",
+			"ddl files exported: 2",
+			"data files exported: 2",
+			"rows exported: 1",
+			"rows failed: 0",
+		} {
+			if !strings.Contains(output, want) {
+				t.Fatalf("interactive output should contain %q, got %q", want, output)
+			}
+		}
+
+		withRowsDDL := readTestFile(t, filepath.Join(outDir, "APP_WITH_ROWS_ddl.sql"))
+		for _, want := range []string{
+			"CREATE TABLE APP.WITH_ROWS",
+			"CREATE OR REPLACE TRIGGER APP.TRG_WITH_ROWS",
+			"GRANT SELECT ON APP.WITH_ROWS TO NO_TABLE;",
+		} {
+			if !strings.Contains(withRowsDDL, want) {
+				t.Fatalf("per-table DDL should contain %q, got %q", want, withRowsDDL)
+			}
+		}
+		for _, unwanted := range []string{
+			"CREATE USER APP",
+			"CREATE OR REPLACE VIEW APP.V_WITH_ROWS",
+			"CREATE SEQUENCE APP.SEQ_WITH_ROWS",
+			"CREATE OR REPLACE FUNCTION APP.F_WITH_ROWS",
+			"CREATE OR REPLACE SYNONYM",
+		} {
+			if strings.Contains(withRowsDDL, unwanted) {
+				t.Fatalf("per-table DDL must not contain %q, got %q", unwanted, withRowsDDL)
+			}
+		}
+		data := readTestFile(t, filepath.Join(outDir, "APP_WITH_ROWS_data.sql"))
+		if !strings.Contains(data, "INSERT INTO APP.WITH_ROWS (ID) VALUES (100);") {
+			t.Fatalf("per-table data SQL should contain exported row, got %q", data)
+		}
+		emptyData := readTestFile(t, filepath.Join(outDir, "APP_EMPTY_TABLE_data.sql"))
+		if strings.Contains(emptyData, "INSERT INTO") {
+			t.Fatalf("empty table data SQL must not contain INSERT, got %q", emptyData)
+		}
+		for _, oldName := range []string{"APP_ddl.sql", "APP_data.sql"} {
+			if _, err := os.Stat(filepath.Join(outDir, oldName)); !os.IsNotExist(err) {
+				t.Fatalf("legacy owner-level output %s must not be created, stat err=%v", oldName, err)
+			}
+		}
+	})
+}
+
+func TestInteractiveUnloadUserCSVExportsPerTableAndSkipsEmptyData(t *testing.T) {
+	cwd, outDir := setupUnloadDatabaseFixture(t)
+	runInDir(t, cwd, func() {
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+		input := "set output_dir " + outDir + ";\nset data_format csv;\nunload user APP;\nexit;\n"
+		if err := RunInteractive(strings.NewReader(input), &stdout, &stderr); err != nil {
+			t.Fatalf("RunInteractive returned error: %v", err)
+		}
+		output := stdout.String()
+		for _, want := range []string{
+			"APP_WITH_ROWS_ddl.sql",
+			"APP_WITH_ROWS_data.csv",
+			"APP_EMPTY_TABLE_ddl.sql",
+			"data output: skipped (no rows)",
+			"ddl files exported: 2",
+			"data files exported: 1",
+			"rows exported: 1",
+		} {
+			if !strings.Contains(output, want) {
+				t.Fatalf("interactive output should contain %q, got %q", want, output)
+			}
+		}
+		csvText := readTestFile(t, filepath.Join(outDir, "APP_WITH_ROWS_data.csv"))
+		if strings.TrimSpace(csvText) != "ID\n100" && strings.TrimSpace(csvText) != "ID\r\n100" {
+			t.Fatalf("unexpected csv output %q", csvText)
+		}
+		if _, err := os.Stat(filepath.Join(outDir, "APP_EMPTY_TABLE_data.csv")); !os.IsNotExist(err) {
+			t.Fatalf("empty table CSV should not exist, stat err=%v", err)
+		}
+	})
+}
+
+func TestInteractiveUnloadTableDMPExportsLoadableTableFile(t *testing.T) {
+	cwd, outDir := setupUnloadDatabaseFixture(t)
+	runInDir(t, cwd, func() {
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+		input := "set output_dir " + outDir + ";\nset data_format dmp;\nset case_sensitive 0;\nunload table APP.WITH_ROWS;\nexit;\n"
+		if err := RunInteractive(strings.NewReader(input), &stdout, &stderr); err != nil {
+			t.Fatalf("RunInteractive returned error: %v", err)
+		}
+		output := stdout.String()
+		for _, want := range []string{"APP_WITH_ROWS_ddl.sql", "APP_WITH_ROWS_data.dmp", "rows exported: 1"} {
+			if !strings.Contains(output, want) {
+				t.Fatalf("interactive output should contain %q, got %q", want, output)
+			}
+		}
+		info, err := dm.InspectDMP(filepath.Join(outDir, "APP_WITH_ROWS_data.dmp"))
+		if err != nil {
+			t.Fatalf("InspectDMP failed: %v", err)
+		}
+		if info.CaseSensitive || info.Charset != "UTF-8" || info.PageSize != 8192 || info.ExtentSize != 16 || len(info.Tables) != 1 || info.Tables[0].ObjectID != 1001 || info.Tables[0].RowCount != 1 {
+			t.Fatalf("unexpected table dmp info %+v", info)
+		}
+	})
+}
+
+func TestInteractiveUnloadUserDMPExportsPerTableAndSkipsEmptyData(t *testing.T) {
+	cwd, outDir := setupUnloadDatabaseFixture(t)
+	runInDir(t, cwd, func() {
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+		input := "set output_dir " + outDir + ";\nset data_format dmp;\nunload user APP;\nexit;\n"
+		if err := RunInteractive(strings.NewReader(input), &stdout, &stderr); err != nil {
+			t.Fatalf("RunInteractive returned error: %v", err)
+		}
+		output := stdout.String()
+		for _, want := range []string{"APP_WITH_ROWS_data.dmp", "data output: skipped (no rows)", "data files exported: 1", "rows exported: 1"} {
+			if !strings.Contains(output, want) {
+				t.Fatalf("interactive output should contain %q, got %q", want, output)
+			}
+		}
+		info, err := dm.InspectDMP(filepath.Join(outDir, "APP_WITH_ROWS_data.dmp"))
+		if err != nil {
+			t.Fatalf("InspectDMP failed: %v", err)
+		}
+		if len(info.Tables) != 1 || info.Tables[0].Name != "WITH_ROWS" || info.Tables[0].RowCount != 1 {
+			t.Fatalf("unexpected user dmp info %+v", info.Tables)
+		}
+		if _, err := os.Stat(filepath.Join(outDir, "APP_EMPTY_TABLE_data.dmp")); !os.IsNotExist(err) {
+			t.Fatalf("empty table DMP should not exist, stat err=%v", err)
+		}
+	})
+}
+
+func TestInteractiveUnloadUserAllDirectsToDatabaseCommand(t *testing.T) {
+	cwd, outDir := setupUnloadDatabaseFixture(t)
+	runInDir(t, cwd, func() {
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+		input := "set output_dir " + outDir + ";\nunload user all;\nexit;\n"
+		if err := RunInteractive(strings.NewReader(input), &stdout, &stderr); err != nil {
+			t.Fatalf("RunInteractive returned error: %v", err)
+		}
+		if !strings.Contains(stdout.String(), "unload user all has been removed; use unload database") {
+			t.Fatalf("unexpected output %q", stdout.String())
+		}
+		if _, err := os.Stat(filepath.Join(outDir, "DATABASE_ddl.sql")); !os.IsNotExist(err) {
+			t.Fatalf("unload user all must not start a database export, stat err=%v", err)
+		}
+	})
+}
+
+func TestInteractiveUnloadUserCustomPrefixAppliesPerTable(t *testing.T) {
+	cwd, outDir := setupUnloadDatabaseFixture(t)
+	runInDir(t, cwd, func() {
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+		input := "set output_dir " + outDir + ";\nunload user APP to rescue_app;\nexit;\n"
+		if err := RunInteractive(strings.NewReader(input), &stdout, &stderr); err != nil {
+			t.Fatalf("RunInteractive returned error: %v", err)
+		}
+		for _, name := range []string{
+			"rescue_app_WITH_ROWS_ddl.sql",
+			"rescue_app_WITH_ROWS_data.sql",
+			"rescue_app_EMPTY_TABLE_ddl.sql",
+			"rescue_app_EMPTY_TABLE_data.sql",
+		} {
+			if _, err := os.Stat(filepath.Join(outDir, name)); err != nil {
+				t.Fatalf("custom-prefix output %s should exist: %v", name, err)
+			}
+		}
+		if _, err := os.Stat(filepath.Join(outDir, "APP_WITH_ROWS_ddl.sql")); !os.IsNotExist(err) {
+			t.Fatalf("default prefix must not be used, stat err=%v", err)
+		}
+	})
+}
+
 func TestInteractiveUnloadDatabaseCSVExportsPerTableAndSkipsEmptyTables(t *testing.T) {
 	cwd, outDir := setupUnloadDatabaseFixture(t)
 	runInDir(t, cwd, func() {
@@ -342,6 +672,41 @@ func TestInteractiveUnloadDatabaseCSVExportsPerTableAndSkipsEmptyTables(t *testi
 		}
 		if _, err := os.Stat(filepath.Join(outDir, "DATABASE_APP_EMPTY_TABLE_data.csv")); !os.IsNotExist(err) {
 			t.Fatalf("empty table csv should not exist, stat err=%v", err)
+		}
+	})
+}
+
+func TestInteractiveUnloadDatabaseDMPExportsPerTableAndSkipsEmptyTables(t *testing.T) {
+	cwd, outDir := setupUnloadDatabaseFixture(t)
+	runInDir(t, cwd, func() {
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+		input := "set output_dir " + outDir + ";\nset data_format dmp;\nunload database;\nexit;\n"
+		if err := RunInteractive(strings.NewReader(input), &stdout, &stderr); err != nil {
+			t.Fatalf("RunInteractive returned error: %v", err)
+		}
+		output := stdout.String()
+		for _, want := range []string{
+			"DATABASE_ddl.sql",
+			"dmp output:",
+			"DATABASE_APP_WITH_ROWS_data.dmp",
+			"dmp skipped: APP.EMPTY_TABLE (no rows)",
+			"dmp files exported: 1",
+			"rows exported: 1",
+		} {
+			if !strings.Contains(output, want) {
+				t.Fatalf("interactive output should contain %q, got %q", want, output)
+			}
+		}
+		info, err := dm.InspectDMP(filepath.Join(outDir, "DATABASE_APP_WITH_ROWS_data.dmp"))
+		if err != nil {
+			t.Fatalf("InspectDMP failed: %v", err)
+		}
+		if len(info.Tables) != 1 || info.Tables[0].RowCount != 1 || !info.PayloadMD5Valid || !info.HeaderChecksumValid {
+			t.Fatalf("unexpected database dmp info %+v", info)
+		}
+		if _, err := os.Stat(filepath.Join(outDir, "DATABASE_APP_EMPTY_TABLE_data.dmp")); !os.IsNotExist(err) {
+			t.Fatalf("empty table DMP should not exist, stat err=%v", err)
 		}
 	})
 }
@@ -432,6 +797,19 @@ func TestInteractiveBootstrapPersistsStructuredDiagnostics(t *testing.T) {
 		for _, want := range []string{"[BOOTSTRAP] phase=start", "stage=1 phase=anchor", "phase=complete"} {
 			if !strings.Contains(logText, want) {
 				t.Fatalf("dul.log missing %q: %s", want, logText)
+			}
+		}
+		initText := readTestFile(t, filepath.Join(dir, defaultInitDULPath))
+		for _, want := range []string{
+			"db_name=DAMENG",
+			"instance_name=DMSERVER",
+			"extent_size=16",
+			"page_size=8192",
+			"unicode_flag=1",
+			"case_sensitive_value=0",
+		} {
+			if !strings.Contains(initText, want) {
+				t.Fatalf("init.dul missing %q: %s", want, initText)
 			}
 		}
 	})

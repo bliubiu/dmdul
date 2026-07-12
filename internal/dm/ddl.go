@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -64,14 +65,23 @@ var reservedIdentifierNames = map[string]bool{
 }
 
 type DDLExportOptions struct {
-	SystemPath     string
-	ControlPath    string
-	ControlDULPath string
-	OutputPath     string
-	OwnerFilter    string
-	TableFilter    string
-	Charset        string
-	Dictionary     *DictionaryInfo
+	SystemPath      string
+	ControlPath     string
+	ControlDULPath  string
+	OutputPath      string
+	TableOutputPath func(owner string, table string, tableID uint32) string
+	OwnerFilter     string
+	TableFilter     string
+	Charset         string
+	TablesOnly      bool
+	Dictionary      *DictionaryInfo
+}
+
+type DDLTableOutput struct {
+	TableID    uint32
+	Owner      string
+	Name       string
+	OutputPath string
 }
 
 type DDLExportResult struct {
@@ -99,6 +109,7 @@ type DDLExportResult struct {
 	TriggerCount       int
 	SynonymCount       int
 	TabPrivilegeCount  int
+	TableOutputs       []DDLTableOutput
 }
 
 type ddlLocation struct {
@@ -230,7 +241,7 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 	if opts.SystemPath == "" {
 		return nil, fmt.Errorf("export-ddl requires SYSTEM.DBF path")
 	}
-	if opts.OutputPath == "" {
+	if opts.OutputPath == "" && opts.TableOutputPath == nil {
 		return nil, fmt.Errorf("export-ddl requires output path")
 	}
 
@@ -421,37 +432,59 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 	if scanErr != nil {
 		return nil, scanErr
 	}
-	texts, err := stream.dictionaryTexts(decoder)
-	if err != nil {
-		return nil, err
-	}
-	views := scanDictionaryViews(objects, texts, ownerMatcher)
-	if dictViews, ok := dictionaryViewsForDDL(opts.Dictionary, ownerMatcher); ok {
-		views = dictViews
-	}
-	sequences := scanDictionarySequences(objects, texts, ownerMatcher)
-	if dictSequences, ok := dictionarySequencesForDDL(opts.Dictionary, ownerMatcher); ok {
-		sequences = dictSequences
-	}
-	rawRoutines, err := stream.rawRoutineTexts(decoder)
-	if err != nil {
-		return nil, err
-	}
-	routines := scanDictionaryRoutines(objects, texts, rawRoutines, ownerMatcher)
-	if dictRoutines, ok := dictionaryRoutinesForDDL(opts.Dictionary, ownerMatcher); ok {
-		routines = dictRoutines
-	}
-	rawTriggers, err := stream.rawTriggerTexts(decoder)
-	if err != nil {
-		return nil, err
-	}
-	triggers := scanDictionaryTriggers(objects, texts, rawTriggers, ownerMatcher)
-	if dictTriggers, ok := dictionaryTriggersForDDL(opts.Dictionary, ownerMatcher, tableMatcher); ok {
-		triggers = dictTriggers
-	}
-	synonyms := scanDictionarySynonyms(objects, ownerMatcher)
-	if dictSynonyms, ok := dictionarySynonymsForDDL(opts.Dictionary, ownerMatcher); ok {
-		synonyms = dictSynonyms
+	tableOnlyMode := opts.TablesOnly || opts.TableOutputPath != nil
+	var views []DictionaryView
+	var sequences []DictionarySequence
+	var routines []DictionaryRoutine
+	var triggers []DictionaryTrigger
+	var synonyms []DictionarySynonym
+	if tableOnlyMode {
+		if dictTriggers, ok := dictionaryTriggersForDDL(opts.Dictionary, ownerMatcher, tableMatcher); ok {
+			triggers = dictTriggers
+		} else {
+			texts, textErr := stream.dictionaryTexts(decoder)
+			if textErr != nil {
+				return nil, textErr
+			}
+			rawTriggers, triggerErr := stream.rawTriggerTexts(decoder)
+			if triggerErr != nil {
+				return nil, triggerErr
+			}
+			triggers = scanDictionaryTriggers(objects, texts, rawTriggers, ownerMatcher)
+		}
+	} else {
+		texts, textErr := stream.dictionaryTexts(decoder)
+		if textErr != nil {
+			return nil, textErr
+		}
+		views = scanDictionaryViews(objects, texts, ownerMatcher)
+		if dictViews, ok := dictionaryViewsForDDL(opts.Dictionary, ownerMatcher); ok {
+			views = dictViews
+		}
+		sequences = scanDictionarySequences(objects, texts, ownerMatcher)
+		if dictSequences, ok := dictionarySequencesForDDL(opts.Dictionary, ownerMatcher); ok {
+			sequences = dictSequences
+		}
+		rawRoutines, routineErr := stream.rawRoutineTexts(decoder)
+		if routineErr != nil {
+			return nil, routineErr
+		}
+		routines = scanDictionaryRoutines(objects, texts, rawRoutines, ownerMatcher)
+		if dictRoutines, ok := dictionaryRoutinesForDDL(opts.Dictionary, ownerMatcher); ok {
+			routines = dictRoutines
+		}
+		rawTriggers, triggerErr := stream.rawTriggerTexts(decoder)
+		if triggerErr != nil {
+			return nil, triggerErr
+		}
+		triggers = scanDictionaryTriggers(objects, texts, rawTriggers, ownerMatcher)
+		if dictTriggers, ok := dictionaryTriggersForDDL(opts.Dictionary, ownerMatcher, tableMatcher); ok {
+			triggers = dictTriggers
+		}
+		synonyms = scanDictionarySynonyms(objects, ownerMatcher)
+		if dictSynonyms, ok := dictionarySynonymsForDDL(opts.Dictionary, ownerMatcher); ok {
+			synonyms = dictSynonyms
+		}
 	}
 	tabPrivileges, err := stream.tabPrivileges(objects, users, roles, ownerMatcher, tableMatcher)
 	if err != nil {
@@ -460,10 +493,59 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 	if dictPrivileges, ok := dictionaryTabPrivilegesForDDL(opts.Dictionary, ownerMatcher, tableMatcher); ok {
 		tabPrivileges = dictPrivileges
 	}
+	triggers = filterDDLTriggersByTable(triggers, tableMatcher)
+	tabPrivileges = filterDDLPrivilegesByTable(tabPrivileges, tableMatcher)
 
-	sql := renderDDL(objects, users, roles, roleGrants, tables, columnsByTable, columnsByTableColID, indexObjects, indexes, tableStorage, partitionsByTable, partitionKeysByTable, constraintObjects, constraints, tableComments, columnComments, views, sequences, routines, triggers, synonyms, tabPrivileges, ownerMatcher, tableMatcher, tablespaces)
-	if err := os.WriteFile(opts.OutputPath, []byte(sql), 0644); err != nil {
-		return nil, fmt.Errorf("write ddl output: %w", err)
+	if tableOnlyMode {
+		users = make(map[uint32]dictionaryObject)
+		roles = make(map[uint32]dictionaryObject)
+		roleGrants = nil
+		views = nil
+		sequences = nil
+		routines = nil
+		synonyms = nil
+		tabPrivileges = filterDDLPrivilegesToTables(tabPrivileges, tables, ownerMatcher, tableMatcher)
+	}
+
+	var tableOutputs []DDLTableOutput
+	if opts.TableOutputPath != nil {
+		pathOwners := make(map[string]uint32)
+		for _, tableID := range sortedTableIDs(tables) {
+			table := tables[tableID]
+			if !ownerMatcher.allowed(table.Owner) || !tableMatcher.allowed(table.Owner, table.Name) || len(columnsByTable[tableID]) == 0 {
+				continue
+			}
+			path := strings.TrimSpace(opts.TableOutputPath(table.Owner, table.Name, tableID))
+			if path == "" {
+				return nil, fmt.Errorf("empty ddl output path for %s.%s", table.Owner, table.Name)
+			}
+			pathKey := strings.ToUpper(filepath.Clean(path))
+			if priorID, exists := pathOwners[pathKey]; exists && priorID != tableID {
+				return nil, fmt.Errorf("duplicate ddl output path %s", path)
+			}
+			pathOwners[pathKey] = tableID
+			if dir := filepath.Dir(path); dir != "." && dir != "" {
+				if err := os.MkdirAll(dir, 0755); err != nil {
+					return nil, fmt.Errorf("create ddl output directory: %w", err)
+				}
+			}
+			exactOwnerMatcher := newOwnerMatcher(table.Owner)
+			exactTableMatcher := newTableNameMatcher(table.Owner + "." + table.Name)
+			tableTriggers := filterDDLTriggersByTable(triggers, exactTableMatcher)
+			tablePrivileges := filterDDLPrivilegesByTable(tabPrivileges, exactTableMatcher)
+			sql := renderDDL(objects, nil, nil, nil, tables, columnsByTable, columnsByTableColID, indexObjects, indexes, tableStorage, partitionsByTable, partitionKeysByTable, constraintObjects, constraints, tableComments, columnComments, nil, nil, nil, tableTriggers, nil, tablePrivileges, exactOwnerMatcher, exactTableMatcher, tablespaces)
+			if err := os.WriteFile(path, []byte(sql), 0644); err != nil {
+				return nil, fmt.Errorf("write ddl output for %s.%s: %w", table.Owner, table.Name, err)
+			}
+			tableOutputs = append(tableOutputs, DDLTableOutput{
+				TableID: tableID, Owner: table.Owner, Name: table.Name, OutputPath: path,
+			})
+		}
+	} else {
+		sql := renderDDL(objects, users, roles, roleGrants, tables, columnsByTable, columnsByTableColID, indexObjects, indexes, tableStorage, partitionsByTable, partitionKeysByTable, constraintObjects, constraints, tableComments, columnComments, views, sequences, routines, triggers, synonyms, tabPrivileges, ownerMatcher, tableMatcher, tablespaces)
+		if err := os.WriteFile(opts.OutputPath, []byte(sql), 0644); err != nil {
+			return nil, fmt.Errorf("write ddl output: %w", err)
+		}
 	}
 
 	exportedUsers := exportedUserIDs(users, ownerMatcher)
@@ -493,6 +575,7 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 		TriggerCount:       len(triggers),
 		SynonymCount:       len(synonyms),
 		TabPrivilegeCount:  len(tabPrivileges),
+		TableOutputs:       tableOutputs,
 	}, nil
 }
 
@@ -1263,6 +1346,48 @@ func isBuiltInRoleName(name string) bool {
 	return builtInRoleNames[strings.ToUpper(strings.TrimSpace(name))]
 }
 
+func filterDDLTriggersByTable(triggers []DictionaryTrigger, matcher tableNameMatcher) []DictionaryTrigger {
+	if !matcher.hasRules || matcher.all {
+		return triggers
+	}
+	filtered := make([]DictionaryTrigger, 0, len(triggers))
+	for _, trigger := range triggers {
+		if matcher.allowed(trigger.TableOwner, trigger.TableName) {
+			filtered = append(filtered, trigger)
+		}
+	}
+	return filtered
+}
+
+func filterDDLPrivilegesByTable(privileges []DictionaryTabPrivilege, matcher tableNameMatcher) []DictionaryTabPrivilege {
+	if !matcher.hasRules || matcher.all {
+		return privileges
+	}
+	filtered := make([]DictionaryTabPrivilege, 0, len(privileges))
+	for _, privilege := range privileges {
+		if matcher.allowed(privilege.Owner, privilege.ObjectName) {
+			filtered = append(filtered, privilege)
+		}
+	}
+	return filtered
+}
+
+func filterDDLPrivilegesToTables(privileges []DictionaryTabPrivilege, tables map[uint32]dictionaryObject, ownerMatcher ownerMatcher, tableMatcher tableNameMatcher) []DictionaryTabPrivilege {
+	tableKeys := make(map[string]bool)
+	for _, table := range tables {
+		if ownerMatcher.allowed(table.Owner) && tableMatcher.allowed(table.Owner, table.Name) {
+			tableKeys[qualifiedObjectKey(table.Owner, table.Name)] = true
+		}
+	}
+	filtered := make([]DictionaryTabPrivilege, 0, len(privileges))
+	for _, privilege := range privileges {
+		if tableKeys[qualifiedObjectKey(privilege.Owner, privilege.ObjectName)] {
+			filtered = append(filtered, privilege)
+		}
+	}
+	return filtered
+}
+
 func userDefaultTablespaceName(user dictionaryObject, tablespaces map[uint32]string) string {
 	groupID := uint32(user.Info3 & 0xFFFF)
 	if groupID == 0 {
@@ -1976,13 +2101,15 @@ func formatColumnType(dataType string, length uint32, scale int16) string {
 		"CHAR": true, "CHARACTER": true, "VARCHAR": true, "VARCHAR2": true,
 		"NCHAR": true, "NVARCHAR": true, "NVARCHAR2": true, "VARCHARACTER": true,
 	}
+	binaryTypes := map[string]bool{"BINARY": true, "VARBINARY": true, "LONGVARBINARY": true}
 	noLengthTypes := map[string]bool{
-		"INT": true, "INTEGER": true, "BIGINT": true, "SMALLINT": true, "TINYINT": true,
+		"INT": true, "INTEGER": true, "BIGINT": true, "SMALLINT": true, "TINYINT": true, "BYTE": true,
 		"DATE": true,
 		"TEXT": true, "LONGVARCHAR": true, "CLOB": true, "BLOB": true, "IMAGE": true,
 		"BIT": true, "BOOLEAN": true, "BOOL": true,
 		"REAL": true, "FLOAT": true, "DOUBLE": true, "DOUBLE PRECISION": true,
 		"ROWID": true, "INTERVAL DAY TO SECOND": true,
+		"INTERVAL YEAR TO MONTH": true, "INTERVAL YEAR": true, "INTERVAL MONTH": true,
 	}
 	timePrecisionTypes := map[string]bool{
 		"DATETIME": true, "TIME": true, "TIMESTAMP": true,
@@ -1992,6 +2119,11 @@ func formatColumnType(dataType string, length uint32, scale int16) string {
 	numberTypes := map[string]bool{"NUMBER": true, "NUMERIC": true, "DEC": true, "DECIMAL": true}
 	switch {
 	case charTypes[upper]:
+		if length > 0 {
+			return fmt.Sprintf("%s(%d)", dt, length)
+		}
+		return dt
+	case binaryTypes[upper]:
 		if length > 0 {
 			return fmt.Sprintf("%s(%d)", dt, length)
 		}

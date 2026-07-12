@@ -31,38 +31,41 @@ type BootstrapDiagnostic struct {
 }
 
 type DictionaryInfo struct {
-	SystemPath        string
-	ControlPath       string
-	Source            string
-	DictionaryDir     string
-	ExtentSize        uint32
-	ExtentSizeSource  string
-	PageSize          uint32
-	PageCount         uint32
-	Charset           string
-	CharsetSource     string
-	ObjectCount       int
-	UserCount         int
-	TableCount        int
-	ColumnCount       int
-	ViewCount         int
-	SequenceCount     int
-	RoutineCount      int
-	TriggerCount      int
-	SynonymCount      int
-	TabPrivilegeCount int
-	BootstrapMode     string
-	BootstrapFallback bool
-	Diagnostics       []BootstrapDiagnostic
-	Users             []DictionaryUser
-	Tables            []DictionaryTable
-	Columns           []DictionaryColumn
-	Views             []DictionaryView
-	Sequences         []DictionarySequence
-	Routines          []DictionaryRoutine
-	Triggers          []DictionaryTrigger
-	Synonyms          []DictionarySynonym
-	TabPrivileges     []DictionaryTabPrivilege
+	SystemPath          string
+	ControlPath         string
+	Source              string
+	DictionaryDir       string
+	ExtentSize          uint32
+	ExtentSizeSource    string
+	PageSize            uint32
+	PageCount           uint32
+	Charset             string
+	CharsetSource       string
+	CaseSensitive       bool
+	CaseSensitiveSource string
+	HasCaseSensitive    bool
+	ObjectCount         int
+	UserCount           int
+	TableCount          int
+	ColumnCount         int
+	ViewCount           int
+	SequenceCount       int
+	RoutineCount        int
+	TriggerCount        int
+	SynonymCount        int
+	TabPrivilegeCount   int
+	BootstrapMode       string
+	BootstrapFallback   bool
+	Diagnostics         []BootstrapDiagnostic
+	Users               []DictionaryUser
+	Tables              []DictionaryTable
+	Columns             []DictionaryColumn
+	Views               []DictionaryView
+	Sequences           []DictionarySequence
+	Routines            []DictionaryRoutine
+	Triggers            []DictionaryTrigger
+	Synonyms            []DictionarySynonym
+	TabPrivileges       []DictionaryTabPrivilege
 }
 
 type DictionaryUser struct {
@@ -189,6 +192,11 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 		if preferredCharset == "" || preferredCharset == "auto" {
 			preferredCharset = charset.DecoderName
 		}
+	}
+	caseSensitive, hasCaseSensitive := stream.caseSensitive()
+	caseSensitiveSource := ""
+	if hasCaseSensitive {
+		caseSensitiveSource = "SYSTEM.DBF page 4 + 0x2C"
 	}
 	decoder := textDecoder{preferred: preferredCharset}
 	ownerMatcher := newOwnerMatcher(opts.OwnerFilter)
@@ -448,37 +456,40 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 	}
 
 	return &DictionaryInfo{
-		SystemPath:        opts.SystemPath,
-		ControlPath:       opts.ControlPath,
-		Source:            "SYSTEM.DBF",
-		ExtentSize:        extentSize,
-		ExtentSizeSource:  extentSizeSource,
-		PageSize:          pageSize,
-		PageCount:         pageCount,
-		Charset:           charsetDisplay,
-		CharsetSource:     charsetSource,
-		ObjectCount:       len(objects),
-		UserCount:         len(userList),
-		TableCount:        len(tableList),
-		ColumnCount:       columnCount,
-		ViewCount:         len(viewList),
-		SequenceCount:     len(sequenceList),
-		RoutineCount:      len(routineList),
-		TriggerCount:      len(triggerList),
-		SynonymCount:      len(synonymList),
-		TabPrivilegeCount: len(tabPrivilegeList),
-		BootstrapMode:     bootstrapMode,
-		BootstrapFallback: bootstrapFallback,
-		Diagnostics:       append([]BootstrapDiagnostic(nil), catalog.diagnostics...),
-		Users:             userList,
-		Tables:            tableList,
-		Columns:           columnList,
-		Views:             viewList,
-		Sequences:         sequenceList,
-		Routines:          routineList,
-		Triggers:          triggerList,
-		Synonyms:          synonymList,
-		TabPrivileges:     tabPrivilegeList,
+		SystemPath:          opts.SystemPath,
+		ControlPath:         opts.ControlPath,
+		Source:              "SYSTEM.DBF",
+		ExtentSize:          extentSize,
+		ExtentSizeSource:    extentSizeSource,
+		PageSize:            pageSize,
+		PageCount:           pageCount,
+		Charset:             charsetDisplay,
+		CharsetSource:       charsetSource,
+		CaseSensitive:       caseSensitive,
+		CaseSensitiveSource: caseSensitiveSource,
+		HasCaseSensitive:    hasCaseSensitive,
+		ObjectCount:         len(objects),
+		UserCount:           len(userList),
+		TableCount:          len(tableList),
+		ColumnCount:         columnCount,
+		ViewCount:           len(viewList),
+		SequenceCount:       len(sequenceList),
+		RoutineCount:        len(routineList),
+		TriggerCount:        len(triggerList),
+		SynonymCount:        len(synonymList),
+		TabPrivilegeCount:   len(tabPrivilegeList),
+		BootstrapMode:       bootstrapMode,
+		BootstrapFallback:   bootstrapFallback,
+		Diagnostics:         append([]BootstrapDiagnostic(nil), catalog.diagnostics...),
+		Users:               userList,
+		Tables:              tableList,
+		Columns:             columnList,
+		Views:               viewList,
+		Sequences:           sequenceList,
+		Routines:            routineList,
+		Triggers:            triggerList,
+		Synonyms:            synonymList,
+		TabPrivileges:       tabPrivilegeList,
 	}, nil
 }
 

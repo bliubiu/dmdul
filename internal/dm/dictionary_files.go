@@ -157,37 +157,40 @@ func LoadDictionaryFiles(dir string) (*DictionaryInfo, *DictionaryFilesResult, e
 	}
 	users, tables, columns, views, sequences, routines, triggers, synonyms, tabPrivileges = normalizeDictionaryFromFiles(users, tables, columns, views, sequences, routines, triggers, synonyms, tabPrivileges)
 	dict := &DictionaryInfo{
-		SystemPath:        meta["system_path"],
-		ControlPath:       meta["control_path"],
-		Source:            "dictionary files",
-		DictionaryDir:     dir,
-		ExtentSize:        parseMetaUint32(meta["extent_size"]),
-		ExtentSizeSource:  meta["extent_size_source"],
-		PageSize:          parseMetaUint32(meta["page_size"]),
-		PageCount:         parseMetaUint32(meta["page_count"]),
-		Charset:           meta["charset"],
-		CharsetSource:     meta["charset_source"],
-		ObjectCount:       parseMetaInt(meta["object_count"]),
-		UserCount:         len(users),
-		TableCount:        len(tables),
-		ColumnCount:       len(columns),
-		ViewCount:         len(views),
-		SequenceCount:     len(sequences),
-		RoutineCount:      len(routines),
-		TriggerCount:      len(triggers),
-		SynonymCount:      len(synonyms),
-		TabPrivilegeCount: len(tabPrivileges),
-		BootstrapMode:     meta["bootstrap_mode"],
-		BootstrapFallback: parseBoolField(meta["bootstrap_fallback"]),
-		Users:             users,
-		Tables:            tables,
-		Columns:           columns,
-		Views:             views,
-		Sequences:         sequences,
-		Routines:          routines,
-		Triggers:          triggers,
-		Synonyms:          synonyms,
-		TabPrivileges:     tabPrivileges,
+		SystemPath:          meta["system_path"],
+		ControlPath:         meta["control_path"],
+		Source:              "dictionary files",
+		DictionaryDir:       dir,
+		ExtentSize:          parseMetaUint32(meta["extent_size"]),
+		ExtentSizeSource:    meta["extent_size_source"],
+		PageSize:            parseMetaUint32(meta["page_size"]),
+		PageCount:           parseMetaUint32(meta["page_count"]),
+		Charset:             meta["charset"],
+		CharsetSource:       meta["charset_source"],
+		CaseSensitive:       parseBoolField(meta["case_sensitive"]),
+		CaseSensitiveSource: meta["case_sensitive_source"],
+		HasCaseSensitive:    strings.TrimSpace(meta["case_sensitive"]) != "",
+		ObjectCount:         parseMetaInt(meta["object_count"]),
+		UserCount:           len(users),
+		TableCount:          len(tables),
+		ColumnCount:         len(columns),
+		ViewCount:           len(views),
+		SequenceCount:       len(sequences),
+		RoutineCount:        len(routines),
+		TriggerCount:        len(triggers),
+		SynonymCount:        len(synonyms),
+		TabPrivilegeCount:   len(tabPrivileges),
+		BootstrapMode:       meta["bootstrap_mode"],
+		BootstrapFallback:   parseBoolField(meta["bootstrap_fallback"]),
+		Users:               users,
+		Tables:              tables,
+		Columns:             columns,
+		Views:               views,
+		Sequences:           sequences,
+		Routines:            routines,
+		Triggers:            triggers,
+		Synonyms:            synonyms,
+		TabPrivileges:       tabPrivileges,
 	}
 	result.UserCount = len(users)
 	result.TableCount = len(tables)
@@ -218,6 +221,13 @@ func dictionaryFilesResultForDir(dir string) *DictionaryFilesResult {
 }
 
 func writeDictionaryMeta(path string, dict *DictionaryInfo) error {
+	caseSensitive := ""
+	if dict.HasCaseSensitive {
+		caseSensitive = "0"
+		if dict.CaseSensitive {
+			caseSensitive = "1"
+		}
+	}
 	rows := [][]string{
 		{"format_version", "1"},
 		{"source", dict.Source},
@@ -229,6 +239,8 @@ func writeDictionaryMeta(path string, dict *DictionaryInfo) error {
 		{"page_count", formatUint32Field(dict.PageCount)},
 		{"charset", dict.Charset},
 		{"charset_source", dict.CharsetSource},
+		{"case_sensitive", caseSensitive},
+		{"case_sensitive_source", dict.CaseSensitiveSource},
 		{"bootstrap_mode", dict.BootstrapMode},
 		{"bootstrap_fallback", formatBoolField(dict.BootstrapFallback)},
 		{"object_count", strconv.Itoa(dict.ObjectCount)},

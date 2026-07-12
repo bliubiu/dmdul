@@ -6,6 +6,7 @@ import (
 	"encoding/csv"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	pathpkg "path"
@@ -29,6 +30,7 @@ const (
 	dmLOBPageIDOff         = 0x24
 	dmLOBPagePayloadLenOff = 0x2C
 	dmLOBLocatorSize       = 21
+	maxOpenSplitDataFiles  = 32
 )
 
 type DataExportOptions struct {
@@ -37,11 +39,13 @@ type DataExportOptions struct {
 	ControlDULPath      string
 	DataDir             string
 	OutputPath          string
+	TableOutputPath     func(owner string, table string, tableID uint32) string
 	OwnerFilter         string
 	TableFilter         string
 	ExcludeTables       string
 	Charset             string
 	OutputFormat        string
+	DMPCaseSensitive    *bool
 	MaxRows             int
 	WriteFailedComments bool
 	RecoveryMode        bool
@@ -65,7 +69,16 @@ type DataExportResult struct {
 	TablesWithRows    int
 	TablesWithoutRows int
 	TableRowCounts    []DataTableRowCount
+	TableOutputs      []DataTableOutput
 	OutputFormat      string
+	TimeFractionLoss  int
+}
+
+type DataTableOutput struct {
+	TableID    uint32
+	Owner      string
+	Name       string
+	OutputPath string
 }
 
 type DataTableRowCount struct {
@@ -126,6 +139,14 @@ type dmNumber string
 type dmBinary []byte
 type dmRowID string
 
+type dmLOBValue struct {
+	reader  *dmLOBReader
+	locator dmLOBLocator
+	kind    uint32
+	text    bool
+	decoder textDecoder
+}
+
 type dmLOBReader struct {
 	cache *dataFilePageCache
 }
@@ -138,6 +159,21 @@ type dmLOBLocator struct {
 	firstPage uint32
 }
 
+type dmLOBChainReader struct {
+	owner       *dmLOBReader
+	locator     dmLOBLocator
+	kind        uint32
+	current     dataPageRef
+	hasCurrent  bool
+	remaining   uint64
+	payload     []byte
+	payloadPos  int
+	seen        map[dataPageRef]bool
+	steps       int
+	maxSteps    int
+	terminalErr error
+}
+
 type dataRowRenderMeta struct {
 	partial       bool
 	prefixKey     string
@@ -147,18 +183,439 @@ type dataRowRenderMeta struct {
 }
 
 type pendingPartialDataRow struct {
-	tableID uint32
-	line    string
-	record  []string
-	stats   *DataTableRowCount
-	meta    dataRowRenderMeta
+	tableID          uint32
+	line             string
+	record           []string
+	fields           []DMPField
+	timeFractionLoss bool
+	stats            *DataTableRowCount
+	meta             dataRowRenderMeta
+}
+
+type dataOutputFile struct {
+	path      string
+	file      *os.File
+	writer    *bufio.Writer
+	csvWriter *csv.Writer
+	dmpWriter *DMPDataWriter
+}
+
+type dataDMPOutputConfig struct {
+	charset       dmpCharsetHeader
+	extentSize    uint32
+	pageSize      uint32
+	caseSensitive *bool
+}
+
+type dataOutputRouter struct {
+	format           string
+	split            bool
+	mainPath         string
+	mainTable        dataTableInfo
+	main             *dataOutputFile
+	pathsByTable     map[uint32]string
+	filesByTable     map[uint32]*dataOutputFile
+	initializedByID  map[uint32]bool
+	lastUsedByID     map[uint32]uint64
+	useClock         uint64
+	tableOutputsByID map[uint32]DataTableOutput
+	dmpConfig        dataDMPOutputConfig
+	dmpWritersByID   map[uint32]*DMPDataWriter
+}
+
+func newDataOutputRouter(opts DataExportOptions, outputFormat string, selectedTables map[uint32]dataTableInfo, dmpConfigs ...dataDMPOutputConfig) (*dataOutputRouter, error) {
+	router := &dataOutputRouter{
+		format:           outputFormat,
+		split:            opts.TableOutputPath != nil,
+		mainPath:         opts.OutputPath,
+		pathsByTable:     make(map[uint32]string),
+		filesByTable:     make(map[uint32]*dataOutputFile),
+		initializedByID:  make(map[uint32]bool),
+		lastUsedByID:     make(map[uint32]uint64),
+		tableOutputsByID: make(map[uint32]DataTableOutput),
+		dmpWritersByID:   make(map[uint32]*DMPDataWriter),
+	}
+	if len(dmpConfigs) > 0 {
+		router.dmpConfig = dmpConfigs[0]
+	}
+
+	if !router.split {
+		if table, ok := singleSelectedDataTable(selectedTables); ok {
+			router.mainTable = table
+		}
+		if outputFormat == "csv" || outputFormat == "dmp" {
+			_ = os.Remove(opts.OutputPath)
+			return router, nil
+		}
+		file, err := openDataOutputFile(opts.OutputPath, outputFormat, router.mainTable)
+		if err != nil {
+			return nil, err
+		}
+		router.main = file
+		return router, nil
+	}
+
+	pathOwners := make(map[string]uint32)
+	for _, tableID := range sortedDataTableIDs(selectedTables) {
+		table := selectedTables[tableID]
+		path := strings.TrimSpace(opts.TableOutputPath(table.table.Owner, table.table.Name, tableID))
+		if path == "" {
+			return nil, fmt.Errorf("empty data output path for %s.%s", table.table.Owner, table.table.Name)
+		}
+		pathKey := strings.ToUpper(filepath.Clean(path))
+		if priorID, exists := pathOwners[pathKey]; exists && priorID != tableID {
+			return nil, fmt.Errorf("duplicate data output path %s", path)
+		}
+		pathOwners[pathKey] = tableID
+		router.pathsByTable[tableID] = path
+		if outputFormat == "csv" || outputFormat == "dmp" {
+			_ = os.Remove(path)
+			continue
+		}
+		file, err := openDataOutputFile(path, outputFormat, table)
+		if err != nil {
+			_ = router.close()
+			return nil, err
+		}
+		if err := closeDataOutputFile(file); err != nil {
+			_ = router.close()
+			return nil, err
+		}
+		router.initializedByID[tableID] = true
+		router.tableOutputsByID[tableID] = DataTableOutput{
+			TableID: tableID, Owner: table.table.Owner, Name: table.table.Name, OutputPath: path,
+		}
+	}
+	return router, nil
+}
+
+func sortedDataTableIDs(tables map[uint32]dataTableInfo) []uint32 {
+	ids := make([]uint32, 0, len(tables))
+	for id := range tables {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool {
+		left, right := tables[ids[i]].table, tables[ids[j]].table
+		if left.Owner != right.Owner {
+			return left.Owner < right.Owner
+		}
+		if left.Name != right.Name {
+			return left.Name < right.Name
+		}
+		return ids[i] < ids[j]
+	})
+	return ids
+}
+
+func openDataOutputFile(path string, outputFormat string, table dataTableInfo) (*dataOutputFile, error) {
+	if dir := filepath.Dir(path); dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return nil, fmt.Errorf("create data output directory: %w", err)
+		}
+	}
+	out, err := os.Create(path)
+	if err != nil {
+		return nil, fmt.Errorf("create data output: %w", err)
+	}
+	target := &dataOutputFile{path: path, file: out, writer: bufio.NewWriter(out)}
+	if outputFormat == "csv" {
+		target.csvWriter = csv.NewWriter(target.writer)
+		if err := target.csvWriter.Write(csvHeaderForDataTable(table)); err != nil {
+			_ = out.Close()
+			return nil, fmt.Errorf("write csv header: %w", err)
+		}
+		return target, nil
+	}
+	fmt.Fprintln(target.writer, "-- Generated by dmdul export-data. Review before running.")
+	fmt.Fprintln(target.writer, "-- Current decoder targets ordinary in-row heap/cluster/IOT rows.")
+	fmt.Fprintln(target.writer)
+	return target, nil
+}
+
+func openExistingDataOutputFile(path string, outputFormat string) (*dataOutputFile, error) {
+	out, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("open data output for append: %w", err)
+	}
+	target := &dataOutputFile{path: path, file: out, writer: bufio.NewWriter(out)}
+	if outputFormat == "csv" {
+		target.csvWriter = csv.NewWriter(target.writer)
+	}
+	return target, nil
+}
+
+func (r *dataOutputRouter) targetForTable(table dataTableInfo) (*dataOutputFile, error) {
+	if r.format == "dmp" {
+		return r.dmpTargetForTable(table)
+	}
+	if !r.split {
+		if r.main != nil {
+			return r.main, nil
+		}
+		file, err := openDataOutputFile(r.mainPath, r.format, r.mainTable)
+		if err != nil {
+			return nil, err
+		}
+		r.main = file
+		return file, nil
+	}
+	if file := r.filesByTable[table.table.ID]; file != nil {
+		r.touch(table.table.ID)
+		return file, nil
+	}
+	if len(r.filesByTable) >= maxOpenSplitDataFiles {
+		if err := r.evictLeastRecentlyUsed(); err != nil {
+			return nil, err
+		}
+	}
+	path := r.pathsByTable[table.table.ID]
+	var file *dataOutputFile
+	var err error
+	if r.initializedByID[table.table.ID] {
+		file, err = openExistingDataOutputFile(path, r.format)
+	} else {
+		file, err = openDataOutputFile(path, r.format, table)
+	}
+	if err != nil {
+		return nil, err
+	}
+	r.filesByTable[table.table.ID] = file
+	r.initializedByID[table.table.ID] = true
+	r.touch(table.table.ID)
+	r.tableOutputsByID[table.table.ID] = DataTableOutput{
+		TableID: table.table.ID, Owner: table.table.Owner, Name: table.table.Name, OutputPath: path,
+	}
+	return file, nil
+}
+
+func (r *dataOutputRouter) dmpTargetForTable(table dataTableInfo) (*dataOutputFile, error) {
+	if !r.split {
+		if r.main != nil {
+			return r.main, nil
+		}
+		file, err := r.newDMPOutputFile(r.mainPath, table)
+		if err != nil {
+			return nil, err
+		}
+		r.main = file
+		return file, nil
+	}
+	if file := r.filesByTable[table.table.ID]; file != nil {
+		r.touch(table.table.ID)
+		return file, nil
+	}
+	if len(r.filesByTable) >= maxOpenSplitDataFiles {
+		if err := r.evictLeastRecentlyUsed(); err != nil {
+			return nil, err
+		}
+	}
+	path := r.pathsByTable[table.table.ID]
+	writer := r.dmpWritersByID[table.table.ID]
+	if writer == nil {
+		file, err := r.newDMPOutputFile(path, table)
+		if err != nil {
+			return nil, err
+		}
+		writer = file.dmpWriter
+	} else if err := writer.resume(); err != nil {
+		return nil, err
+	}
+	file := &dataOutputFile{path: path, dmpWriter: writer}
+	r.filesByTable[table.table.ID] = file
+	r.touch(table.table.ID)
+	return file, nil
+}
+
+func (r *dataOutputRouter) newDMPOutputFile(path string, table dataTableInfo) (*dataOutputFile, error) {
+	writer, err := NewDMPDataWriter(DMPDataOptions{
+		OutputPath:    path,
+		Charset:       r.dmpConfig.charset.Name,
+		ExtentSize:    r.dmpConfig.extentSize,
+		PageSize:      r.dmpConfig.pageSize,
+		CaseSensitive: r.dmpConfig.caseSensitive,
+		Schema:        table.table.Owner,
+		Table:         table.table.Name,
+		TableID:       table.table.ID,
+		ColumnCount:   uint16(len(table.columns)),
+	})
+	if err != nil {
+		return nil, err
+	}
+	if r.split {
+		r.dmpWritersByID[table.table.ID] = writer
+	}
+	r.initializedByID[table.table.ID] = true
+	r.tableOutputsByID[table.table.ID] = DataTableOutput{
+		TableID: table.table.ID, Owner: table.table.Owner, Name: table.table.Name, OutputPath: path,
+	}
+	return &dataOutputFile{path: path, dmpWriter: writer}, nil
+}
+
+func (r *dataOutputRouter) touch(tableID uint32) {
+	r.useClock++
+	r.lastUsedByID[tableID] = r.useClock
+}
+
+func (r *dataOutputRouter) evictLeastRecentlyUsed() error {
+	var oldestID uint32
+	var oldestUse uint64
+	found := false
+	for tableID := range r.filesByTable {
+		used := r.lastUsedByID[tableID]
+		if !found || used < oldestUse {
+			oldestID = tableID
+			oldestUse = used
+			found = true
+		}
+	}
+	if !found {
+		return nil
+	}
+	if r.format == "dmp" {
+		if err := r.filesByTable[oldestID].dmpWriter.suspend(); err != nil {
+			return err
+		}
+	} else {
+		if err := closeDataOutputFile(r.filesByTable[oldestID]); err != nil {
+			return err
+		}
+	}
+	delete(r.filesByTable, oldestID)
+	delete(r.lastUsedByID, oldestID)
+	return nil
+}
+
+func (r *dataOutputRouter) writeRow(table dataTableInfo, line string, record []string, dmpRows ...[]DMPField) error {
+	target, err := r.targetForTable(table)
+	if err != nil {
+		return err
+	}
+	if r.format == "csv" {
+		if err := target.csvWriter.Write(record); err != nil {
+			return fmt.Errorf("write csv row: %w", err)
+		}
+		return nil
+	}
+	if r.format == "dmp" {
+		if len(dmpRows) != 1 {
+			return fmt.Errorf("missing dmp fields for %s.%s", table.table.Owner, table.table.Name)
+		}
+		if err := target.dmpWriter.WriteRow(dmpRows[0]); err != nil {
+			_ = target.dmpWriter.Abort()
+			return fmt.Errorf("write dmp row: %w", err)
+		}
+		return nil
+	}
+	if _, err := fmt.Fprintln(target.writer, line); err != nil {
+		return fmt.Errorf("write sql row: %w", err)
+	}
+	return nil
+}
+
+func (r *dataOutputRouter) writeFailure(table dataTableInfo, message string) error {
+	if r.format == "csv" || r.format == "dmp" {
+		return nil
+	}
+	target, err := r.targetForTable(table)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintln(target.writer, message); err != nil {
+		return fmt.Errorf("write failed-row comment: %w", err)
+	}
+	return nil
+}
+
+func (r *dataOutputRouter) tableOutputs() []DataTableOutput {
+	outputs := make([]DataTableOutput, 0, len(r.tableOutputsByID))
+	for _, output := range r.tableOutputsByID {
+		outputs = append(outputs, output)
+	}
+	sort.Slice(outputs, func(i, j int) bool {
+		if outputs[i].Owner != outputs[j].Owner {
+			return outputs[i].Owner < outputs[j].Owner
+		}
+		if outputs[i].Name != outputs[j].Name {
+			return outputs[i].Name < outputs[j].Name
+		}
+		return outputs[i].TableID < outputs[j].TableID
+	})
+	return outputs
+}
+
+func (r *dataOutputRouter) close() error {
+	var firstErr error
+	if r.format == "dmp" {
+		if r.split {
+			for _, tableID := range sortedDMPWriterIDs(r.dmpWritersByID) {
+				if _, err := r.dmpWritersByID[tableID].Close(); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
+		} else if r.main != nil && r.main.dmpWriter != nil {
+			if _, err := r.main.dmpWriter.Close(); err != nil {
+				firstErr = err
+			}
+		}
+		return firstErr
+	}
+	if r.split {
+		for _, tableID := range sortedDataOutputFileIDs(r.filesByTable) {
+			if err := closeDataOutputFile(r.filesByTable[tableID]); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+	} else {
+		if err := closeDataOutputFile(r.main); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func sortedDMPWriterIDs(writers map[uint32]*DMPDataWriter) []uint32 {
+	ids := make([]uint32, 0, len(writers))
+	for id := range writers {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
+}
+
+func closeDataOutputFile(target *dataOutputFile) error {
+	if target == nil {
+		return nil
+	}
+	var firstErr error
+	if target.csvWriter != nil {
+		target.csvWriter.Flush()
+		if err := target.csvWriter.Error(); err != nil {
+			firstErr = err
+		}
+	}
+	if err := target.writer.Flush(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := target.file.Close(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	return firstErr
+}
+
+func sortedDataOutputFileIDs(files map[uint32]*dataOutputFile) []uint32 {
+	ids := make([]uint32, 0, len(files))
+	for id := range files {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
 }
 
 func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 	if opts.SystemPath == "" {
 		return nil, fmt.Errorf("export-data requires SYSTEM.DBF path")
 	}
-	if opts.OutputPath == "" {
+	if opts.OutputPath == "" && opts.TableOutputPath == nil {
 		return nil, fmt.Errorf("export-data requires output path")
 	}
 
@@ -194,6 +651,21 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 	outputFormat := normalizeDataOutputFormat(opts.OutputFormat)
 	if outputFormat == "" {
 		return nil, fmt.Errorf("unsupported data output format %q", opts.OutputFormat)
+	}
+	dmpConfig := dataDMPOutputConfig{}
+	if outputFormat == "dmp" {
+		dmpCharset, err := dmpCharsetForDataExport(preferredCharset)
+		if err != nil {
+			return nil, err
+		}
+		caseSensitive := opts.DMPCaseSensitive
+		if caseSensitive == nil {
+			caseSensitive = detectDMPCaseSensitive(opts.SystemPath, dataDir, pageSize)
+		}
+		dmpConfig = dataDMPOutputConfig{
+			charset: dmpCharset, extentSize: stream.extentSize, pageSize: pageSize,
+			caseSensitive: caseSensitive,
+		}
 	}
 	objects, err := stream.dictionaryObjects(decoder)
 	if err != nil {
@@ -338,46 +810,32 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 		DataFileCount:    len(dataFiles),
 	}
 	rowStats := initDataTableRowStats(selectedTables)
-	if outputFormat == "csv" && len(selectedTables) > 1 {
-		return nil, fmt.Errorf("csv export requires exactly one table; selected %d tables", len(selectedTables))
+	if (outputFormat == "csv" || outputFormat == "dmp") && opts.TableOutputPath == nil && len(selectedTables) > 1 {
+		return nil, fmt.Errorf("%s export requires exactly one table or per-table output paths; selected %d tables", outputFormat, len(selectedTables))
 	}
 
-	out, err := os.Create(opts.OutputPath)
+	output, err := newDataOutputRouter(opts, outputFormat, selectedTables, dmpConfig)
 	if err != nil {
-		return nil, fmt.Errorf("create data output: %w", err)
+		return nil, err
 	}
-	writer := bufio.NewWriter(out)
-
-	var csvWriter *csv.Writer
-	var csvTable dataTableInfo
+	outputClosed := false
 	defer func() {
-		if csvWriter != nil {
-			csvWriter.Flush()
-		}
-		_ = writer.Flush()
-		_ = out.Close()
-		if outputFormat == "csv" && result != nil && result.RowsExported == 0 {
-			_ = os.Remove(opts.OutputPath)
-			result.OutputPath = ""
+		if !outputClosed {
+			_ = output.close()
 		}
 	}()
-	if outputFormat == "csv" {
-		csvWriter = csv.NewWriter(writer)
-		if table, ok := singleSelectedDataTable(selectedTables); ok {
-			csvTable = table
-			if err := csvWriter.Write(csvHeaderForDataTable(table)); err != nil {
-				return nil, fmt.Errorf("write csv header: %w", err)
-			}
-		}
-	} else {
-		fmt.Fprintln(writer, "-- Generated by dmdul export-data. Review before running.")
-		fmt.Fprintln(writer, "-- Current decoder targets ordinary in-row heap/cluster/IOT rows.")
-		fmt.Fprintln(writer)
-	}
 
 	if len(assistByID) == 0 || len(dataFiles) == 0 {
 		result.TableRowCounts = finalizeDataTableRowStats(rowStats)
 		result.TablesWithoutRows = len(result.TableRowCounts)
+		result.TableOutputs = output.tableOutputs()
+		if (outputFormat == "csv" || outputFormat == "dmp") && opts.TableOutputPath == nil {
+			result.OutputPath = ""
+		}
+		if err := output.close(); err != nil {
+			return nil, fmt.Errorf("finalize %s data output: %w", outputFormat, err)
+		}
+		outputClosed = true
 		return result, nil
 	}
 
@@ -420,14 +878,16 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 				rowBytes := append([]byte(nil), page[rowStart:rowEnd]...)
 				var line string
 				var record []string
+				var fields []DMPField
 				var meta dataRowRenderMeta
+				var timeFractionLoss bool
 				var err error
-				if outputFormat == "csv" {
-					if info.table.ID != csvTable.table.ID {
-						continue
-					}
+				switch outputFormat {
+				case "csv":
 					record, _, _, meta, err = renderCSVForDataRowWithMeta(info, rowBytes, decoder)
-				} else {
+				case "dmp":
+					fields, _, _, meta, timeFractionLoss, err = renderDMPForDataRowWithMeta(info, rowBytes, decoder, dmpConfig.charset)
+				default:
 					line, _, _, meta, err = renderInsertForDataRowWithMeta(info, rowBytes, decoder)
 				}
 				stats := rowStats[info.table.ID]
@@ -440,32 +900,36 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 						stats.RowsFailed++
 					}
 					if opts.WriteFailedComments {
-						fmt.Fprintf(writer, "-- FAILED %s.%s page=%d slot=%d off=0x%X len=%d: %v\n",
+						message := fmt.Sprintf("-- FAILED %s.%s page=%d slot=%d off=0x%X len=%d: %v",
 							quoteIdent(info.table.Owner), quoteIdent(info.table.Name), pageNo, row.slotNo, row.offset, row.length, err)
+						if writeErr := output.writeFailure(info, message); writeErr != nil {
+							return writeErr
+						}
 					}
 					continue
 				}
 				if meta.partial {
 					pendingPartialRows = append(pendingPartialRows, pendingPartialDataRow{
-						tableID: info.table.ID,
-						line:    line,
-						record:  record,
-						stats:   stats,
-						meta:    meta,
+						tableID:          info.table.ID,
+						line:             line,
+						record:           record,
+						fields:           fields,
+						timeFractionLoss: timeFractionLoss,
+						stats:            stats,
+						meta:             meta,
 					})
 					continue
+				}
+				if timeFractionLoss {
+					result.TimeFractionLoss++
 				}
 				markCoveredRowPrefixes(coveredRowPrefixes, info.table.ID, meta.coverageKeys)
 				result.RowsExported++
 				if stats != nil {
 					stats.RowsExported++
 				}
-				if outputFormat == "csv" {
-					if err := csvWriter.Write(record); err != nil {
-						return fmt.Errorf("write csv row: %w", err)
-					}
-				} else {
-					fmt.Fprintln(writer, line)
+				if err := output.writeRow(info, line, record, fields); err != nil {
+					return err
 				}
 			}
 			if stop {
@@ -486,16 +950,19 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 			continue
 		}
 		markCoveredRowPrefixes(coveredRowPrefixes, pending.tableID, pending.meta.coverageKeys)
+		if pending.timeFractionLoss {
+			result.TimeFractionLoss++
+		}
 		result.RowsExported++
 		if pending.stats != nil {
 			pending.stats.RowsExported++
 		}
-		if outputFormat == "csv" {
-			if err := csvWriter.Write(pending.record); err != nil {
-				return nil, fmt.Errorf("write csv row: %w", err)
-			}
-		} else {
-			fmt.Fprintln(writer, pending.line)
+		info, ok := selectedTables[pending.tableID]
+		if !ok {
+			continue
+		}
+		if err := output.writeRow(info, pending.line, pending.record, pending.fields); err != nil {
+			return nil, err
 		}
 	}
 
@@ -507,6 +974,14 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 			result.TablesWithoutRows++
 		}
 	}
+	result.TableOutputs = output.tableOutputs()
+	if (outputFormat == "csv" || outputFormat == "dmp") && opts.TableOutputPath == nil && result.RowsExported == 0 {
+		result.OutputPath = ""
+	}
+	if err := output.close(); err != nil {
+		return nil, fmt.Errorf("finalize %s data output: %w", outputFormat, err)
+	}
+	outputClosed = true
 	return result, nil
 }
 
@@ -669,7 +1144,7 @@ func selectDataPageCandidate(candidates []dataTableInfo, file dataFileRef, pageN
 			if rowStart < 0 || rowEnd > int(pageSize) || rowEnd > len(page) {
 				continue
 			}
-			if _, _, _, err := renderInsertForDataRow(candidate, page[rowStart:rowEnd], decoder); err == nil {
+			if _, _, _, err := parseDataRowValues(page[rowStart:rowEnd], candidate.columns, decoder, candidate.historicalRows, candidate.lobReader); err == nil {
 				return candidate, true
 			}
 		}
@@ -1356,6 +1831,8 @@ func dataValueSignature(value any) string {
 		return "NULL"
 	case dmBinary:
 		return "BIN:" + hex.EncodeToString(v)
+	case dmLOBValue:
+		return fmt.Sprintf("LOB:%d:%d:%d:%d:%t", v.locator.lobID, v.locator.groupID, v.locator.firstPage, v.locator.byteLen, v.text)
 	default:
 		return fmt.Sprintf("%T:%v", value, value)
 	}
@@ -1393,7 +1870,7 @@ func normalizeDataOutputFormat(value string) string {
 		return "sql"
 	}
 	switch value {
-	case "sql", "csv":
+	case "sql", "csv", "dmp":
 		return value
 	default:
 		return ""
@@ -1504,20 +1981,23 @@ func readOutOfLineDataValue(col columnDef, row []byte, pos int, decoder textDeco
 		return nil, pos, fmt.Errorf("%s: out-of-line locator cannot be resolved without data files", col.Name)
 	}
 	if isBinaryDataType(col.DataType) {
-		payload, err := lobReader.readLOBPayload(locator, dmPageKindLOBData)
+		value, err := lobReader.lazyLOBValue(locator, dmPageKindLOBData, false, decoder)
 		if err != nil {
 			return nil, pos, fmt.Errorf("%s: %w", col.Name, err)
 		}
-		return dmBinary(payload), next, nil
+		return value, next, nil
 	}
 	if isCharacterLOBDataType(col.DataType) {
-		payload, err := lobReader.readTextLOBOrLongRowPayload(locator)
+		if value, err := lobReader.lazyLOBValue(locator, dmPageKindLOBData, true, decoder); err == nil {
+			return value, next, nil
+		}
+		payload, err := lobReader.readLongRowPayload(locator)
 		if err != nil {
 			return nil, pos, fmt.Errorf("%s: %w", col.Name, err)
 		}
-		value, ok := decoder.decode(payload)
-		if !ok || strings.ContainsRune(value, '\uFFFD') || containsBadControl(value) {
-			return nil, pos, fmt.Errorf("%s: cannot decode out-of-line text LOB", col.Name)
+		value, err := decodeLOBTextValue(col.Name, payload, decoder)
+		if err != nil {
+			return nil, pos, err
 		}
 		return value, next, nil
 	}
@@ -1750,7 +2230,7 @@ func isCharacterLOBDataType(dataType string) bool {
 
 func isBinaryDataType(dataType string) bool {
 	switch normalizeDataType(dataType) {
-	case "VARBINARY", "LONGVARBINARY", "BLOB", "IMAGE":
+	case "BINARY", "VARBINARY", "LONGVARBINARY", "BLOB", "IMAGE":
 		return true
 	default:
 		return false
@@ -1776,7 +2256,7 @@ func fixedDataSizeForColumn(col columnDef) int {
 
 func fixedDataSizeForType(dataType string, length uint32) int {
 	switch dataType {
-	case "TINYINT":
+	case "BIT", "BOOL", "BOOLEAN", "BYTE", "TINYINT":
 		return 1
 	case "SMALLINT":
 		return 2
@@ -1805,6 +2285,8 @@ func fixedDataSizeForType(dataType string, length uint32) int {
 		return 10
 	case "INTERVAL DAY TO SECOND":
 		return 24
+	case "INTERVAL YEAR TO MONTH", "INTERVAL YEAR", "INTERVAL MONTH":
+		return 12
 	case "ROWID":
 		return 12
 	default:
@@ -1831,6 +2313,19 @@ func parseFixedDataValue(col columnDef, row []byte, pos int) (any, int, error) {
 		return nil, pos + size, nil
 	}
 	switch dataType {
+	case "BIT", "BOOL", "BOOLEAN":
+		if pos+1 > len(row) {
+			return nil, pos, fmt.Errorf("%s out of range", dataType)
+		}
+		if row[pos] == 0 {
+			return int8(0), pos + 1, nil
+		}
+		return int8(1), pos + 1, nil
+	case "BYTE":
+		if pos+1 > len(row) {
+			return nil, pos, fmt.Errorf("BYTE out of range")
+		}
+		return int8(row[pos]), pos + 1, nil
 	case "TINYINT":
 		if pos+1 > len(row) {
 			return nil, pos, fmt.Errorf("TINYINT out of range")
@@ -1922,11 +2417,16 @@ func parseFixedDataValue(col columnDef, row []byte, pos int) (any, int, error) {
 			return nil, pos, fmt.Errorf("INTERVAL DAY TO SECOND out of range")
 		}
 		return decodeDMIntervalDayToSecond(row[pos : pos+24]), pos + 24, nil
+	case "INTERVAL YEAR TO MONTH", "INTERVAL YEAR", "INTERVAL MONTH":
+		if pos+12 > len(row) {
+			return nil, pos, fmt.Errorf("%s out of range", dataType)
+		}
+		return decodeDMIntervalYearToMonth(row[pos:pos+12], dataType), pos + 12, nil
 	case "ROWID":
 		if pos+12 > len(row) {
 			return nil, pos, fmt.Errorf("ROWID out of range")
 		}
-		return dmRowID(strings.ToUpper(hex.EncodeToString(row[pos : pos+12]))), pos + 12, nil
+		return dmRowID(decodeDMRowID(row[pos : pos+12])), pos + 12, nil
 	default:
 		return nil, pos, fmt.Errorf("unsupported fixed type: %s", dataType)
 	}
@@ -2007,10 +2507,11 @@ func readVariableDataValue(col columnDef, row []byte, pos int, decoder textDecod
 			if lobReader == nil {
 				return nil, pos, fmt.Errorf("%s: out-of-line binary LOB locator cannot be resolved without data files", col.Name)
 			}
-			value, err = lobReader.readLOBPayload(locator, dmPageKindLOBData)
-			if err != nil {
-				return nil, pos, fmt.Errorf("%s: %w", col.Name, err)
+			lazy, lazyErr := lobReader.lazyLOBValue(locator, dmPageKindLOBData, false, decoder)
+			if lazyErr != nil {
+				return nil, pos, fmt.Errorf("%s: %w", col.Name, lazyErr)
 			}
+			return lazy, next, nil
 		}
 		return dmBinary(value), next, nil
 	}
@@ -2044,30 +2545,41 @@ func readVariableDataValue(col columnDef, row []byte, pos int, decoder textDecod
 	return value, next, nil
 }
 
-func readInlineTextLOB(row []byte, pos int, decoder textDecoder, lobReader *dmLOBReader) (string, int, error) {
+func readInlineTextLOB(row []byte, pos int, decoder textDecoder, lobReader *dmLOBReader) (any, int, error) {
 	raw, next, marker, err := readShortDataBytesWithMarker(row, pos)
 	if err != nil {
-		return "", pos, fmt.Errorf("%s", strings.Replace(err.Error(), "raw value", "text LOB", 1))
+		return nil, pos, fmt.Errorf("%s", strings.Replace(err.Error(), "raw value", "text LOB", 1))
 	}
 	if payload, ok := unwrapInlineLOBPayload(raw); ok {
 		raw = payload
 	} else if locator, ok := parseDMLOBLocatorRaw(raw); ok {
 		if lobReader == nil {
-			return "", pos, fmt.Errorf("out-of-line text LOB locator cannot be resolved without data files")
+			return nil, pos, fmt.Errorf("out-of-line text LOB locator cannot be resolved without data files")
 		}
-		raw, err = lobReader.readTextLOBOrLongRowPayload(locator)
+		if value, lazyErr := lobReader.lazyLOBValue(locator, dmPageKindLOBData, true, decoder); lazyErr == nil {
+			return value, next, nil
+		}
+		raw, err = lobReader.readLongRowPayload(locator)
 		if err != nil {
-			return "", pos, err
+			return nil, pos, err
 		}
 	}
 	value, ok := decoder.decode(raw)
 	if !ok {
-		return "", pos, fmt.Errorf("cannot decode text LOB marker=0x%02X pos=%d raw=%s", marker, pos, strings.ToUpper(hex.EncodeToString(raw)))
+		return nil, pos, fmt.Errorf("cannot decode text LOB marker=0x%02X pos=%d raw=%s", marker, pos, strings.ToUpper(hex.EncodeToString(raw)))
 	}
 	if strings.ContainsRune(value, '\uFFFD') || containsBadControl(value) {
-		return "", pos, fmt.Errorf("decoded text LOB contains invalid characters marker=0x%02X pos=%d raw=%s", marker, pos, strings.ToUpper(hex.EncodeToString(raw)))
+		return nil, pos, fmt.Errorf("decoded text LOB contains invalid characters marker=0x%02X pos=%d raw=%s", marker, pos, strings.ToUpper(hex.EncodeToString(raw)))
 	}
 	return value, next, nil
+}
+
+func decodeLOBTextValue(column string, raw []byte, decoder textDecoder) (string, error) {
+	value, ok := decoder.decode(raw)
+	if !ok || strings.ContainsRune(value, '\uFFFD') || containsBadControl(value) {
+		return "", fmt.Errorf("%s: cannot decode out-of-line text LOB", column)
+	}
+	return value, nil
 }
 
 func readShortDataVarchar(row []byte, pos int, decoder textDecoder) (string, int, error) {
@@ -2168,7 +2680,36 @@ func parseDMLOBLocatorRaw(raw []byte) (dmLOBLocator, bool) {
 	return locator, true
 }
 
-func (r *dmLOBReader) readLOBPayload(locator dmLOBLocator, kind uint32) ([]byte, error) {
+func (r *dmLOBReader) lazyLOBValue(locator dmLOBLocator, kind uint32, text bool, decoder textDecoder) (dmLOBValue, error) {
+	if r == nil || r.cache == nil {
+		return dmLOBValue{}, fmt.Errorf("LOB reader is not available")
+	}
+	if _, ok := r.findFirstLOBPage(locator, kind); !ok {
+		return dmLOBValue{}, fmt.Errorf("LOB page not found: lob_id=%d group=%d page=%d kind=0x%X", locator.lobID, locator.groupID, locator.firstPage, kind)
+	}
+	return dmLOBValue{reader: r, locator: locator, kind: kind, text: text, decoder: decoder}, nil
+}
+
+func (v dmLOBValue) open() (io.Reader, error) {
+	if v.reader == nil {
+		return nil, fmt.Errorf("LOB reader is not available")
+	}
+	return v.reader.openLOBPayload(v.locator, v.kind)
+}
+
+func (v dmLOBValue) readAll() ([]byte, error) {
+	reader, err := v.open()
+	if err != nil {
+		return nil, err
+	}
+	raw, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
+func (r *dmLOBReader) openLOBPayload(locator dmLOBLocator, kind uint32) (io.Reader, error) {
 	if r == nil || r.cache == nil {
 		return nil, fmt.Errorf("LOB reader is not available")
 	}
@@ -2176,43 +2717,108 @@ func (r *dmLOBReader) readLOBPayload(locator dmLOBLocator, kind uint32) ([]byte,
 	if !ok {
 		return nil, fmt.Errorf("LOB page not found: lob_id=%d group=%d page=%d kind=0x%X", locator.lobID, locator.groupID, locator.firstPage, kind)
 	}
-	var out []byte
-	current := start
-	seen := make(map[dataPageRef]bool)
 	maxSteps := r.cache.totalPageCount() * maxLeafChainWalkMultiplier
 	if maxSteps <= 0 {
 		maxSteps = 1
 	}
-	for steps := 0; steps < maxSteps && len(out) < int(locator.byteLen); steps++ {
-		if seen[current] {
-			break
-		}
-		seen[current] = true
-		page, ok := r.cache.readPage(current)
-		if !ok || !pageHeaderMatchesRef(page, current) || dataPageKind(page) != kind || lobPageID(page) != locator.lobID {
-			break
-		}
-		payloadLen := int(lobPagePayloadLen(page))
-		if payloadLen < 0 || dmLOBPagePayloadOff+payloadLen > len(page) {
-			return nil, fmt.Errorf("bad LOB payload length %d at page %d", payloadLen, current.pageNo)
-		}
-		out = append(out, page[dmLOBPagePayloadOff:dmLOBPagePayloadOff+payloadLen]...)
-		nextFileID, nextPageNo, ok := readDMPageRef(page, dmPageNextRefOff)
-		if !ok {
-			break
-		}
-		current = dataPageRef{
-			key: dataFileKey{
-				groupID: locator.groupID,
-				fileID:  nextFileID,
-			},
-			pageNo: nextPageNo,
-		}
+	return &dmLOBChainReader{
+		owner: r, locator: locator, kind: kind, current: start, hasCurrent: true,
+		remaining: uint64(locator.byteLen), seen: make(map[dataPageRef]bool), maxSteps: maxSteps,
+	}, nil
+}
+
+func (r *dmLOBChainReader) Read(dst []byte) (int, error) {
+	if len(dst) == 0 {
+		return 0, nil
 	}
-	if len(out) < int(locator.byteLen) {
+	if r.terminalErr != nil {
+		return 0, r.terminalErr
+	}
+	if r.remaining == 0 {
+		return 0, io.EOF
+	}
+	written := 0
+	for written < len(dst) && r.remaining > 0 {
+		if r.payloadPos >= len(r.payload) {
+			if err := r.loadNextPayload(); err != nil {
+				if written > 0 {
+					r.terminalErr = err
+					return written, nil
+				}
+				return 0, err
+			}
+		}
+		available := len(r.payload) - r.payloadPos
+		if available <= 0 {
+			continue
+		}
+		length := len(dst) - written
+		if length > available {
+			length = available
+		}
+		if uint64(length) > r.remaining {
+			length = int(r.remaining)
+		}
+		copy(dst[written:written+length], r.payload[r.payloadPos:r.payloadPos+length])
+		r.payloadPos += length
+		r.remaining -= uint64(length)
+		written += length
+	}
+	if written > 0 {
+		return written, nil
+	}
+	return 0, io.EOF
+}
+
+func (r *dmLOBChainReader) loadNextPayload() error {
+	if !r.hasCurrent || r.steps >= r.maxSteps {
+		return fmt.Errorf("LOB payload incomplete: remaining=%d want=%d", r.remaining, r.locator.byteLen)
+	}
+	if r.seen[r.current] {
+		return fmt.Errorf("LOB page chain cycle at group=%d file=%d page=%d", r.current.key.groupID, r.current.key.fileID, r.current.pageNo)
+	}
+	r.seen[r.current] = true
+	r.steps++
+	page, ok := r.owner.cache.readPage(r.current)
+	if !ok || !pageHeaderMatchesRef(page, r.current) || dataPageKind(page) != r.kind || lobPageID(page) != r.locator.lobID {
+		return fmt.Errorf("invalid LOB page at group=%d file=%d page=%d", r.current.key.groupID, r.current.key.fileID, r.current.pageNo)
+	}
+	payloadLen := int(lobPagePayloadLen(page))
+	if payloadLen < 0 || dmLOBPagePayloadOff+payloadLen > len(page) {
+		return fmt.Errorf("bad LOB payload length %d at page %d", payloadLen, r.current.pageNo)
+	}
+	if uint64(payloadLen) > r.remaining {
+		payloadLen = int(r.remaining)
+	}
+	r.payload = page[dmLOBPagePayloadOff : dmLOBPagePayloadOff+payloadLen]
+	r.payloadPos = 0
+	nextFileID, nextPageNo, hasNext := readDMPageRef(page, dmPageNextRefOff)
+	if hasNext {
+		r.current = dataPageRef{
+			key: dataFileKey{groupID: r.locator.groupID, fileID: nextFileID}, pageNo: nextPageNo,
+		}
+	} else {
+		r.hasCurrent = false
+	}
+	if payloadLen == 0 && !r.hasCurrent && r.remaining > 0 {
+		return fmt.Errorf("LOB payload incomplete: remaining=%d want=%d", r.remaining, r.locator.byteLen)
+	}
+	return nil
+}
+
+func (r *dmLOBReader) readLOBPayload(locator dmLOBLocator, kind uint32) ([]byte, error) {
+	reader, err := r.openLOBPayload(locator, kind)
+	if err != nil {
+		return nil, err
+	}
+	out, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, err
+	}
+	if uint64(len(out)) != uint64(locator.byteLen) {
 		return nil, fmt.Errorf("LOB payload incomplete: got=%d want=%d", len(out), locator.byteLen)
 	}
-	return append([]byte(nil), out[:int(locator.byteLen)]...), nil
+	return out, nil
 }
 
 func (r *dmLOBReader) readTextLOBOrLongRowPayload(locator dmLOBLocator) ([]byte, error) {
@@ -2498,21 +3104,81 @@ func decodeDMIntervalDayToSecond(raw []byte) string {
 	if len(raw) < 20 {
 		return ""
 	}
-	day := int32(binary.LittleEndian.Uint32(raw[0:4]))
-	hour := int32(binary.LittleEndian.Uint32(raw[4:8]))
-	minute := int32(binary.LittleEndian.Uint32(raw[8:12]))
-	second := int32(binary.LittleEndian.Uint32(raw[12:16]))
-	micro := int32(binary.LittleEndian.Uint32(raw[16:20]))
-	return fmt.Sprintf("%d %02d:%02d:%02d.%06d", day, hour, minute, second, micro)
+	values := []int64{
+		int64(int32(binary.LittleEndian.Uint32(raw[0:4]))),
+		int64(int32(binary.LittleEndian.Uint32(raw[4:8]))),
+		int64(int32(binary.LittleEndian.Uint32(raw[8:12]))),
+		int64(int32(binary.LittleEndian.Uint32(raw[12:16]))),
+		int64(int32(binary.LittleEndian.Uint32(raw[16:20]))),
+	}
+	negative := false
+	for i := range values {
+		if values[i] < 0 {
+			negative = true
+			values[i] = -values[i]
+		}
+	}
+	sign := ""
+	if negative {
+		sign = "-"
+	}
+	return fmt.Sprintf("%s%d %02d:%02d:%02d.%06d", sign, values[0], values[1], values[2], values[3], values[4])
+}
+
+func decodeDMIntervalYearToMonth(raw []byte, dataType string) string {
+	if len(raw) < 12 {
+		return ""
+	}
+	year := int64(int32(binary.LittleEndian.Uint32(raw[0:4])))
+	month := int64(int32(binary.LittleEndian.Uint32(raw[4:8])))
+	negative := year < 0 || month < 0
+	if year < 0 {
+		year = -year
+	}
+	if month < 0 {
+		month = -month
+	}
+	sign := ""
+	if negative {
+		sign = "-"
+	}
+	switch normalizeDataType(dataType) {
+	case "INTERVAL YEAR":
+		return fmt.Sprintf("%s%d", sign, year)
+	case "INTERVAL MONTH":
+		return fmt.Sprintf("%s%d", sign, month)
+	default:
+		return fmt.Sprintf("%s%d-%02d", sign, year, month)
+	}
+}
+
+func decodeDMRowID(raw []byte) string {
+	if len(raw) != 12 {
+		return ""
+	}
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	out := make([]byte, 0, 18)
+	for offset := 0; offset < len(raw); offset += 4 {
+		value := binary.BigEndian.Uint32(raw[offset : offset+4])
+		for _, shift := range []uint{30, 24, 18, 12, 6, 0} {
+			out = append(out, alphabet[(value>>shift)&0x3F])
+		}
+	}
+	return string(out)
 }
 
 func sqlValueForDataColumn(col columnDef, value any) (string, error) {
+	var err error
+	value, err = materializeDataValue(value)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", col.Name, err)
+	}
 	if value == nil {
 		return "NULL", nil
 	}
 	typ := normalizeDataType(col.DataType)
 	switch typ {
-	case "TINYINT", "SMALLINT", "INT", "INTEGER", "BIGINT":
+	case "BIT", "BOOL", "BOOLEAN", "BYTE", "TINYINT", "SMALLINT", "INT", "INTEGER", "BIGINT":
 		return fmt.Sprintf("%v", value), nil
 	case "REAL", "FLOAT", "DOUBLE", "DOUBLE PRECISION":
 		return fmt.Sprintf("%v", value), nil
@@ -2534,6 +3200,12 @@ func sqlValueForDataColumn(col columnDef, value any) (string, error) {
 		return "TIME " + sqlLiteral(fmt.Sprintf("%v", value)), nil
 	case "INTERVAL DAY TO SECOND":
 		return "INTERVAL " + sqlLiteral(fmt.Sprintf("%v", value)) + " DAY TO SECOND", nil
+	case "INTERVAL YEAR TO MONTH":
+		return "INTERVAL " + sqlLiteral(fmt.Sprintf("%v", value)) + " YEAR TO MONTH", nil
+	case "INTERVAL YEAR":
+		return "INTERVAL " + sqlLiteral(fmt.Sprintf("%v", value)) + " YEAR", nil
+	case "INTERVAL MONTH":
+		return "INTERVAL " + sqlLiteral(fmt.Sprintf("%v", value)) + " MONTH", nil
 	case "ROWID":
 		return sqlLiteral(fmt.Sprintf("%v", value)), nil
 	default:
@@ -2549,6 +3221,11 @@ func sqlValueForDataColumn(col columnDef, value any) (string, error) {
 }
 
 func csvValueForDataColumn(col columnDef, value any) (string, error) {
+	var err error
+	value, err = materializeDataValue(value)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", col.Name, err)
+	}
 	if value == nil {
 		return "", nil
 	}
@@ -2558,6 +3235,25 @@ func csvValueForDataColumn(col columnDef, value any) (string, error) {
 	text := fmt.Sprintf("%v", value)
 	if strings.ContainsRune(text, '\uFFFD') || containsBadControl(text) {
 		return "", fmt.Errorf("invalid text value for %s", col.Name)
+	}
+	return text, nil
+}
+
+func materializeDataValue(value any) (any, error) {
+	lob, ok := value.(dmLOBValue)
+	if !ok {
+		return value, nil
+	}
+	raw, err := lob.readAll()
+	if err != nil {
+		return nil, err
+	}
+	if !lob.text {
+		return dmBinary(raw), nil
+	}
+	text, ok := lob.decoder.decode(raw)
+	if !ok || strings.ContainsRune(text, '\uFFFD') || containsBadControl(text) {
+		return nil, fmt.Errorf("cannot decode out-of-line text LOB")
 	}
 	return text, nil
 }

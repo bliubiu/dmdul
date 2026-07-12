@@ -111,6 +111,10 @@ func (s *systemPageStream) charset() (systemCharset, bool) {
 	return detectSystemCharsetFromFile(s.path, s.pageSize)
 }
 
+func (s *systemPageStream) caseSensitive() (bool, bool) {
+	return detectSystemCaseSensitiveFromFile(s.path, s.pageSize)
+}
+
 func (s *systemPageStream) rawRoutineTexts(decoder textDecoder) (map[string]string, error) {
 	return s.scanRawWindows(decoder, scanRawRoutineTexts)
 }
@@ -178,6 +182,7 @@ func forEachDataFilePage(path string, pageSize uint32, visit func(page []byte, p
 		if n != len(page) {
 			return pageNo, fmt.Errorf("short read %d/%d", n, len(page))
 		}
+		restorePageProtectionBytes(page, pageSize)
 		if err := visit(page, uint32(pageNo)); err != nil {
 			return pageNo + 1, err
 		}

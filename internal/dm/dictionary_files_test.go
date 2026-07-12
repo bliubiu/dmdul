@@ -9,18 +9,21 @@ import (
 func TestWriteAndLoadDictionaryFiles(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), DefaultDictionaryDirName)
 	dict := &DictionaryInfo{
-		SystemPath:        `D:\temp\oldpro\SYSTEM.DBF`,
-		ControlPath:       `D:\temp\oldpro\dm.ctl`,
-		Source:            "SYSTEM.DBF",
-		ExtentSize:        16,
-		ExtentSizeSource:  "u32 @ 0x80",
-		PageSize:          8192,
-		PageCount:         9472,
-		Charset:           "UTF-8",
-		CharsetSource:     "UNICODE_FLAG=1",
-		ObjectCount:       781,
-		BootstrapMode:     "standard-two-stage",
-		BootstrapFallback: true,
+		SystemPath:          `D:\temp\oldpro\SYSTEM.DBF`,
+		ControlPath:         `D:\temp\oldpro\dm.ctl`,
+		Source:              "SYSTEM.DBF",
+		ExtentSize:          16,
+		ExtentSizeSource:    "u32 @ 0x80",
+		PageSize:            8192,
+		PageCount:           9472,
+		Charset:             "UTF-8",
+		CharsetSource:       "UNICODE_FLAG=1",
+		CaseSensitive:       false,
+		CaseSensitiveSource: "SYSTEM.DBF page 4 + 0x2C",
+		HasCaseSensitive:    true,
+		ObjectCount:         781,
+		BootstrapMode:       "standard-two-stage",
+		BootstrapFallback:   true,
 		Users: []DictionaryUser{
 			{ID: 1, Name: "HR_TEST"},
 		},
@@ -75,6 +78,9 @@ func TestWriteAndLoadDictionaryFiles(t *testing.T) {
 	}
 	if loaded.BootstrapMode != "standard-two-stage" || !loaded.BootstrapFallback {
 		t.Fatalf("bootstrap metadata was not preserved: mode=%q fallback=%v", loaded.BootstrapMode, loaded.BootstrapFallback)
+	}
+	if !loaded.HasCaseSensitive || loaded.CaseSensitive || loaded.CaseSensitiveSource != "SYSTEM.DBF page 4 + 0x2C" {
+		t.Fatalf("case-sensitive metadata was not preserved: %+v", loaded)
 	}
 	if loaded.Tables[0].HeaderBlock != 16 || loaded.Tables[0].Bytes != 131072 || loaded.Tables[0].Blocks != 16 || loaded.Tables[0].Extents != 1 {
 		t.Fatalf("segment fields were not preserved: %+v", loaded.Tables[0])

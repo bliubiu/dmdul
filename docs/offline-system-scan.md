@@ -26,6 +26,7 @@ Observed from `SYSTEM.DBF`:
 | Extent size | `0x80` | little-endian `u32` | sample-dependent | Verified as pages per extent in multiple initialized databases |
 | Page size | `0x84` | little-endian `u32` | `8192` | Bytes `00 20 00 00`; old parser succeeds with 8192-byte pages |
 | Page count | `0x8C` | little-endian `u32` | `9472` | `9472 * 8192 = 77594624` |
+| Case-sensitive flag | `4 * page_size + 0x2C` | `u8` | sample-dependent | `0=insensitive`, `1=sensitive`; verified against `dminit` logs and controlled differential instances |
 | Character set flag | `4 * page_size + 0x2D` | `u8` | sample-dependent | `0=GB18030`, `1=UTF-8`, `2=EUC-KR`; matches online `UNICODE()` / `SF_GET_UNICODE_FLAG()` |
 
 Every DBF page also starts with its physical page address:
@@ -65,6 +66,30 @@ Character-set status:
   - `2`: EUC-KR
 - `dm.ini` is not required for DDL extraction. It may not contain initialization
   parameters such as page size, extent size, or character set.
+
+Case-sensitive status:
+
+- The database initialization flag is stored immediately before `UNICODE_FLAG`,
+  at `SYSTEM.DBF` page 4 offset `0x2C`.
+- Six existing samples matched their `dminit` evidence. A controlled pair with
+  identical UTF-8/page/extent settings and only `CASE_SENSITIVE=0/1` changed this
+  byte from `0` to `1`.
+- Raw `V$DM_INI` occurrences in `SYSTEM.DBF` are SQL/source references to the
+  dynamic view, not persisted rows of the runtime view.
+
+Database and instance names:
+
+- `INSTANCE_NAME` can be recovered from live rows in `SYS.SYSOPENHISTORY`.
+  The verified DM8 samples use `SYSINDEXOPENHISTORY` storage/assist id
+  `0x02000093`; DMDUL validates `RGUID`, `SYS_MODE`, `PRIMARY_INST_NAME`, and
+  `CUR_INST_NAME`, then selects the newest valid `OPEN_TIME` record.
+- A database that has never opened may not yet have an open-history row. The
+  fallback order is adjacent `dm.ini`, then the dminit default `DMSERVER`.
+- `DB_NAME` is not present in `V$DM_INI` on the verified build. Open history
+  stores database magic numbers, not the name, and some verified SYSTEM.DBF
+  files contain no byte sequence for their real database name. `dm.ctl` remains
+  the reliable name source; without it DMDUL reports the default `DAMENG` and
+  marks the source as `DM default`.
 
 ## Page And Row Scanning Rule
 
