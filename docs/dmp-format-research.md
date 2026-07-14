@@ -223,6 +223,8 @@ u16 length + bytes                普通字段，length 可为 0
 | INTERVAL YEAR TO MONTH | 规范化 INTERVAL ASCII 文本 |
 | INTERVAL DAY TO SECOND | 规范化 INTERVAL ASCII 文本 |
 | ROWID | ROWID 显示值的 ASCII 文本 |
+| BFILE | `directory:file` 字符串 |
+| JSON/JSONB | `0xFFFE + uint64 length + JSON 文本` |
 | CLOB | `0xFFFE + uint64 length + 字符数据` |
 | BLOB | `0xFFFE + uint64 length + 原始二进制` |
 
@@ -234,7 +236,12 @@ u16 length + bytes                普通字段，length 可为 0
 - 10 字节“时分秒 + 小数秒”可以导入，但后 4 字节被忽略。
 
 因此当前 DM 构建的 DMP 通道无法无损保存 TIME 小数秒。DMP 导出必须记录明确告警，
-不能假装已经完整恢复。BFILE、复杂类型、自定义类型和集合类型尚未形成编码结论。
+不能假装已经完整恢复。BFILE 和 JSON/JSONB 已完成编码及官方回灌验证；自定义类型
+和集合类型尚未形成编码结论。
+
+JSON/JSONB 还有一个官方快速装载限制。dmdul DMP 与同表官方 `dexp` DMP 的 JSON
+字段字节完全一致，但二者使用 `FAST_LOAD=Y` 导入后都会出现 `JSON value syntax error`；
+改为 `FAST_LOAD=N` 后，15 个 JSONB 标量、数组、对象及嵌套样本均可正常查询。
 
 DM 默认模式下空字符串会成为 SQL NULL；本次样例中空 VARCHAR 的 DMP 字段也是
 `0xFFFD`，不是长度 0。写入器仍保留长度 0 与 NULL 两种格式，以兼容其他模式或类型。
@@ -379,7 +386,7 @@ HR_TEST_EMP_INFO_data.dmp
 恢复顺序：
 
 1. 执行 DDL，创建用户、表、约束和必要对象；
-2. 对每张表执行 `dimp DATA_ONLY=Y FAST_LOAD=Y`；
+2. 对普通表执行 `dimp DATA_ONLY=Y FAST_LOAD=Y`；JSON/JSONB 表使用 `FAST_LOAD=N`；
 3. 数据装载完成后创建或重建二级索引、外键和触发器；
 4. 做行数、MD5 和抽样内容校验。
 
@@ -387,7 +394,7 @@ HR_TEST_EMP_INFO_data.dmp
 
 仍需继续研究和验证：
 
-- 补齐 BFILE、复杂类型、自定义类型和集合类型编码矩阵；
+- 补齐自定义类型和集合类型编码矩阵；
 - 原生多文件 footer、压缩和加密 DMP；
 - 单个 21 字节 locator 的长度字段是 32 位；超过该范围的其他 LOB locator 形态尚未确认；
 - 迁移行、链式行和部分恢复行的列值策略；
@@ -395,7 +402,8 @@ HR_TEST_EMP_INFO_data.dmp
 - 导入失败时的错误定位和逐表重试清单。
 
 建议先在隔离测试库执行 `dimp CTRL_INFO=4` 校验，再使用 `DATA_ONLY=Y FAST_LOAD=Y`
-装载。跨字符集恢复必须按目标字符集重新生成 DMP，不能只修改文件头标记。
+装载；JSON/JSONB 使用 `FAST_LOAD=N`。跨字符集恢复必须按目标字符集重新生成 DMP，
+不能只修改文件头标记。
 `case_sensitive=auto` 从 `SYSTEM.DBF` 第 4 页偏移 `0x2C` 读取建库标志，并写入
 DMP 头 `0x435`。该对应关系已通过 6 个已有实例及一组“同字符集、仅
 CASE_SENSITIVE 不同”的差分实例验证。只有控制页损坏或无法识别时，才需要通过

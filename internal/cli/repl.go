@@ -159,7 +159,7 @@ func printInteractiveHelp(stdout io.Writer) {
 	fmt.Fprintln(stdout, "  set data_dir <DBF directory>;")
 	fmt.Fprintln(stdout, "  set control <dm.ctl path>;")
 	fmt.Fprintln(stdout, "  set output_dir <directory>;")
-	fmt.Fprintln(stdout, "      Output SQL directory. Defaults to data_dir when set, otherwise current directory.")
+	fmt.Fprintln(stdout, "      Unload/recovery output directory. Defaults to <data_dir>/output or ./output.")
 	fmt.Fprintln(stdout, "  set data_format sql|csv|dmp;")
 	fmt.Fprintln(stdout, "  set case_sensitive auto|0|1;")
 	fmt.Fprintln(stdout, "  set charset auto|utf-8|gb18030|gbk|euc-kr;")
@@ -1175,6 +1175,10 @@ func (s *interactiveSession) effectiveOutputDir() string {
 	if s.outputDirSet {
 		return defaultIfBlank(s.outputDir, ".")
 	}
+	return filepath.Join(s.effectiveWorkDir(), defaultOutputDirName)
+}
+
+func (s *interactiveSession) effectiveWorkDir() string {
 	if s.dataDirSet && strings.TrimSpace(s.dataDir) != "" {
 		return s.dataDir
 	}
@@ -1182,18 +1186,15 @@ func (s *interactiveSession) effectiveOutputDir() string {
 }
 
 func (s *interactiveSession) effectiveControlDULPath() string {
-	return filepath.Join(s.effectiveOutputDir(), defaultControlDULPath)
+	return filepath.Join(s.effectiveWorkDir(), defaultControlDULPath)
 }
 
 func (s *interactiveSession) effectiveDictionaryDir() string {
-	return filepath.Join(s.effectiveOutputDir(), dm.DefaultDictionaryDirName)
+	return filepath.Join(s.effectiveWorkDir(), dm.DefaultDictionaryDirName)
 }
 
 func (s *interactiveSession) effectiveInitDULPath() string {
-	if s.dataDirSet && strings.TrimSpace(s.dataDir) != "" {
-		return filepath.Join(s.dataDir, defaultInitDULPath)
-	}
-	return defaultInitDULPath
+	return filepath.Join(s.effectiveWorkDir(), defaultInitDULPath)
 }
 
 func (s *interactiveSession) effectiveLogPath() string {
@@ -1201,9 +1202,9 @@ func (s *interactiveSession) effectiveLogPath() string {
 		if filepath.IsAbs(s.logPath) {
 			return s.logPath
 		}
-		return filepath.Join(s.effectiveOutputDir(), s.logPath)
+		return filepath.Join(s.effectiveWorkDir(), s.logPath)
 	}
-	return filepath.Join(s.effectiveOutputDir(), "dul.log")
+	return filepath.Join(s.effectiveWorkDir(), "dul.log")
 }
 
 func (s *interactiveSession) ensureOutputDir() error {

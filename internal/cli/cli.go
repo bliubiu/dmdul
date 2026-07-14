@@ -38,6 +38,7 @@ const (
 	defaultSystemPath     = "SYSTEM.DBF"
 	defaultControlDULPath = "control.dul"
 	defaultInitDULPath    = "init.dul"
+	defaultOutputDirName  = "output"
 )
 
 var removedFunctionalCommands = map[string]bool{

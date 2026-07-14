@@ -17,7 +17,7 @@ DMDUL 交互式模式会自动生成 `init.dul` 参数文件。未设置 `data_d
 # effective_control_dul=D:\temp\oldpro\control.dul
 # effective_dict_dir=D:\temp\oldpro\dmdul_dict
 # effective_init_dul=D:\temp\oldpro\init.dul
-# effective_output_dir=D:\temp\oldpro
+# effective_output_dir=D:\temp\oldpro\output
 # effective_log=D:\temp\oldpro\dul.log
 # init_load=D:\temp\oldpro\init.dul
 # dictionary=not loaded
@@ -52,11 +52,11 @@ log=
 | `system` | `SYSTEM.DBF` | 达梦系统表空间文件路径。 |
 | `control` | 自动查找 `SYSTEM.DBF` 同目录下的 `dm.ctl` | 可选控制文件路径。 |
 | `data_dir` | `SYSTEM.DBF` 所在目录 | 用户表空间 DBF 文件所在目录。 |
-| `output_dir` | 未设置时：如果设置过 `data_dir` 则使用 `data_dir`，否则使用当前目录 | DDL、数据文件、`control.dul` 和 `dul.log` 的输出目录。 |
+| `output_dir` | 未设置时为 `<data_dir>/output`；没有 `data_dir` 时为 `./output` | `unload` / `recover` 生成的 DDL、SQL、CSV 和 DMP 目录。显式设置时直接使用指定目录。 |
 | `data_format` | `sql` | 数据导出格式，支持 `sql`、`csv` 和 `dmp`。DMP 按表生成纯数据文件。 |
 | `case_sensitive` | `auto` | DMP 文件头的建库大小写敏感标志。`auto` 优先读取 `SYSTEM.DBF` 第 4 页偏移 `0x2C`；也可显式设为 `0` 或 `1`。 |
 | `charset` | `auto` | 字典和数据文本解码字符集。 |
-| `log` | `dul.log`，目录规则同 `output_dir` | 交互式执行日志。 |
+| `log` | 工作目录下的 `dul.log` | 交互式执行日志；工作目录为 `data_dir`，未设置时为当前目录。 |
 
 `bootstrap;` 还会识别并持久化以下数据库参数：
 
@@ -86,6 +86,23 @@ DMDUL 使用实际值。
 
 `control_dul`、`init_dul`、`dict_dir`、`output_dir` 和 `log` 的实际路径也会写入注释，
 便于和 `show parameter;` 的输出对应。空值表示继续使用自动默认规则。
+
+默认目录结构如下。`output` 只保存卸载和残留恢复结果，避免大量表文件与 DBF、字典和
+日志混在一起：
+
+```text
+<data_dir>/
+├── init.dul
+├── control.dul
+├── dul.log
+├── dmdul_dict/
+└── output/
+    ├── <owner>_<table>_ddl.sql
+    └── <owner>_<table>_data.{sql|csv|dmp}
+```
+
+`set output_dir D:\recovery\result;` 只覆盖 `output/` 的默认位置，不会移动
+`init.dul`、`control.dul`、`dul.log` 或 `dmdul_dict`。相对的 `log` 路径仍以工作目录为基准。
 
 `dul.log` 中每条命令和错误记录都会带本地时间戳，格式为
 `YYYY-MM-DD HH:MM:SS`，方便回看操作时间。
@@ -184,9 +201,8 @@ datafile 5 0 TBS_BIN_TEST D:\temp\oldpro\TBS_BIN_TEST01.DBF
 
 ## dmdul_dict
 
-`dmdul_dict` 是 `bootstrap;` 生成的文本字典目录，默认目录规则同 `output_dir`：
-未设置 `data_dir` 时在当前目录，设置 `data_dir` 后在 `data_dir` 下，显式设置
-`output_dir` 时在 `output_dir` 下。
+`dmdul_dict` 是 `bootstrap;` 生成的文本字典目录。未设置 `data_dir` 时位于当前目录，
+设置 `data_dir` 后位于 `data_dir` 下。`output_dir` 只控制卸载结果，不改变字典目录。
 
 当前文件如下：
 
@@ -264,9 +280,11 @@ v0.1.6 开始，`bootstrap` 会尝试通过 DBF 页头和 assist id 自动推断
 - `init.dul`
 - `control.dul`
 - `dmdul_dict/`
+- `output/`
 - `dul.log`
 - `*.csv`
 - `*.sql`
+- `*.dmp`
 - `oldpro/`
 - `windowdameng/`
 - `bin/`

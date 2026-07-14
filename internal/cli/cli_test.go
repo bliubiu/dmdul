@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -68,20 +69,49 @@ func TestRunInteractiveHelpAndExit(t *testing.T) {
 	}
 }
 
-func TestInteractiveOutputDirDefaultsToDataDirWhenSet(t *testing.T) {
+func TestInteractiveOutputDirDefaultsToDedicatedSubdirectory(t *testing.T) {
 	session := newInteractiveSession()
-	if got := session.outputPath("HR_TEST_data.sql"); got != "HR_TEST_data.sql" {
+	if got := session.outputPath("HR_TEST_data.sql"); got != filepath.Join("output", "HR_TEST_data.sql") {
 		t.Fatalf("default outputPath = %q", got)
 	}
 	session.dataDir = `D:\temp\oldpro`
 	session.dataDirSet = true
-	if got := session.outputPath("HR_TEST_data.sql"); got != `D:\temp\oldpro\HR_TEST_data.sql` {
+	if got := session.outputPath("HR_TEST_data.sql"); got != `D:\temp\oldpro\output\HR_TEST_data.sql` {
 		t.Fatalf("data_dir outputPath = %q", got)
+	}
+	if got := session.effectiveControlDULPath(); got != `D:\temp\oldpro\control.dul` {
+		t.Fatalf("control.dul path = %q", got)
+	}
+	if got := session.effectiveDictionaryDir(); got != `D:\temp\oldpro\dmdul_dict` {
+		t.Fatalf("dictionary path = %q", got)
+	}
+	if got := session.effectiveLogPath(); got != `D:\temp\oldpro\dul.log` {
+		t.Fatalf("log path = %q", got)
 	}
 	session.outputDir = `D:\out`
 	session.outputDirSet = true
 	if got := session.outputPath("HR_TEST_data.sql"); got != `D:\out\HR_TEST_data.sql` {
 		t.Fatalf("explicit output_dir outputPath = %q", got)
+	}
+	if got := session.effectiveDictionaryDir(); got != `D:\temp\oldpro\dmdul_dict` {
+		t.Fatalf("output_dir must not move dictionary path, got %q", got)
+	}
+}
+
+func TestInteractiveEnsureOutputDirCreatesDedicatedSubdirectory(t *testing.T) {
+	dataDir := t.TempDir()
+	session := newInteractiveSession()
+	session.dataDir = dataDir
+	session.dataDirSet = true
+	if err := session.ensureOutputDir(); err != nil {
+		t.Fatalf("ensureOutputDir failed: %v", err)
+	}
+	info, err := os.Stat(filepath.Join(dataDir, defaultOutputDirName))
+	if err != nil {
+		t.Fatalf("output directory was not created: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("output path is not a directory")
 	}
 }
 
@@ -318,7 +348,7 @@ func TestInteractiveListUserShowsObjectCounts(t *testing.T) {
 }
 
 func TestInteractiveUnloadDatabaseSQLAutoLoadsDictionary(t *testing.T) {
-	cwd, outDir := setupUnloadDatabaseFixture(t)
+	cwd, _, outDir := setupUnloadDatabaseFixture(t)
 	runInDir(t, cwd, func() {
 		var stdout bytes.Buffer
 		var stderr bytes.Buffer
@@ -379,8 +409,32 @@ func TestInteractiveUnloadDatabaseSQLAutoLoadsDictionary(t *testing.T) {
 	})
 }
 
+func TestInteractiveUnloadUserUsesDefaultOutputSubdirectory(t *testing.T) {
+	cwd, dataDir, _ := setupUnloadDatabaseFixture(t)
+	runInDir(t, cwd, func() {
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+		input := "unload user APP;\nexit;\n"
+		if err := RunInteractive(strings.NewReader(input), &stdout, &stderr); err != nil {
+			t.Fatalf("RunInteractive returned error: %v", err)
+		}
+		outputDir := filepath.Join(dataDir, defaultOutputDirName)
+		for _, name := range []string{"APP_WITH_ROWS_ddl.sql", "APP_WITH_ROWS_data.sql"} {
+			if _, err := os.Stat(filepath.Join(outputDir, name)); err != nil {
+				t.Fatalf("default output %s should exist: %v", name, err)
+			}
+			if _, err := os.Stat(filepath.Join(dataDir, name)); !os.IsNotExist(err) {
+				t.Fatalf("default output %s must not clutter data_dir, stat err=%v", name, err)
+			}
+		}
+		if !strings.Contains(stdout.String(), "output dir: "+outputDir) {
+			t.Fatalf("interactive output should report dedicated directory, got %q", stdout.String())
+		}
+	})
+}
+
 func TestInteractiveUnloadObjectExportsOwnerDictionary(t *testing.T) {
-	cwd, outDir := setupUnloadDatabaseFixture(t)
+	cwd, _, outDir := setupUnloadDatabaseFixture(t)
 	runInDir(t, cwd, func() {
 		var stdout bytes.Buffer
 		var stderr bytes.Buffer
@@ -424,7 +478,7 @@ func TestInteractiveUnloadObjectExportsOwnerDictionary(t *testing.T) {
 }
 
 func TestInteractiveUnloadObjectKeepsUserWithoutTables(t *testing.T) {
-	cwd, outDir := setupUnloadDatabaseFixture(t)
+	cwd, _, outDir := setupUnloadDatabaseFixture(t)
 	runInDir(t, cwd, func() {
 		var stdout bytes.Buffer
 		var stderr bytes.Buffer
@@ -449,7 +503,7 @@ func TestInteractiveUnloadObjectKeepsUserWithoutTables(t *testing.T) {
 }
 
 func TestInteractiveUnloadUserSQLExportsPerTableFiles(t *testing.T) {
-	cwd, outDir := setupUnloadDatabaseFixture(t)
+	cwd, _, outDir := setupUnloadDatabaseFixture(t)
 	runInDir(t, cwd, func() {
 		var stdout bytes.Buffer
 		var stderr bytes.Buffer
@@ -514,7 +568,7 @@ func TestInteractiveUnloadUserSQLExportsPerTableFiles(t *testing.T) {
 }
 
 func TestInteractiveUnloadUserCSVExportsPerTableAndSkipsEmptyData(t *testing.T) {
-	cwd, outDir := setupUnloadDatabaseFixture(t)
+	cwd, _, outDir := setupUnloadDatabaseFixture(t)
 	runInDir(t, cwd, func() {
 		var stdout bytes.Buffer
 		var stderr bytes.Buffer
@@ -547,7 +601,7 @@ func TestInteractiveUnloadUserCSVExportsPerTableAndSkipsEmptyData(t *testing.T) 
 }
 
 func TestInteractiveUnloadTableDMPExportsLoadableTableFile(t *testing.T) {
-	cwd, outDir := setupUnloadDatabaseFixture(t)
+	cwd, _, outDir := setupUnloadDatabaseFixture(t)
 	runInDir(t, cwd, func() {
 		var stdout bytes.Buffer
 		var stderr bytes.Buffer
@@ -572,7 +626,7 @@ func TestInteractiveUnloadTableDMPExportsLoadableTableFile(t *testing.T) {
 }
 
 func TestInteractiveUnloadUserDMPExportsPerTableAndSkipsEmptyData(t *testing.T) {
-	cwd, outDir := setupUnloadDatabaseFixture(t)
+	cwd, _, outDir := setupUnloadDatabaseFixture(t)
 	runInDir(t, cwd, func() {
 		var stdout bytes.Buffer
 		var stderr bytes.Buffer
@@ -600,7 +654,7 @@ func TestInteractiveUnloadUserDMPExportsPerTableAndSkipsEmptyData(t *testing.T) 
 }
 
 func TestInteractiveUnloadUserAllDirectsToDatabaseCommand(t *testing.T) {
-	cwd, outDir := setupUnloadDatabaseFixture(t)
+	cwd, _, outDir := setupUnloadDatabaseFixture(t)
 	runInDir(t, cwd, func() {
 		var stdout bytes.Buffer
 		var stderr bytes.Buffer
@@ -618,7 +672,7 @@ func TestInteractiveUnloadUserAllDirectsToDatabaseCommand(t *testing.T) {
 }
 
 func TestInteractiveUnloadUserCustomPrefixAppliesPerTable(t *testing.T) {
-	cwd, outDir := setupUnloadDatabaseFixture(t)
+	cwd, _, outDir := setupUnloadDatabaseFixture(t)
 	runInDir(t, cwd, func() {
 		var stdout bytes.Buffer
 		var stderr bytes.Buffer
@@ -643,7 +697,7 @@ func TestInteractiveUnloadUserCustomPrefixAppliesPerTable(t *testing.T) {
 }
 
 func TestInteractiveUnloadDatabaseCSVExportsPerTableAndSkipsEmptyTables(t *testing.T) {
-	cwd, outDir := setupUnloadDatabaseFixture(t)
+	cwd, _, outDir := setupUnloadDatabaseFixture(t)
 	runInDir(t, cwd, func() {
 		var stdout bytes.Buffer
 		var stderr bytes.Buffer
@@ -677,7 +731,7 @@ func TestInteractiveUnloadDatabaseCSVExportsPerTableAndSkipsEmptyTables(t *testi
 }
 
 func TestInteractiveUnloadDatabaseDMPExportsPerTableAndSkipsEmptyTables(t *testing.T) {
-	cwd, outDir := setupUnloadDatabaseFixture(t)
+	cwd, _, outDir := setupUnloadDatabaseFixture(t)
 	runInDir(t, cwd, func() {
 		var stdout bytes.Buffer
 		var stderr bytes.Buffer
@@ -712,7 +766,7 @@ func TestInteractiveUnloadDatabaseDMPExportsPerTableAndSkipsEmptyTables(t *testi
 }
 
 func TestInteractiveUnloadDatabaseCustomPrefix(t *testing.T) {
-	cwd, outDir := setupUnloadDatabaseFixture(t)
+	cwd, _, outDir := setupUnloadDatabaseFixture(t)
 	runInDir(t, cwd, func() {
 		var stdout bytes.Buffer
 		var stderr bytes.Buffer
@@ -834,7 +888,7 @@ func TestBootstrapFileDiagnosticIgnoresRecreatedTempHeader(t *testing.T) {
 	}
 }
 
-func setupUnloadDatabaseFixture(t *testing.T) (string, string) {
+func setupUnloadDatabaseFixture(t *testing.T) (string, string, string) {
 	t.Helper()
 	cwd := t.TempDir()
 	dataDir := t.TempDir()
@@ -843,7 +897,7 @@ func setupUnloadDatabaseFixture(t *testing.T) (string, string) {
 	mainPath := filepath.Join(dataDir, "MAIN.DBF")
 	writeMinimalSystemDBF(t, systemPath)
 	writeMinimalMainDBFWithOneIntRow(t, mainPath, 1001, 100)
-	_, err := dm.WriteDictionaryFiles(filepath.Join(outDir, dm.DefaultDictionaryDirName), &dm.DictionaryInfo{
+	_, err := dm.WriteDictionaryFiles(filepath.Join(dataDir, dm.DefaultDictionaryDirName), &dm.DictionaryInfo{
 		SystemPath:       systemPath,
 		Source:           "SYSTEM.DBF",
 		ExtentSize:       16,
@@ -889,7 +943,11 @@ func setupUnloadDatabaseFixture(t *testing.T) (string, string) {
 	if err != nil {
 		t.Fatalf("WriteDictionaryFiles failed: %v", err)
 	}
-	return cwd, outDir
+	initContent := fmt.Sprintf("system=%s\ndata_dir=%s\ncharset=utf-8\n", systemPath, dataDir)
+	if err := os.WriteFile(filepath.Join(cwd, defaultInitDULPath), []byte(initContent), 0644); err != nil {
+		t.Fatalf("WriteFile init.dul failed: %v", err)
+	}
+	return cwd, dataDir, outDir
 }
 
 func writeMinimalSystemDBF(t *testing.T, path string) {

@@ -7,5 +7,5 @@
 7. 必要时修正 users.tsv/tables.tsv/columns.tsv
 8. load dictionary
 9. unload database
-10. 审核 DATABASE_ddl.sql 和 DATABASE_data.sql
+10. 审核 output/DATABASE_ddl.sql 和 output/DATABASE_data.sql
 11. 导入测试库校验

@@ -510,15 +510,16 @@ func readDictionaryColumns(path string) ([]DictionaryColumn, error) {
 		if len(rec) < 10 || rec[0] == "table_id" {
 			continue
 		}
+		scale := int16(parseIntField(rec[7]))
 		columns = append(columns, DictionaryColumn{
 			TableID:    parseUint32Field(rec[0]),
 			TableOwner: rec[1],
 			TableName:  rec[2],
 			ColID:      uint16(parseUint32Field(rec[3])),
 			Name:       rec[4],
-			DataType:   rec[5],
+			DataType:   normalizeCatalogColumnType(rec[5], scale),
 			Length:     parseUint32Field(rec[6]),
-			Scale:      int16(parseIntField(rec[7])),
+			Scale:      scale,
 			Nullable:   rec[8],
 			Default:    rec[9],
 		})

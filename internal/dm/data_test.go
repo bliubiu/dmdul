@@ -113,6 +113,8 @@ func TestLocateRowsInDataPage(t *testing.T) {
 	putTestRow(page, pos, 5, 0x00)
 	pos += 5
 	putTestRow(page, pos, 4, 0x01)
+	page[pos] = 0xFF
+	page[pos+1] = 0xFF
 	pos += 4
 	putTestRow(page, pos, 6, 0x00)
 	pos += 6
@@ -218,6 +220,98 @@ func TestDecodeDMTime(t *testing.T) {
 	}
 	if got != "15:56:05.123456" {
 		t.Fatalf("decodeDMTime = %q", got)
+	}
+}
+
+func TestDecodeDMNanosecondTimestamp(t *testing.T) {
+	raw := make([]byte, 9)
+	date := uint32(2026) | uint32(7)<<15 | uint32(13)<<19
+	raw[0] = byte(date)
+	raw[1] = byte(date >> 8)
+	raw[2] = byte(date >> 16)
+	timeBits := uint64(12) | uint64(34)<<5 | uint64(56)<<11 | uint64(123456000)<<17
+	for i := 0; i < 6; i++ {
+		raw[3+i] = byte(timeBits >> (8 * i))
+	}
+	got, err := decodeDMDateTimeWithPrecision(raw, 9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "2026-07-13 12:34:56.123456000" {
+		t.Fatalf("nanosecond timestamp = %q", got)
+	}
+}
+
+func TestDecodeAllDMIntervalQualifiers(t *testing.T) {
+	yearMonth := func(year, month int32) []byte {
+		raw := make([]byte, 12)
+		binary.LittleEndian.PutUint32(raw[0:4], uint32(year))
+		binary.LittleEndian.PutUint32(raw[4:8], uint32(month))
+		binary.LittleEndian.PutUint16(raw[8:10], uint16(4<<4))
+		return raw
+	}
+	dayTime := func(day, hour, minute, second, microsecond int32) []byte {
+		raw := make([]byte, 24)
+		for i, value := range []int32{day, hour, minute, second, microsecond} {
+			binary.LittleEndian.PutUint32(raw[i*4:i*4+4], uint32(value))
+		}
+		binary.LittleEndian.PutUint16(raw[20:22], uint16(4<<4|6))
+		return raw
+	}
+	tests := []struct {
+		typ  string
+		raw  []byte
+		want string
+	}{
+		{"INTERVAL YEAR", yearMonth(12, 0), "12"},
+		{"INTERVAL MONTH", yearMonth(0, -25), "-25"},
+		{"INTERVAL YEAR TO MONTH", yearMonth(12, 11), "12-11"},
+		{"INTERVAL DAY", dayTime(123, 0, 0, 0, 0), "123"},
+		{"INTERVAL HOUR", dayTime(0, -49, 0, 0, 0), "-49"},
+		{"INTERVAL MINUTE", dayTime(0, 0, 125, 0, 0), "125"},
+		{"INTERVAL SECOND", dayTime(0, 0, 0, -125, -123456), "-125.123456"},
+		{"INTERVAL DAY TO HOUR", dayTime(12, 23, 0, 0, 0), "12 23"},
+		{"INTERVAL DAY TO MINUTE", dayTime(-12, -23, -59, 0, 0), "-12 23:59"},
+		{"INTERVAL DAY TO SECOND", dayTime(12, 23, 59, 58, 123456), "12 23:59:58.123456"},
+		{"INTERVAL HOUR TO MINUTE", dayTime(0, -49, -59, 0, 0), "-49:59"},
+		{"INTERVAL HOUR TO SECOND", dayTime(0, 49, 59, 58, 123456), "49:59:58.123456"},
+		{"INTERVAL MINUTE TO SECOND", dayTime(0, 0, -125, -58, -123456), "-125:58.123456"},
+	}
+	for _, test := range tests {
+		var got string
+		if isYearMonthIntervalDataType(test.typ) {
+			got = decodeDMIntervalYearToMonth(test.raw, test.typ)
+		} else {
+			got = decodeDMIntervalDayToSecond(test.raw, test.typ)
+		}
+		if got != test.want {
+			t.Fatalf("%s = %q, want %q", test.typ, got, test.want)
+		}
+	}
+}
+
+func TestDecodeVerifiedJSONBAtoms(t *testing.T) {
+	tests := []struct {
+		raw  string
+		want string
+	}{
+		{"f1d83401000000c02d29da84000000000100001000000060", "null"},
+		{"f1d83401000000c03e21f2090000000001000010060000203132332e3435", "123.45"},
+		{"f1d83401000000c024a1cb310000000002000040140000900800001001000000000000000200000000000000", "[1,2]"},
+		{"f1d83401000000c0c911cb9800000000030000201d0000b0010000300100003000000040010000300000006061786263", `{"a":"x","b":false,"c":null}`},
+	}
+	for _, test := range tests {
+		raw, err := hex.DecodeString(test.raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := decodeDMJSONB(raw, textDecoder{preferred: "utf-8"})
+		if err != nil {
+			t.Fatalf("decodeDMJSONB(%s): %v", test.raw, err)
+		}
+		if string(got) != test.want {
+			t.Fatalf("decodeDMJSONB(%s) = %q, want %q", test.raw, got, test.want)
+		}
 	}
 }
 
@@ -448,6 +542,8 @@ func TestDecodeDMNumber(t *testing.T) {
 		{raw: []byte{0xC3, 0x03, 0x33}, want: "25000"},
 		{raw: []byte{0xC3, 0x02, 0x51}, want: "18000"},
 		{raw: []byte{0xC2, 0x0D, 0x23}, want: "1234"},
+		{raw: []byte{0x3A, 0x03, 0x19, 0x2F, 0x45, 0x5B, 0x24, 0x3A, 0x50, 0x66}, want: "-9876543210.654321"},
+		{raw: []byte{0x41, 0x64, 0x66}, want: "-0.000001"},
 		{raw: []byte{0x80}, want: "0"},
 	}
 	for _, tt := range tests {
@@ -563,6 +659,7 @@ func TestDecodeAdditionalFixedScalarTypes(t *testing.T) {
 	}{
 		{column: columnDef{Name: "B", DataType: "BIT", Nullable: "N"}, raw: []byte{9}, want: "1"},
 		{column: columnDef{Name: "Y", DataType: "BYTE", Nullable: "N"}, raw: []byte{0x88}, want: "-120"},
+		{column: columnDef{Name: "BF", DataType: "BINARY_FLOAT", Nullable: "N"}, raw: []byte{0x00, 0x00, 0xA0, 0x3F}, want: "1.25"},
 		{column: columnDef{Name: "I", DataType: "INTERVAL YEAR TO MONTH", Nullable: "N"}, raw: intervalYM, want: "12-11"},
 		{column: columnDef{Name: "R", DataType: "ROWID", Nullable: "N"}, raw: rowIDRaw, want: "AAAAAAAAAAAAAAAAAB"},
 	}
@@ -574,6 +671,68 @@ func TestDecodeAdditionalFixedScalarTypes(t *testing.T) {
 		if next != len(test.raw) || fmt.Sprintf("%v", value) != test.want {
 			t.Fatalf("parseFixedDataValue(%s) = %v next=%d, want %s next=%d", test.column.DataType, value, next, test.want, len(test.raw))
 		}
+	}
+}
+
+func TestDecodeVerifiedROWIDLayout(t *testing.T) {
+	tests := []struct {
+		raw  string
+		want string
+	}{
+		{raw: "000000000000000000000001", want: "AAAAAAAAAAAAAAAAAB"},
+		{raw: "000100000002000000000032", want: "AAABAAAAACAAAAAAAy"},
+		{raw: "ffff0000fffeffffffffffff", want: "AP//AAAP/+////////"},
+		{raw: "00050000303900003ade68b1", want: "AAAFAAADA5AAA63mix"},
+		{raw: "010000000101000100000001", want: "AAEAAAAAEBAAEAAAAB"},
+	}
+	for _, test := range tests {
+		raw, err := hex.DecodeString(test.raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := decodeDMRowID(raw); got != test.want {
+			t.Fatalf("decodeDMRowID(%s) = %q, want %q", test.raw, got, test.want)
+		}
+	}
+}
+
+func TestBinaryIsFixedWidthAndDoesNotShiftFollowingValues(t *testing.T) {
+	col := columnDef{Name: "B", DataType: "BINARY", Length: 8, Nullable: "N"}
+	if isVariableDataType(col.DataType) {
+		t.Fatal("BINARY must use fixed-width row storage")
+	}
+	if got := fixedDataSizeForColumn(col); got != 8 {
+		t.Fatalf("fixed BINARY size = %d, want 8", got)
+	}
+	raw := []byte{0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x83, 0xAA, 0xBB, 0xCC}
+	value, next, err := parseFixedDataValue(col, raw, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next != 8 || hex.EncodeToString(value.(dmBinary)) != "0011223344556677" {
+		t.Fatalf("fixed BINARY value=%x next=%d", value, next)
+	}
+	value, end, err := readVariableDataValue(columnDef{Name: "V", DataType: "VARBINARY"}, raw, next, textDecoder{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if end != len(raw) || hex.EncodeToString(value.(dmBinary)) != "aabbcc" {
+		t.Fatalf("following VARBINARY value=%x end=%d", value, end)
+	}
+}
+
+func TestRAWUsesVariableBinaryStorage(t *testing.T) {
+	if !isBinaryDataType("RAW") || !isVariableBinaryDataType("RAW") {
+		t.Fatal("RAW must use VARBINARY-compatible row storage")
+	}
+	raw := []byte{0x83, 0x00, 0xFF, 0x10}
+	value, end, err := readVariableDataValue(columnDef{Name: "R", DataType: "RAW"}, raw, 0, textDecoder{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := value.(dmBinary)
+	if !ok || !bytes.Equal(got, []byte{0x00, 0xFF, 0x10}) || end != len(raw) {
+		t.Fatalf("RAW value=%x end=%d", value, end)
 	}
 }
 
@@ -832,6 +991,7 @@ func TestSelectDataPageCandidateSkipsLooseHistoricalRowLeaf(t *testing.T) {
 		t.Fatal("loose historical candidate should not be selected on ordinary row/index leaf page")
 	}
 
+	candidate.recoveryMode = true
 	putTestDMPageHeader(page, 4, 0, 592, dmPageKindRowOverflow, 33555536)
 	_, ok = selectDataPageCandidate(
 		[]dataTableInfo{candidate},
@@ -843,7 +1003,7 @@ func TestSelectDataPageCandidateSkipsLooseHistoricalRowLeaf(t *testing.T) {
 		textDecoder{preferred: "utf-8"},
 	)
 	if !ok {
-		t.Fatal("loose historical candidate should remain available on row overflow/residual page")
+		t.Fatal("row overflow/residual page should be selectable in explicit recovery mode")
 	}
 }
 
@@ -881,6 +1041,7 @@ func TestSelectDataPageCandidateSkipsTableAssistHeaderWhenStorageIsKnown(t *test
 		t.Fatal("tableDataAssist row page should be skipped when dictionary already knows the real data storage")
 	}
 
+	candidate.recoveryMode = true
 	putTestDMPageHeader(page, 4, 0, 592, dmPageKindRowOverflow, 33555536)
 	_, ok = selectDataPageCandidate(
 		[]dataTableInfo{candidate},
@@ -892,7 +1053,7 @@ func TestSelectDataPageCandidateSkipsTableAssistHeaderWhenStorageIsKnown(t *test
 		textDecoder{preferred: "utf-8"},
 	)
 	if !ok {
-		t.Fatal("row overflow/residual page should remain selectable for historical rows")
+		t.Fatal("row overflow/residual page should be selectable in explicit recovery mode")
 	}
 }
 
@@ -1052,6 +1213,35 @@ func TestRenderInsertForInlineLOBRow(t *testing.T) {
 	}
 	if !strings.Contains(sql, "HEXTORAW('48656C6C6F2044614D656E672031')") {
 		t.Fatalf("unexpected BLOB insert sql: %s", sql)
+	}
+}
+
+func TestRenderInsertForAllInlineLOBTypes(t *testing.T) {
+	raw, err := hex.DecodeString("00AE0000010000009301560401000000000006000000544558543F3F93015604020000000000060000004C4F4E473F3F9A0156040300000000000D0000004C4F4E47564152434841523F3F92015604040000000000050000000102030405920156040500000000000500000010203040509301560406000000000006000000FFEEDDCCBBAA9501560407000000000008000000434C4F423F3F3F3F010000000000FFFFFFFF7FFFFFA31002000000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := dataTableInfo{
+		table: dictionaryObject{Owner: "SYSDBA", Name: "DMDUL_T_LOB"},
+		columns: []columnDef{
+			{ColID: 1, Name: "ID", DataType: "INT", Nullable: "N"},
+			{ColID: 2, Name: "C_TEXT", DataType: "TEXT", Nullable: "Y"},
+			{ColID: 3, Name: "C_LONG", DataType: "CLOB", Nullable: "Y"},
+			{ColID: 4, Name: "C_LONGVARCHAR", DataType: "LONGVARCHAR", Nullable: "Y"},
+			{ColID: 5, Name: "C_IMAGE", DataType: "IMAGE", Nullable: "Y"},
+			{ColID: 6, Name: "C_LONGVARBINARY", DataType: "LONGVARBINARY", Nullable: "Y"},
+			{ColID: 7, Name: "C_BLOB", DataType: "BLOB", Nullable: "Y"},
+			{ColID: 8, Name: "C_CLOB", DataType: "CLOB", Nullable: "Y"},
+		},
+	}
+	sql, _, _, err := renderInsertForDataRow(info, raw, textDecoder{preferred: "utf-8"})
+	if err != nil {
+		t.Fatalf("renderInsertForDataRow returned error: %v", err)
+	}
+	for _, want := range []string{"'TEXT??'", "'LONG??'", "'LONGVARCHAR??'", "HEXTORAW('0102030405')", "HEXTORAW('1020304050')", "HEXTORAW('FFEEDDCCBBAA')", "'CLOB????'"} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("insert SQL does not contain %s: %s", want, sql)
+		}
 	}
 }
 

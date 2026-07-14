@@ -2,6 +2,7 @@ package dm
 
 import (
 	"encoding/binary"
+	"strings"
 	"testing"
 )
 
@@ -18,6 +19,11 @@ func TestFormatColumnTypeUsesScaleForNumericAndTimeTypes(t *testing.T) {
 		{name: "plain max precision number", dataType: "NUMBER", length: 38, scale: 0, want: "NUMBER"},
 		{name: "datetime precision", dataType: "datetime", length: 8, scale: 6, want: "datetime(6)"},
 		{name: "varchar length", dataType: "VARCHAR2", length: 50, scale: 0, want: "VARCHAR2(50)"},
+		{name: "national character length", dataType: "NATIONAL CHARACTER", length: 8, scale: 8, want: "NATIONAL CHARACTER(8)"},
+		{name: "national varying length", dataType: "NATIONAL CHARACTER VARYING", length: 20, scale: 7, want: "NATIONAL CHARACTER VARYING(20)"},
+		{name: "raw length", dataType: "RAW", length: 32, scale: 0, want: "RAW(32)"},
+		{name: "binary float alias", dataType: "BINARY_FLOAT", length: 4, scale: 0, want: "BINARY_FLOAT"},
+		{name: "xml alias", dataType: "XMLTYPE", length: 2147483647, scale: 0, want: "XMLTYPE"},
 	}
 
 	for _, tt := range tests {
@@ -119,6 +125,36 @@ func TestRenderCreateUserUsesPlaceholderPasswordAndTablespaces(t *testing.T) {
 	want := `CREATE USER HR_TEST IDENTIFIED BY "dmdul_default_password" DEFAULT TABLESPACE "MAIN" TEMPORARY TABLESPACE "TEMP";`
 	if got != want {
 		t.Fatalf("renderCreateUser() = %q, want %q", got, want)
+	}
+}
+
+func TestRenderConstraintsOmitsUnusableDMGeneratedName(t *testing.T) {
+	tables := map[uint32]dictionaryObject{
+		100: {ID: 100, Owner: "APP", Name: "T"},
+	}
+	columns := map[tableColKey]columnDef{
+		{tableID: 100, colID: 1}: {TableID: 100, ColID: 1, Name: "ID", DataType: "INT"},
+	}
+	objects := map[uint32]dictionaryObject{
+		200: {ID: 200, ParentID: 100, Name: "INDEX_200", Type: "INDEX"},
+	}
+	indexes := map[uint32]indexDef{
+		200: {ID: 200, KeyNum: 1, Keys: []indexKey{{ColID: 1, Order: "ASC"}}},
+	}
+	constraints := []constraintDef{{ID: 300, TableID: 100, Type: "P", Valid: "Y", IndexID: 200}}
+	constraintObjects := map[uint32]dictionaryObject{
+		300: {ID: 300, Name: "CONS134218829"},
+	}
+	var out strings.Builder
+	renderConstraints(&out, objects, tables, columns, constraintObjects, indexes, constraints, newOwnerMatcher("all"), newTableNameMatcher("all"))
+	if got := out.String(); !strings.Contains(got, "ALTER TABLE APP.T ADD PRIMARY KEY (ID);") || strings.Contains(got, "CONS134218829") {
+		t.Fatalf("unexpected generated constraint DDL:\n%s", got)
+	}
+}
+
+func TestRecoveredConstraintNameClausePreservesUserName(t *testing.T) {
+	if got := recoveredConstraintNameClause("PK_ORDERS"); got != "CONSTRAINT PK_ORDERS " {
+		t.Fatalf("recoveredConstraintNameClause() = %q", got)
 	}
 }
 

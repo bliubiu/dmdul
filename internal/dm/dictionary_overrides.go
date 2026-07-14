@@ -162,7 +162,7 @@ func dictionaryColumnMaps(dict *DictionaryInfo, dictionaryTables map[uint32]Dict
 			TableID:  tableID,
 			ColID:    col.ColID,
 			Name:     col.Name,
-			DataType: col.DataType,
+			DataType: normalizeCatalogColumnType(col.DataType, col.Scale),
 			Length:   col.Length,
 			Scale:    col.Scale,
 			Nullable: col.Nullable,

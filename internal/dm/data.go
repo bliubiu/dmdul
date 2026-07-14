@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/csv"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math"
@@ -138,6 +139,13 @@ type dataValue struct {
 type dmNumber string
 type dmBinary []byte
 type dmRowID string
+type dmJSON string
+
+type dmJSONValue struct {
+	value   any
+	binary  bool
+	decoder textDecoder
+}
 
 type dmLOBValue struct {
 	reader  *dmLOBReader
@@ -766,6 +774,9 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 		}
 		selectedTables[tableID] = baseInfo
 		for _, storage := range assistByParentID[tableID] {
+			if baseInfo.dataStorageID != 0 && storage.ID != baseInfo.dataStorageID {
+				continue
+			}
 			addKnownDataAssistID(assistByID, neededFiles, baseInfo, storage.ID, storage, buildStoragePagePlan(storage, dataFilePages))
 		}
 		for _, assistID := range dictionaryDataAssistIDs(dictionaryTables, tableID) {
@@ -783,7 +794,11 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 			scanAllDataFiles = true
 		}
 		for _, part := range partitionsByTable[tableID] {
+			partitionStorageID := dataStorageIDForTable(dictionaryTables, dataStorageByTable, part.PartTableID)
 			for _, storage := range assistByParentID[part.PartTableID] {
+				if partitionStorageID != 0 && storage.ID != partitionStorageID {
+					continue
+				}
 				addKnownDataAssistID(assistByID, neededFiles, baseInfo, storage.ID, storage, buildStoragePagePlan(storage, dataFilePages))
 			}
 			if addHiddenIndexObjectAssistIDs(assistByID, baseInfo, part.PartTableID, indexObjects, indexes) {
@@ -1127,7 +1142,7 @@ func selectDataPageCandidate(candidates []dataTableInfo, file dataFileRef, pageN
 		if isTableDataAssistHeaderCandidate(candidate, pageStorageID, pageKind) {
 			continue
 		}
-		if isLooseHistoricalCandidate(candidate) && pageKind == dmPageKindRowData {
+		if isLooseHistoricalCandidate(candidate) {
 			continue
 		}
 		if !candidateMatchesFile(candidate, file, pageNo) {
@@ -1716,7 +1731,10 @@ func dataRowLength(page []byte, rowOff uint16, pageSize uint32, freeEnd uint16) 
 }
 
 func isLiveDataRow(page []byte, rowOff uint16) bool {
-	return int(rowOff)+3 <= len(page) && page[rowOff+2] == 0x00
+	// The byte at rowOff+2 starts the 2-bit-per-column metadata. It may be
+	// non-zero (or even 0xFF) for a perfectly live row containing NULLs.
+	// Deleted/free slots are rejected earlier by dataRowLength.
+	return int(rowOff)+3 <= len(page)
 }
 
 func renderInsertForDataRow(info dataTableInfo, row []byte, decoder textDecoder) (string, int, int, error) {
@@ -1980,6 +1998,13 @@ func readOutOfLineDataValue(col columnDef, row []byte, pos int, decoder textDeco
 	if lobReader == nil {
 		return nil, pos, fmt.Errorf("%s: out-of-line locator cannot be resolved without data files", col.Name)
 	}
+	if isJSONDataType(col.DataType) {
+		value, err := lobReader.lazyLOBValue(locator, dmPageKindLOBData, false, decoder)
+		if err != nil {
+			return nil, pos, fmt.Errorf("%s: %w", col.Name, err)
+		}
+		return dmJSONValue{value: value, binary: normalizeDataType(col.DataType) == "JSONB", decoder: decoder}, next, nil
+	}
 	if isBinaryDataType(col.DataType) {
 		value, err := lobReader.lazyLOBValue(locator, dmPageKindLOBData, false, decoder)
 		if err != nil {
@@ -2041,6 +2066,7 @@ func parseDataRowValuesWithMetadata(row []byte, columns []columnDef, decoder tex
 	states := decodeRowColumnStates(row[2:start], len(storageColumns))
 	pos := start
 	values := make(map[uint16]dataValue, len(columns))
+parseColumns:
 	for i, col := range storageColumns {
 		state := states[i]
 		switch {
@@ -2053,7 +2079,13 @@ func parseDataRowValuesWithMetadata(row []byte, columns []columnDef, decoder tex
 			}
 			values[col.ColID] = dataValue{value: nil}
 		case isRowColumnOutOfLine(state):
-			value, next, err := readOutOfLineDataValue(col, row, pos, decoder, lobReader)
+			// State 1 marks special/overflow storage. Inline LOB values also use
+			// it on some DM8 builds, so accept the normal length-prefixed form
+			// first and fall back to a bare 21-byte locator.
+			value, next, err := readInRowDataValue(col, row, pos, decoder, lobReader)
+			if err != nil {
+				value, next, err = readOutOfLineDataValue(col, row, pos, decoder, lobReader)
+			}
 			if err != nil {
 				return nil, 0, 0, err
 			}
@@ -2062,6 +2094,12 @@ func parseDataRowValuesWithMetadata(row []byte, columns []columnDef, decoder tex
 		default:
 			value, next, err := readInRowDataValue(col, row, pos, decoder, lobReader)
 			if err != nil {
+				if fixedDataSizeForColumn(col) == 0 && canOmitTrailingNullVars(row, pos, storageColumns[i:]) {
+					for _, nullCol := range storageColumns[i:] {
+						values[nullCol.ColID] = dataValue{value: nil}
+					}
+					break parseColumns
+				}
 				return nil, 0, 0, err
 			}
 			values[col.ColID] = dataValue{value: value}
@@ -2215,22 +2253,32 @@ func isZeroFixedValue(value any) bool {
 }
 
 func isVariableDataType(dataType string) bool {
-	return isCharacterDataType(dataType) || isBinaryDataType(dataType) || isNumberDataType(dataType)
+	return isCharacterDataType(dataType) || isVariableBinaryDataType(dataType) || isNumberDataType(dataType) ||
+		isJSONDataType(dataType) || normalizeDataType(dataType) == "BFILE"
 }
 
 func isCharacterDataType(dataType string) bool {
 	upper := normalizeDataType(dataType)
-	return strings.Contains(upper, "CHAR") || strings.Contains(upper, "VARCHAR") || strings.Contains(upper, "TEXT") || strings.Contains(upper, "CLOB") || upper == "LONG"
+	return strings.Contains(upper, "CHAR") || strings.Contains(upper, "VARCHAR") || strings.Contains(upper, "TEXT") || strings.Contains(upper, "CLOB") || upper == "LONG" || upper == "XMLTYPE"
 }
 
 func isCharacterLOBDataType(dataType string) bool {
 	upper := normalizeDataType(dataType)
-	return strings.Contains(upper, "CLOB") || strings.Contains(upper, "TEXT") || upper == "LONG"
+	return strings.Contains(upper, "CLOB") || strings.Contains(upper, "TEXT") || upper == "LONG" || upper == "LONGVARCHAR" || upper == "XMLTYPE"
 }
 
 func isBinaryDataType(dataType string) bool {
 	switch normalizeDataType(dataType) {
-	case "BINARY", "VARBINARY", "LONGVARBINARY", "BLOB", "IMAGE":
+	case "BINARY", "VARBINARY", "RAW", "LONGVARBINARY", "LONG RAW", "BLOB", "IMAGE":
+		return true
+	default:
+		return false
+	}
+}
+
+func isVariableBinaryDataType(dataType string) bool {
+	switch normalizeDataType(dataType) {
+	case "VARBINARY", "RAW", "LONGVARBINARY", "LONG RAW", "BLOB", "IMAGE":
 		return true
 	default:
 		return false
@@ -2255,24 +2303,32 @@ func fixedDataSizeForColumn(col columnDef) int {
 }
 
 func fixedDataSizeForType(dataType string, length uint32) int {
+	if isDayTimeIntervalDataType(dataType) {
+		return 24
+	}
+	if isYearMonthIntervalDataType(dataType) {
+		return 12
+	}
 	switch dataType {
 	case "BIT", "BOOL", "BOOLEAN", "BYTE", "TINYINT":
 		return 1
 	case "SMALLINT":
 		return 2
-	case "INT", "INTEGER":
+	case "INT", "INTEGER", "PLS_INTEGER":
 		return 4
 	case "BIGINT":
 		return 8
-	case "REAL":
+	case "REAL", "BINARY_FLOAT":
 		return 4
 	case "FLOAT":
 		if length == 4 {
 			return 4
 		}
 		return 8
-	case "DOUBLE", "DOUBLE PRECISION":
+	case "DOUBLE", "DOUBLE PRECISION", "BINARY_DOUBLE":
 		return 8
+	case "BINARY":
+		return int(length)
 	case "DATE":
 		return 3
 	case "TIME":
@@ -2280,13 +2336,15 @@ func fixedDataSizeForType(dataType string, length uint32) int {
 	case "TIME WITH TIME ZONE":
 		return 7
 	case "DATETIME", "TIMESTAMP", "TIMESTAMP WITH LOCAL TIME ZONE":
+		if length == 9 {
+			return 9
+		}
 		return 8
 	case "DATETIME WITH TIME ZONE", "TIMESTAMP WITH TIME ZONE":
+		if length == 11 {
+			return 11
+		}
 		return 10
-	case "INTERVAL DAY TO SECOND":
-		return 24
-	case "INTERVAL YEAR TO MONTH", "INTERVAL YEAR", "INTERVAL MONTH":
-		return 12
 	case "ROWID":
 		return 12
 	default:
@@ -2336,7 +2394,7 @@ func parseFixedDataValue(col columnDef, row []byte, pos int) (any, int, error) {
 			return nil, pos, fmt.Errorf("SMALLINT out of range")
 		}
 		return int16(binary.LittleEndian.Uint16(row[pos:])), pos + 2, nil
-	case "INT", "INTEGER":
+	case "INT", "INTEGER", "PLS_INTEGER":
 		if pos+4 > len(row) {
 			return nil, pos, fmt.Errorf("INT out of range")
 		}
@@ -2346,7 +2404,7 @@ func parseFixedDataValue(col columnDef, row []byte, pos int) (any, int, error) {
 			return nil, pos, fmt.Errorf("BIGINT out of range")
 		}
 		return int64(binary.LittleEndian.Uint64(row[pos:])), pos + 8, nil
-	case "REAL":
+	case "REAL", "BINARY_FLOAT":
 		if pos+4 > len(row) {
 			return nil, pos, fmt.Errorf("REAL out of range")
 		}
@@ -2362,11 +2420,16 @@ func parseFixedDataValue(col columnDef, row []byte, pos int) (any, int, error) {
 			return nil, pos, fmt.Errorf("FLOAT out of range")
 		}
 		return math.Float64frombits(binary.LittleEndian.Uint64(row[pos:])), pos + 8, nil
-	case "DOUBLE", "DOUBLE PRECISION":
+	case "DOUBLE", "DOUBLE PRECISION", "BINARY_DOUBLE":
 		if pos+8 > len(row) {
 			return nil, pos, fmt.Errorf("%s out of range", dataType)
 		}
 		return math.Float64frombits(binary.LittleEndian.Uint64(row[pos:])), pos + 8, nil
+	case "BINARY":
+		if size <= 0 || pos+size > len(row) {
+			return nil, pos, fmt.Errorf("BINARY out of range")
+		}
+		return dmBinary(append([]byte(nil), row[pos:pos+size]...)), pos + size, nil
 	case "DATE":
 		if pos+3 > len(row) {
 			return nil, pos, fmt.Errorf("DATE out of range")
@@ -2380,7 +2443,7 @@ func parseFixedDataValue(col columnDef, row []byte, pos int) (any, int, error) {
 		if pos+5 > len(row) {
 			return nil, pos, fmt.Errorf("TIME out of range")
 		}
-		value, err := decodeDMTime(row[pos : pos+5])
+		value, err := decodeDMTimeWithPrecision(row[pos:pos+5], timeFractionalPrecision(col.Scale))
 		if err != nil {
 			return nil, pos, err
 		}
@@ -2389,34 +2452,36 @@ func parseFixedDataValue(col columnDef, row []byte, pos int) (any, int, error) {
 		if pos+7 > len(row) {
 			return nil, pos, fmt.Errorf("TIME WITH TIME ZONE out of range")
 		}
-		value, err := decodeDMTime(row[pos : pos+5])
+		value, err := decodeDMTimeWithPrecision(row[pos:pos+5], timeFractionalPrecision(col.Scale))
 		if err != nil {
 			return nil, pos, err
 		}
 		return value + " " + decodeDMTimezone(row[pos+5:pos+7]), pos + 7, nil
 	case "DATETIME", "TIMESTAMP", "TIMESTAMP WITH LOCAL TIME ZONE":
-		if pos+8 > len(row) {
+		if size <= 0 || pos+size > len(row) {
 			return nil, pos, fmt.Errorf("%s out of range", dataType)
 		}
-		value, err := decodeDMDateTime(row[pos : pos+8])
+		value, err := decodeDMDateTimeWithPrecision(row[pos:pos+size], timeFractionalPrecision(col.Scale))
 		if err != nil {
 			return nil, pos, err
 		}
-		return value, pos + 8, nil
+		return value, pos + size, nil
 	case "DATETIME WITH TIME ZONE", "TIMESTAMP WITH TIME ZONE":
-		if pos+10 > len(row) {
+		if size <= 2 || pos+size > len(row) {
 			return nil, pos, fmt.Errorf("%s out of range", dataType)
 		}
-		value, err := decodeDMDateTime(row[pos : pos+8])
+		value, err := decodeDMDateTimeWithPrecision(row[pos:pos+size-2], timeFractionalPrecision(col.Scale))
 		if err != nil {
 			return nil, pos, err
 		}
-		return value + " " + decodeDMTimezone(row[pos+8:pos+10]), pos + 10, nil
-	case "INTERVAL DAY TO SECOND":
+		return value + " " + decodeDMTimezone(row[pos+size-2:pos+size]), pos + size, nil
+	case "INTERVAL DAY", "INTERVAL HOUR", "INTERVAL MINUTE", "INTERVAL SECOND",
+		"INTERVAL DAY TO HOUR", "INTERVAL DAY TO MINUTE", "INTERVAL DAY TO SECOND",
+		"INTERVAL HOUR TO MINUTE", "INTERVAL HOUR TO SECOND", "INTERVAL MINUTE TO SECOND":
 		if pos+24 > len(row) {
-			return nil, pos, fmt.Errorf("INTERVAL DAY TO SECOND out of range")
+			return nil, pos, fmt.Errorf("%s out of range", dataType)
 		}
-		return decodeDMIntervalDayToSecond(row[pos : pos+24]), pos + 24, nil
+		return decodeDMIntervalDayToSecond(row[pos:pos+24], dataType), pos + 24, nil
 	case "INTERVAL YEAR TO MONTH", "INTERVAL YEAR", "INTERVAL MONTH":
 		if pos+12 > len(row) {
 			return nil, pos, fmt.Errorf("%s out of range", dataType)
@@ -2456,7 +2521,7 @@ func isFixedNullSentinel(dataType string, raw []byte) bool {
 		}
 		return isFixedNullSentinel("TIME", raw[:5])
 	case "DATETIME", "TIMESTAMP", "TIMESTAMP WITH LOCAL TIME ZONE":
-		if len(raw) != 8 {
+		if len(raw) != 8 && len(raw) != 9 {
 			return false
 		}
 		if isAllBytes(raw, 0x00) {
@@ -2467,10 +2532,10 @@ func isFixedNullSentinel(dataType string, raw []byte) bool {
 		}
 		return raw[0] == 0xFF && raw[1] == 0xFF && raw[4] == 0x7F
 	case "DATETIME WITH TIME ZONE", "TIMESTAMP WITH TIME ZONE":
-		if len(raw) != 10 {
+		if len(raw) != 10 && len(raw) != 11 {
 			return false
 		}
-		return isFixedNullSentinel("DATETIME", raw[:8])
+		return isFixedNullSentinel("DATETIME", raw[:len(raw)-2])
 	default:
 		return false
 	}
@@ -2489,6 +2554,9 @@ func isAllBytes(raw []byte, value byte) bool {
 }
 
 func readVariableDataValue(col columnDef, row []byte, pos int, decoder textDecoder, lobReader *dmLOBReader) (any, int, error) {
+	if isJSONDataType(col.DataType) {
+		return readJSONDataValue(col, row, pos, decoder, lobReader)
+	}
 	if isNumberDataType(col.DataType) {
 		value, next, err := readDMNumber(row, pos)
 		if err != nil {
@@ -2543,6 +2611,27 @@ func readVariableDataValue(col columnDef, row []byte, pos int, decoder textDecod
 		return nil, pos, fmt.Errorf("%s: decoded varchar contains invalid characters marker=0x%02X raw=%s", col.Name, marker, strings.ToUpper(hex.EncodeToString(raw)))
 	}
 	return value, next, nil
+}
+
+func readJSONDataValue(col columnDef, row []byte, pos int, decoder textDecoder, lobReader *dmLOBReader) (any, int, error) {
+	raw, next, err := readShortDataBytes(row, pos)
+	if err != nil {
+		return nil, pos, fmt.Errorf("%s: %w", col.Name, err)
+	}
+	var value any = dmBinary(raw)
+	if payload, ok := unwrapInlineLOBPayload(raw); ok {
+		value = dmBinary(payload)
+	} else if locator, ok := parseDMLOBLocatorRaw(raw); ok {
+		if lobReader == nil {
+			return nil, pos, fmt.Errorf("%s: out-of-line JSON locator cannot be resolved without data files", col.Name)
+		}
+		lazy, lazyErr := lobReader.lazyLOBValue(locator, dmPageKindLOBData, false, decoder)
+		if lazyErr != nil {
+			return nil, pos, fmt.Errorf("%s: %w", col.Name, lazyErr)
+		}
+		value = lazy
+	}
+	return dmJSONValue{value: value, binary: normalizeDataType(col.DataType) == "JSONB", decoder: decoder}, next, nil
 }
 
 func readInlineTextLOB(row []byte, pos int, decoder textDecoder, lobReader *dmLOBReader) (any, int, error) {
@@ -2981,7 +3070,7 @@ func decodeDMNumber(raw []byte) (string, bool) {
 		return formatBase100Number(false, exp, digits), true
 	}
 
-	exp := 0x3F - int(raw[0])
+	exp := 0x3E - int(raw[0])
 	digits := make([]int, 0, len(raw)-1)
 	for _, b := range raw[1:] {
 		if b == 0x66 {
@@ -3058,14 +3147,22 @@ func formatBase100Number(negative bool, exp int, digits []int) string {
 }
 
 func decodeDMDateTime(raw []byte) (string, error) {
-	if len(raw) != 8 {
-		return "", fmt.Errorf("datetime needs 8 bytes")
+	precision := 6
+	if len(raw) == 9 {
+		precision = 9
+	}
+	return decodeDMDateTimeWithPrecision(raw, precision)
+}
+
+func decodeDMDateTimeWithPrecision(raw []byte, precision int) (string, error) {
+	if len(raw) != 8 && len(raw) != 9 {
+		return "", fmt.Errorf("datetime needs 8 or 9 bytes")
 	}
 	date, err := decodeDMDate(raw[:3])
 	if err != nil {
 		return "", fmt.Errorf("%s", strings.Replace(err.Error(), "date", "datetime date", 1))
 	}
-	timeValue, err := decodeDMTime(raw[3:8])
+	timeValue, err := decodeDMTimeWithPrecision(raw[3:], precision)
 	if err != nil {
 		return "", fmt.Errorf("%s", strings.Replace(err.Error(), "time", "datetime time", 1))
 	}
@@ -3073,18 +3170,41 @@ func decodeDMDateTime(raw []byte) (string, error) {
 }
 
 func decodeDMTime(raw []byte) (string, error) {
-	if len(raw) != 5 {
-		return "", fmt.Errorf("time needs 5 bytes")
+	precision := 6
+	if len(raw) == 6 {
+		precision = 9
+	}
+	return decodeDMTimeWithPrecision(raw, precision)
+}
+
+func decodeDMTimeWithPrecision(raw []byte, precision int) (string, error) {
+	if len(raw) != 5 && len(raw) != 6 {
+		return "", fmt.Errorf("time needs 5 or 6 bytes")
 	}
 	v := uint64(raw[0]) | uint64(raw[1])<<8 | uint64(raw[2])<<16 | uint64(raw[3])<<24 | uint64(raw[4])<<32
+	maxPrecision := 6
+	fractionMask := uint64((1 << 23) - 1)
+	if len(raw) == 6 {
+		v |= uint64(raw[5]) << 40
+		maxPrecision = 9
+		fractionMask = (1 << 31) - 1
+	}
 	hour := int(v & 0x1F)
 	minute := int((v >> 5) & 0x3F)
 	second := int((v >> 11) & 0x3F)
-	micro := int((v >> 17) & ((1 << 23) - 1))
-	if hour > 23 || minute > 59 || second > 59 || micro > 999999 {
-		return "", fmt.Errorf("invalid datetime time bits: %02d:%02d:%02d.%06d", hour, minute, second, micro)
+	fraction := int((v >> 17) & fractionMask)
+	maxFraction := 999999
+	if maxPrecision == 9 {
+		maxFraction = 999999999
 	}
-	return fmt.Sprintf("%02d:%02d:%02d.%06d", hour, minute, second, micro), nil
+	if hour > 23 || minute > 59 || second > 59 || fraction > maxFraction {
+		return "", fmt.Errorf("invalid datetime time bits: %02d:%02d:%02d fraction=%d", hour, minute, second, fraction)
+	}
+	if precision <= 0 || precision > maxPrecision {
+		precision = maxPrecision
+	}
+	fractionText := fmt.Sprintf("%0*d", maxPrecision, fraction)
+	return fmt.Sprintf("%02d:%02d:%02d.%s", hour, minute, second, fractionText[:precision]), nil
 }
 
 func decodeDMTimezone(raw []byte) string {
@@ -3100,8 +3220,8 @@ func decodeDMTimezone(raw []byte) string {
 	return fmt.Sprintf("%s%02d:%02d", sign, minutes/60, minutes%60)
 }
 
-func decodeDMIntervalDayToSecond(raw []byte) string {
-	if len(raw) < 20 {
+func decodeDMIntervalDayToSecond(raw []byte, dataType string) string {
+	if len(raw) < 24 {
 		return ""
 	}
 	values := []int64{
@@ -3122,7 +3242,46 @@ func decodeDMIntervalDayToSecond(raw []byte) string {
 	if negative {
 		sign = "-"
 	}
-	return fmt.Sprintf("%s%d %02d:%02d:%02d.%06d", sign, values[0], values[1], values[2], values[3], values[4])
+	_, fractional := intervalPrecisions(int16(binary.LittleEndian.Uint16(raw[20:22])))
+	if fractional < 0 || fractional > 6 {
+		fractional = 6
+	}
+	fractionText := fmt.Sprintf("%06d", values[4])
+	if fractional < len(fractionText) {
+		fractionText = fractionText[:fractional]
+	}
+	seconds := fmt.Sprintf("%02d", values[3])
+	if fractional > 0 {
+		seconds += "." + fractionText
+	}
+	switch normalizeDataType(dataType) {
+	case "INTERVAL DAY":
+		return fmt.Sprintf("%s%d", sign, values[0])
+	case "INTERVAL HOUR":
+		return fmt.Sprintf("%s%d", sign, values[1])
+	case "INTERVAL MINUTE":
+		return fmt.Sprintf("%s%d", sign, values[2])
+	case "INTERVAL SECOND":
+		seconds = fmt.Sprintf("%d", values[3])
+		if fractional > 0 {
+			seconds += "." + fractionText
+		}
+		return sign + seconds
+	case "INTERVAL DAY TO HOUR":
+		return fmt.Sprintf("%s%d %02d", sign, values[0], values[1])
+	case "INTERVAL DAY TO MINUTE":
+		return fmt.Sprintf("%s%d %02d:%02d", sign, values[0], values[1], values[2])
+	case "INTERVAL DAY TO SECOND":
+		return fmt.Sprintf("%s%d %02d:%02d:%s", sign, values[0], values[1], values[2], seconds)
+	case "INTERVAL HOUR TO MINUTE":
+		return fmt.Sprintf("%s%d:%02d", sign, values[1], values[2])
+	case "INTERVAL HOUR TO SECOND":
+		return fmt.Sprintf("%s%d:%02d:%s", sign, values[1], values[2], seconds)
+	case "INTERVAL MINUTE TO SECOND":
+		return fmt.Sprintf("%s%d:%s", sign, values[2], seconds)
+	default:
+		return ""
+	}
 }
 
 func decodeDMIntervalYearToMonth(raw []byte, dataType string) string {
@@ -3157,14 +3316,197 @@ func decodeDMRowID(raw []byte) string {
 		return ""
 	}
 	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	appendFixed := func(out []byte, value uint64, width int) []byte {
+		start := len(out)
+		out = append(out, make([]byte, width)...)
+		for i := width - 1; i >= 0; i-- {
+			out[start+i] = alphabet[value&0x3F]
+			value >>= 6
+		}
+		return out
+	}
+	epno := uint64(binary.BigEndian.Uint16(raw[0:2]))
+	partno := uint64(binary.BigEndian.Uint16(raw[4:6]))
+	realRowID := uint64(0)
+	for _, value := range raw[6:12] {
+		realRowID = realRowID<<8 | uint64(value)
+	}
 	out := make([]byte, 0, 18)
-	for offset := 0; offset < len(raw); offset += 4 {
-		value := binary.BigEndian.Uint32(raw[offset : offset+4])
-		for _, shift := range []uint{30, 24, 18, 12, 6, 0} {
-			out = append(out, alphabet[(value>>shift)&0x3F])
+	out = appendFixed(out, epno, 4)
+	out = appendFixed(out, partno, 6)
+	out = appendFixed(out, realRowID, 8)
+	return string(out)
+}
+
+type dmJSONBDescriptor struct {
+	kind    byte
+	length  int
+	special bool
+}
+
+func decodeDMJSONB(raw []byte, decoder textDecoder) (dmJSON, error) {
+	if len(raw) < 20 {
+		return "", fmt.Errorf("JSONB payload is too short: %d", len(raw))
+	}
+	value, err := decodeDMJSONBContainer(raw[16:], decoder)
+	if err != nil {
+		return "", err
+	}
+	if !json.Valid([]byte(value)) {
+		return "", fmt.Errorf("decoded JSONB value is not valid JSON")
+	}
+	return dmJSON(value), nil
+}
+
+func decodeDMJSONBContainer(raw []byte, decoder textDecoder) (string, error) {
+	if len(raw) < 4 {
+		return "", fmt.Errorf("JSONB container header is truncated")
+	}
+	header := binary.LittleEndian.Uint32(raw[:4])
+	kind := byte(header >> 28)
+	count := int(header & 0x0FFFFFFF)
+	if count < 0 || count > 1_000_000 {
+		return "", fmt.Errorf("invalid JSONB item count %d", count)
+	}
+	descriptorCount := 0
+	switch kind {
+	case 1:
+		descriptorCount = count
+	case 2:
+		descriptorCount = count * 2
+	case 4:
+		descriptorCount = count
+	default:
+		return "", fmt.Errorf("unsupported JSONB container kind 0x%X", kind)
+	}
+	descriptorEnd := 4 + descriptorCount*4
+	if descriptorEnd > len(raw) {
+		return "", fmt.Errorf("JSONB descriptor array is truncated")
+	}
+	if descriptorCount == 0 {
+		if kind == 2 {
+			return "{}", nil
+		}
+		if kind == 4 {
+			return "[]", nil
+		}
+		return "null", nil
+	}
+
+	descriptors := make([]dmJSONBDescriptor, descriptorCount)
+	knownPayload := 0
+	specialIndex := -1
+	for i := 0; i < descriptorCount; i++ {
+		desc := binary.LittleEndian.Uint32(raw[4+i*4:])
+		descKind := byte(desc >> 28)
+		special := descKind >= 8
+		if special {
+			descKind -= 8
+			if specialIndex >= 0 {
+				return "", fmt.Errorf("multiple JSONB special descriptors")
+			}
+			specialIndex = i
+		}
+		length := int(desc & 0x0FFFFFFF)
+		if descKind >= 4 && descKind <= 6 {
+			length = 0
+		}
+		descriptors[i] = dmJSONBDescriptor{kind: descKind, length: length, special: special}
+		if !special {
+			knownPayload += length
 		}
 	}
-	return string(out)
+	payloadLength := len(raw) - descriptorEnd
+	if specialIndex >= 0 {
+		length := payloadLength - knownPayload
+		if length < 0 {
+			return "", fmt.Errorf("invalid JSONB special descriptor length")
+		}
+		descriptors[specialIndex].length = length
+	} else if knownPayload != payloadLength {
+		return "", fmt.Errorf("JSONB payload length mismatch: descriptors=%d payload=%d", knownPayload, payloadLength)
+	}
+
+	values := make([]string, descriptorCount)
+	pos := descriptorEnd
+	for i, desc := range descriptors {
+		if desc.length < 0 || pos+desc.length > len(raw) {
+			return "", fmt.Errorf("JSONB item %d is out of range", i)
+		}
+		text, err := decodeDMJSONBItem(desc.kind, raw[pos:pos+desc.length], decoder)
+		if err != nil {
+			return "", fmt.Errorf("JSONB item %d: %w", i, err)
+		}
+		values[i] = text
+		pos += desc.length
+	}
+	if pos != len(raw) {
+		return "", fmt.Errorf("JSONB payload has %d trailing bytes", len(raw)-pos)
+	}
+
+	switch kind {
+	case 1:
+		if len(values) != 1 {
+			return "", fmt.Errorf("JSONB scalar wrapper contains %d values", len(values))
+		}
+		return values[0], nil
+	case 2:
+		pairs := make([]string, 0, count)
+		for i := 0; i < len(values); i += 2 {
+			pairs = append(pairs, values[i]+":"+values[i+1])
+		}
+		return "{" + strings.Join(pairs, ",") + "}", nil
+	case 4:
+		return "[" + strings.Join(values, ",") + "]", nil
+	default:
+		return "", fmt.Errorf("unsupported JSONB container kind 0x%X", kind)
+	}
+}
+
+func decodeDMJSONBItem(kind byte, raw []byte, decoder textDecoder) (string, error) {
+	switch kind {
+	case 0:
+		return decodeDMJSONBContainer(raw, decoder)
+	case 1:
+		var value int64
+		switch len(raw) {
+		case 1:
+			value = int64(int8(raw[0]))
+		case 2:
+			value = int64(int16(binary.LittleEndian.Uint16(raw)))
+		case 4:
+			value = int64(int32(binary.LittleEndian.Uint32(raw)))
+		case 8:
+			value = int64(binary.LittleEndian.Uint64(raw))
+		default:
+			return "", fmt.Errorf("unsupported integer width %d", len(raw))
+		}
+		return fmt.Sprintf("%d", value), nil
+	case 2:
+		value := string(raw)
+		if !json.Valid([]byte(value)) {
+			return "", fmt.Errorf("invalid numeric text %q", value)
+		}
+		return value, nil
+	case 3:
+		value, ok := decoder.decode(raw)
+		if !ok || strings.ContainsRune(value, '\uFFFD') || containsBadControl(value) {
+			return "", fmt.Errorf("cannot decode JSONB string")
+		}
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return "", err
+		}
+		return string(encoded), nil
+	case 4:
+		return "false", nil
+	case 5:
+		return "true", nil
+	case 6:
+		return "null", nil
+	default:
+		return "", fmt.Errorf("unsupported JSONB item kind 0x%X", kind)
+	}
 }
 
 func sqlValueForDataColumn(col columnDef, value any) (string, error) {
@@ -3177,10 +3519,19 @@ func sqlValueForDataColumn(col columnDef, value any) (string, error) {
 		return "NULL", nil
 	}
 	typ := normalizeDataType(col.DataType)
+	if isYearMonthIntervalDataType(typ) || isDayTimeIntervalDataType(typ) {
+		text := fmt.Sprintf("%v", value)
+		sign := ""
+		if strings.HasPrefix(text, "-") {
+			sign = "-"
+			text = strings.TrimPrefix(text, "-")
+		}
+		return "INTERVAL " + sign + sqlLiteral(text) + " " + intervalQualifier(typ), nil
+	}
 	switch typ {
-	case "BIT", "BOOL", "BOOLEAN", "BYTE", "TINYINT", "SMALLINT", "INT", "INTEGER", "BIGINT":
+	case "BIT", "BOOL", "BOOLEAN", "BYTE", "TINYINT", "SMALLINT", "INT", "INTEGER", "PLS_INTEGER", "BIGINT":
 		return fmt.Sprintf("%v", value), nil
-	case "REAL", "FLOAT", "DOUBLE", "DOUBLE PRECISION":
+	case "REAL", "BINARY_FLOAT", "FLOAT", "DOUBLE", "DOUBLE PRECISION", "BINARY_DOUBLE":
 		return fmt.Sprintf("%v", value), nil
 	case "NUMBER", "NUMERIC", "DEC", "DECIMAL":
 		return fmt.Sprintf("%v", value), nil
@@ -3198,14 +3549,14 @@ func sqlValueForDataColumn(col columnDef, value any) (string, error) {
 		return "DATE " + sqlLiteral(text), nil
 	case "TIME", "TIME WITH TIME ZONE":
 		return "TIME " + sqlLiteral(fmt.Sprintf("%v", value)), nil
-	case "INTERVAL DAY TO SECOND":
-		return "INTERVAL " + sqlLiteral(fmt.Sprintf("%v", value)) + " DAY TO SECOND", nil
-	case "INTERVAL YEAR TO MONTH":
-		return "INTERVAL " + sqlLiteral(fmt.Sprintf("%v", value)) + " YEAR TO MONTH", nil
-	case "INTERVAL YEAR":
-		return "INTERVAL " + sqlLiteral(fmt.Sprintf("%v", value)) + " YEAR", nil
-	case "INTERVAL MONTH":
-		return "INTERVAL " + sqlLiteral(fmt.Sprintf("%v", value)) + " MONTH", nil
+	case "JSON", "JSONB":
+		return "CAST(" + sqlLiteral(fmt.Sprintf("%v", value)) + " AS " + typ + ")", nil
+	case "BFILE":
+		directory, filename, ok := strings.Cut(fmt.Sprintf("%v", value), ":")
+		if !ok {
+			return "", fmt.Errorf("invalid BFILE value %q", value)
+		}
+		return "BFILENAME(" + sqlLiteral(directory) + "," + sqlLiteral(filename) + ")", nil
 	case "ROWID":
 		return sqlLiteral(fmt.Sprintf("%v", value)), nil
 	default:
@@ -3240,6 +3591,31 @@ func csvValueForDataColumn(col columnDef, value any) (string, error) {
 }
 
 func materializeDataValue(value any) (any, error) {
+	if jsonValue, ok := value.(dmJSONValue); ok {
+		materialized, err := materializeDataValue(jsonValue.value)
+		if err != nil {
+			return nil, err
+		}
+		var raw []byte
+		switch value := materialized.(type) {
+		case dmBinary:
+			raw = []byte(value)
+		case []byte:
+			raw = value
+		case string:
+			raw = []byte(value)
+		default:
+			return nil, fmt.Errorf("unsupported JSON storage value %T", materialized)
+		}
+		if jsonValue.binary {
+			return decodeDMJSONB(raw, jsonValue.decoder)
+		}
+		text, ok := jsonValue.decoder.decode(raw)
+		if !ok || strings.ContainsRune(text, '\uFFFD') || containsBadControl(text) {
+			return nil, fmt.Errorf("cannot decode JSON text")
+		}
+		return dmJSON(text), nil
+	}
 	lob, ok := value.(dmLOBValue)
 	if !ok {
 		return value, nil

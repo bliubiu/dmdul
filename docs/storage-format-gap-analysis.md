@@ -2,6 +2,12 @@
 
 本文根据 `DM8_STORAGE_FORMAT_SUMMARY_2026-07-03_CN.md` 对当前 DMDUL 实现做差距分析，用于安排后续解析增强。
 
+> **2026-07-13 状态更新**：本文第 1～4 节保留的是当时的差距记录，不再代表当前
+> 实现。标准两阶段 bootstrap、按页流式扫描、显式 2-bit NULL metadata、常规标量
+> 类型、21 字节 LOB locator、`0x20` LOB 页链和 `0x22` Long Row 页链均已落地。
+> 当前类型矩阵和实机结果以 [DM8 数据类型支持矩阵](data-types.md) 为准；仍未完成的
+> 主要方向是 HUGE 表、自定义/集合类型和无 SYSTEM 字典的独立 storage scan。
+
 ## 已经基本吻合的部分
 
 ### 页头与 page plan

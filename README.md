@@ -72,6 +72,8 @@ SYSTEM.DBF / dm.ctl / user tablespace DBF
   SQL、CSV 或每表一个纯数据 DMP。
 - **精确数据页定位**：优先 `storage root -> internal page refs -> leaf chain`，使用段范围
   辅助校验，最后才进入段扫描或全文件救援扫描。
+- **完整常规类型路径**：支持定长/变长字符与二进制、精确/近似数值、9 位时间戳、
+  时区类型、13 种 INTERVAL、ROWID、BFILE、JSON/JSONB，以及国家字符兼容类型。
 - **复杂行与大对象**：支持显式 2-bit NULL metadata、ALTER TABLE 历史短行、21 字节
   LOB locator、行外 CLOB/BLOB 流式读取和 Long Row 页链。
 - **残留数据救援**：表定义仍可获得时，可尝试恢复 `DROP` / `TRUNCATE` 后未覆盖页。
@@ -79,6 +81,8 @@ SYSTEM.DBF / dm.ctl / user tablespace DBF
   4 GiB 的输出路径，不需要把整个数据文件或 LOB 一次性读入内存。
 
 格式研究记录：[DM8 DMP 逻辑导出格式实验记录](docs/dmp-format-research.md)
+
+类型支持与实机验证：[DM8 数据类型支持矩阵](docs/data-types.md)
 
 ------
 
@@ -118,7 +122,8 @@ SYSTEM.DBF / dm.ctl / user tablespace DBF
 | Long Row | ✅ 初步支持 | 21 字节 locator 与 `0x22` Long Row 页链 |
 | ALTER TABLE 历史行 | ✅ 支持 | 新增尾列的旧行按当前结构补 `NULL` |
 | DROP / TRUNCATE 残留页 | ✅ 初步支持 | 原页未覆盖且具有当前或历史字典时尝试恢复 |
-| 基础类型与 NULL metadata | ✅ 增强 | 2-bit NULL、整数、二进制、浮点、时间、INTERVAL、ROWID 等 |
+| 基础类型与 NULL metadata | ✅ 支持 | 2-bit NULL、数值、二进制、9 位时间戳、时区、13 种 INTERVAL、ROWID |
+| JSON / JSONB / BFILE | ✅ 支持 | JSONB 标量与复合结构、BFILE locator；详见类型支持矩阵 |
 
 ------
 
@@ -153,8 +158,9 @@ DMDUL> unload table HR_TEST.EMP_INFO;
 输出：
 
 ```text
-HR_TEST_EMP_INFO_ddl.sql
-HR_TEST_EMP_INFO_data.sql
+output/
+├── HR_TEST_EMP_INFO_ddl.sql
+└── HR_TEST_EMP_INFO_data.sql
 ```
 
 ### CSV Export
@@ -170,10 +176,11 @@ DMDUL> unload user HR_TEST;
 输出示例：
 
 ```text
-HR_TEST_EMP_INFO_ddl.sql
-HR_TEST_EMP_INFO_data.csv
-HR_TEST_ORDER_ddl.sql
-HR_TEST_ORDER_data.csv
+output/
+├── HR_TEST_EMP_INFO_ddl.sql
+├── HR_TEST_EMP_INFO_data.csv
+├── HR_TEST_ORDER_ddl.sql
+└── HR_TEST_ORDER_data.csv
 ```
 
 ### Dameng DMP Export
@@ -205,9 +212,9 @@ DMP 能力：
 
 | Scope | Command | Data output |
 | --- | --- | --- |
-| Table | `unload table HR_TEST.EMP_INFO;` | `HR_TEST_EMP_INFO_data.dmp` |
-| User | `unload user HR_TEST;` | `HR_TEST_<table>_data.dmp` |
-| Database | `unload database;` | `DATABASE_<owner>_<table>_data.dmp` |
+| Table | `unload table HR_TEST.EMP_INFO;` | `output/HR_TEST_EMP_INFO_data.dmp` |
+| User | `unload user HR_TEST;` | `output/HR_TEST_<table>_data.dmp` |
+| Database | `unload database;` | `output/DATABASE_<owner>_<table>_data.dmp` |
 
 分区表行为：
 
@@ -233,7 +240,9 @@ dimp SYSDBA/password \
 ```
 
 当前 DM DMP 行格式不能由已验证通道无损保存 `TIME` 小数秒，遇到非零小数秒时工具会
-打印告警。跨字符集恢复应按目标字符集重新生成 DMP，不能只修改文件头。
+打印告警。JSON/JSONB 表必须使用 `FAST_LOAD=N` 导入；实测 `FAST_LOAD=Y` 对
+dmdul 和官方 `dexp` 文件都会生成不可查询的 JSONB 内容。跨字符集恢复应按目标
+字符集重新生成 DMP，不能只修改文件头。
 
 ------
 
@@ -332,6 +341,24 @@ dul.log
 dmdul_dict/
 ```
 
+首次执行 `unload` 或 `recover` 时会自动创建同级 `output/` 目录，所有 DDL、SQL、
+CSV 和 DMP 都集中写入其中：
+
+```text
+D:\temp\oldpro\
+├── control.dul
+├── init.dul
+├── dul.log
+├── dmdul_dict\
+└── output\
+    ├── HR_TEST_EMP_INFO_ddl.sql
+    └── HR_TEST_EMP_INFO_data.dmp
+```
+
+可以通过 `set output_dir <directory>;` 显式指定其他卸载目录；该参数只改变
+`unload` / `recover` 产物位置，不移动 `dmdul_dict`、`control.dul`、`init.dul` 或
+`dul.log`。
+
 其中 `init.dul` 保存 bootstrap 识别出的 `db_name`、`instance_name`、
 `extent_size`、`page_size`、`unicode_flag` 和 `case_sensitive_value` 及其来源；
 `show parameter;` 可查看，`load parameter;` 可重新加载。
@@ -339,12 +366,12 @@ dmdul_dict/
 `unload database;` 默认生成：
 
 ```text
-DATABASE_ddl.sql
-DATABASE_data.sql
+output/DATABASE_ddl.sql
+output/DATABASE_data.sql
 ```
 
 设置 `data_format=dmp` 后，DDL 仍生成 SQL，数据按表生成
-`DATABASE_<owner>_<table>_data.dmp`；空表不生成 DMP。
+`output/DATABASE_<owner>_<table>_data.dmp`；空表不生成 DMP。
 `case_sensitive=auto` 会从 `SYSTEM.DBF` 第 4 页偏移 `0x2C` 读取建库标志并写入
 DMP 文件头，避免 `dimp` 因大小写敏感参数不一致等待人工确认。
 
@@ -395,7 +422,7 @@ unload object / table / user / database
 
 ## dmdul_dict 字典目录
 
-`bootstrap;` 会在输出目录生成 `dmdul_dict`。这些 TSV 文件可以人工修正，修正后执行：
+`bootstrap;` 会在工作目录生成 `dmdul_dict`。这些 TSV 文件可以人工修正，修正后执行：
 
 ```text
 DMDUL> load dictionary;
@@ -594,6 +621,7 @@ dm.ini
 init.dul
 control.dul
 dmdul_dict/
+output/
 dul.log
 *.sql
 *.csv

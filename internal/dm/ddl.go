@@ -794,6 +794,8 @@ func parseDDLColumnRow(page []byte, rowOff int, pageNo uint32, slotNo uint16, sl
 	if !isSafeShortText(name) || !isSafeShortText(dataType) {
 		return columnDef{}, false
 	}
+	scale := int16(binary.LittleEndian.Uint16(page[rowOff+0x0F:]))
+	dataType = normalizeCatalogColumnType(dataType, scale)
 	rowAbs := uint64(pageNo)*uint64(pageSize) + uint64(rowOff)
 	return columnDef{
 		TableID:  binary.LittleEndian.Uint32(page[rowOff+0x05:]),
@@ -801,7 +803,7 @@ func parseDDLColumnRow(page []byte, rowOff int, pageNo uint32, slotNo uint16, sl
 		Name:     name,
 		DataType: dataType,
 		Length:   binary.LittleEndian.Uint32(page[rowOff+0x0B:]),
-		Scale:    int16(binary.LittleEndian.Uint16(page[rowOff+0x0F:])),
+		Scale:    scale,
 		Nullable: nullable,
 		Default:  parseDDLDefault(page, next, decoder),
 		Location: ddlLocation{PageNo: pageNo, SlotNo: slotNo, SlotOffset: slotOff, RowOffset: rowAbs},
@@ -1933,7 +1935,7 @@ func renderConstraints(out *strings.Builder, objects map[uint32]dictionaryObject
 		}
 		owner := quoteIdent(table.Owner)
 		tableName := quoteIdent(table.Name)
-		consName := quoteIdent(consObj.Name)
+		consName := recoveredConstraintNameClause(consObj.Name)
 		switch cons.Type {
 		case "P", "U":
 			cols := ddlColumns(columnsFromIndex(cons.IndexID, cons.TableID, indexes, columnsByTableColID), false)
@@ -1944,12 +1946,12 @@ func renderConstraints(out *strings.Builder, objects map[uint32]dictionaryObject
 			if cons.Type == "U" {
 				kind = "UNIQUE"
 			}
-			out.WriteString(fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s %s (%s);\n", owner, tableName, consName, kind, cols))
+			out.WriteString(fmt.Sprintf("ALTER TABLE %s.%s ADD %s%s (%s);\n", owner, tableName, consName, kind, cols))
 		case "C":
 			if cons.CheckInfo == "" {
 				continue
 			}
-			out.WriteString(fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s CHECK (%s);\n", owner, tableName, consName, cons.CheckInfo))
+			out.WriteString(fmt.Sprintf("ALTER TABLE %s.%s ADD %sCHECK (%s);\n", owner, tableName, consName, cons.CheckInfo))
 		case "F":
 			childCols := ddlColumns(columnsFromIndex(cons.IndexID, cons.TableID, indexes, columnsByTableColID), false)
 			parentIndexObj, ok := objects[cons.FIndexID]
@@ -1964,11 +1966,32 @@ func renderConstraints(out *strings.Builder, objects map[uint32]dictionaryObject
 			if parentCols == "" {
 				continue
 			}
-			out.WriteString(fmt.Sprintf("ALTER TABLE %s.%s ADD CONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s.%s (%s);\n",
+			out.WriteString(fmt.Sprintf("ALTER TABLE %s.%s ADD %sFOREIGN KEY (%s) REFERENCES %s.%s (%s);\n",
 				owner, tableName, consName, childCols, quoteIdent(parentTable.Owner), quoteIdent(parentTable.Name), parentCols))
 		}
 	}
 	out.WriteString("\n")
+}
+
+func recoveredConstraintNameClause(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" || isDMGeneratedConstraintName(name) {
+		return ""
+	}
+	return "CONSTRAINT " + quoteIdent(name) + " "
+}
+
+func isDMGeneratedConstraintName(name string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(name))
+	if len(upper) <= len("CONS") || !strings.HasPrefix(upper, "CONS") {
+		return false
+	}
+	for _, ch := range upper[len("CONS"):] {
+		if ch < '0' || ch > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func renderComments(out *strings.Builder, tables map[uint32]dictionaryObject, columnsByTable map[uint32][]columnDef, tableComments map[ownerTableKey]tableComment, columnComments map[ownerTableColumnKey]columnComment, matcher ownerMatcher, tableMatcher tableNameMatcher) {
@@ -2100,16 +2123,19 @@ func formatColumnType(dataType string, length uint32, scale int16) string {
 	charTypes := map[string]bool{
 		"CHAR": true, "CHARACTER": true, "VARCHAR": true, "VARCHAR2": true,
 		"NCHAR": true, "NVARCHAR": true, "NVARCHAR2": true, "VARCHARACTER": true,
+		"CHARACTER VARYING": true, "NATIONAL CHAR": true, "NATIONAL CHARACTER": true,
+		"NATIONAL CHAR VARYING": true, "NATIONAL CHARACTER VARYING": true, "NCHAR VARYING": true,
 	}
-	binaryTypes := map[string]bool{"BINARY": true, "VARBINARY": true, "LONGVARBINARY": true}
+	binaryTypes := map[string]bool{"BINARY": true, "VARBINARY": true, "RAW": true}
 	noLengthTypes := map[string]bool{
-		"INT": true, "INTEGER": true, "BIGINT": true, "SMALLINT": true, "TINYINT": true, "BYTE": true,
+		"INT": true, "INTEGER": true, "PLS_INTEGER": true, "BIGINT": true, "SMALLINT": true, "TINYINT": true, "BYTE": true,
 		"DATE": true,
-		"TEXT": true, "LONGVARCHAR": true, "CLOB": true, "BLOB": true, "IMAGE": true,
-		"BIT": true, "BOOLEAN": true, "BOOL": true,
-		"REAL": true, "FLOAT": true, "DOUBLE": true, "DOUBLE PRECISION": true,
-		"ROWID": true, "INTERVAL DAY TO SECOND": true,
-		"INTERVAL YEAR TO MONTH": true, "INTERVAL YEAR": true, "INTERVAL MONTH": true,
+		"TEXT": true, "LONGVARCHAR": true, "LONGVARBINARY": true, "LONG RAW": true, "CLOB": true, "NCLOB": true, "BLOB": true, "IMAGE": true,
+		"BFILE": true, "JSON": true, "JSONB": true,
+		"XMLTYPE": true,
+		"BIT":     true, "BOOLEAN": true, "BOOL": true,
+		"REAL": true, "BINARY_FLOAT": true, "FLOAT": true, "DOUBLE": true, "DOUBLE PRECISION": true, "BINARY_DOUBLE": true,
+		"ROWID": true,
 	}
 	timePrecisionTypes := map[string]bool{
 		"DATETIME": true, "TIME": true, "TIMESTAMP": true,
@@ -2118,6 +2144,9 @@ func formatColumnType(dataType string, length uint32, scale int16) string {
 	}
 	numberTypes := map[string]bool{"NUMBER": true, "NUMERIC": true, "DEC": true, "DECIMAL": true}
 	switch {
+	case isYearMonthIntervalDataType(upper) || isDayTimeIntervalDataType(upper):
+		formatted, _ := formatIntervalColumnType(upper, scale)
+		return formatted
 	case charTypes[upper]:
 		if length > 0 {
 			return fmt.Sprintf("%s(%d)", dt, length)
@@ -2131,13 +2160,14 @@ func formatColumnType(dataType string, length uint32, scale int16) string {
 	case noLengthTypes[upper]:
 		return dt
 	case timePrecisionTypes[upper]:
-		if scale > 0 && scale <= 6 {
+		precision := timeFractionalPrecision(scale)
+		if precision > 0 && precision <= 9 {
 			if idx := strings.Index(strings.ToUpper(dt), " WITH "); idx >= 0 {
 				base := strings.TrimSpace(dt[:idx])
 				suffix := strings.TrimSpace(dt[idx+6:])
-				return fmt.Sprintf("%s(%d) WITH %s", base, scale, suffix)
+				return fmt.Sprintf("%s(%d) WITH %s", base, precision, suffix)
 			}
-			return fmt.Sprintf("%s(%d)", dt, scale)
+			return fmt.Sprintf("%s(%d)", dt, precision)
 		}
 		return dt
 	case numberTypes[upper]:

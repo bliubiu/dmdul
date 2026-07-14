@@ -78,12 +78,23 @@ func renderDMPForDataRowWithMeta(info dataTableInfo, row []byte, decoder textDec
 
 func dmpFieldForDataColumn(col columnDef, value any, charset dmpCharsetHeader) (DMPField, bool, error) {
 	typ := normalizeDataType(col.DataType)
+	if isJSONDataType(typ) {
+		materialized, err := materializeDataValue(value)
+		if err != nil {
+			return DMPField{}, false, err
+		}
+		raw, err := encodeDMPText(fmt.Sprintf("%v", materialized), charset)
+		if err != nil {
+			return DMPField{}, false, err
+		}
+		return DMPLongField(raw), false, nil
+	}
 	if lob, ok := value.(dmLOBValue); ok {
 		return dmpFieldForLOBValue(col, lob, charset)
 	}
 	switch typ {
-	case "BIT", "BOOL", "BOOLEAN", "BYTE", "TINYINT", "SMALLINT", "INT", "INTEGER", "BIGINT",
-		"REAL", "FLOAT", "DOUBLE", "DOUBLE PRECISION", "NUMBER", "NUMERIC", "DEC", "DECIMAL":
+	case "BIT", "BOOL", "BOOLEAN", "BYTE", "TINYINT", "SMALLINT", "INT", "INTEGER", "PLS_INTEGER", "BIGINT",
+		"REAL", "BINARY_FLOAT", "FLOAT", "DOUBLE", "DOUBLE PRECISION", "BINARY_DOUBLE", "NUMBER", "NUMERIC", "DEC", "DECIMAL":
 		return DMPShortField([]byte(fmt.Sprintf("%v", value))), false, nil
 	case "DATE":
 		year, month, day, err := parseDMPDate(fmt.Sprintf("%v", value))
@@ -114,8 +125,16 @@ func dmpFieldForDataColumn(col columnDef, value any, charset dmpCharsetHeader) (
 		}
 		return DMPShortField(raw), false, nil
 	case "INTERVAL YEAR", "INTERVAL MONTH", "INTERVAL YEAR TO MONTH",
-		"INTERVAL DAY TO SECOND":
+		"INTERVAL DAY", "INTERVAL HOUR", "INTERVAL MINUTE", "INTERVAL SECOND",
+		"INTERVAL DAY TO HOUR", "INTERVAL DAY TO MINUTE", "INTERVAL DAY TO SECOND",
+		"INTERVAL HOUR TO MINUTE", "INTERVAL HOUR TO SECOND", "INTERVAL MINUTE TO SECOND":
 		return DMPShortField([]byte(formatDMPInterval(fmt.Sprintf("%v", value), strings.TrimPrefix(typ, "INTERVAL ")))), false, nil
+	case "BFILE":
+		raw, err := encodeDMPText(fmt.Sprintf("%v", value), charset)
+		if err != nil {
+			return DMPField{}, false, err
+		}
+		return DMPShortField(raw), false, nil
 	case "ROWID":
 		return DMPShortField([]byte(fmt.Sprintf("%v", value))), false, nil
 	}
@@ -180,7 +199,7 @@ func sameDMPCharset(left string, right string) bool {
 
 func isBinaryLOBDataType(dataType string) bool {
 	switch normalizeDataType(dataType) {
-	case "BLOB", "IMAGE", "LONGVARBINARY":
+	case "BLOB", "IMAGE", "LONGVARBINARY", "LONG RAW":
 		return true
 	default:
 		return false
@@ -223,19 +242,19 @@ func parseDMPTime(value string) (int, int, int, int, string, error) {
 	hour, err1 := strconv.Atoi(parts[0])
 	minute, err2 := strconv.Atoi(parts[1])
 	second, err3 := strconv.Atoi(parts[2])
-	microsecond := 0
+	nanosecond := 0
 	if len(mainAndFraction) == 2 {
 		fraction := mainAndFraction[1]
-		if len(fraction) > 6 {
-			fraction = fraction[:6]
+		if len(fraction) > 9 {
+			fraction = fraction[:9]
 		}
-		fraction += strings.Repeat("0", 6-len(fraction))
-		microsecond, _ = strconv.Atoi(fraction)
+		fraction += strings.Repeat("0", 9-len(fraction))
+		nanosecond, _ = strconv.Atoi(fraction)
 	}
 	if err1 != nil || err2 != nil || err3 != nil || hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59 {
 		return 0, 0, 0, 0, "", fmt.Errorf("invalid TIME value %q", value)
 	}
-	return hour, minute, second, microsecond, timezone, nil
+	return hour, minute, second, nanosecond, timezone, nil
 }
 
 func encodeDMPTimestamp(value string) ([]byte, error) {
@@ -247,7 +266,7 @@ func encodeDMPTimestamp(value string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	hour, minute, second, microsecond, _, err := parseDMPTime(parts[1])
+	hour, minute, second, nanosecond, _, err := parseDMPTime(parts[1])
 	if err != nil {
 		return nil, err
 	}
@@ -255,7 +274,7 @@ func encodeDMPTimestamp(value string) ([]byte, error) {
 	for i, component := range []int{year, month, day, hour, minute, second} {
 		binary.LittleEndian.PutUint16(raw[i*2:i*2+2], uint16(component))
 	}
-	binary.LittleEndian.PutUint32(raw[12:16], uint32(microsecond)*1000)
+	binary.LittleEndian.PutUint32(raw[12:16], uint32(nanosecond))
 	return raw, nil
 }
 

@@ -31,6 +31,11 @@ dictionary recovery to SQL/CSV/DMP data output and official `dimp` loading.
 - Added RANGE/LIST/HASH partition-table DMP compatibility with `dimp`; rows are exported through the parent table and routed by DM during import.
 - Added UTF-8, GB18030, and EUC-KR DMP headers, including page size, extent size, `UNICODE_FLAG`, and `CASE_SENSITIVE` metadata.
 - Added standard two-stage bootstrap through page-0 anchors, storage roots, internal page references, and leaf chains.
+- Added complete regular-column type recovery for SQL/CSV/DMP paths, including 13 INTERVAL
+  qualifiers, 9-digit timestamps, timezone types, ROWID, BFILE, JSON/JSONB, national character
+  variants, and DM-compatible aliases.
+- Added `docs/data-types.md` with the official-document comparison, catalog normalization rules,
+  output-format limits, and the 2026-07-13 DM8 validation matrix.
 - Bootstrap now automatically detects database parameters from offline files.
 - Added persistent parameter metadata in init.dul.
 - Added interactive commands:
@@ -52,9 +57,24 @@ Supported parameters:
 
 ### Improved
 
+- Grouped default `unload` and `recover` artifacts under a dedicated `output/` directory beside `dmdul_dict`; explicit `output_dir` still overrides the destination.
+- Kept `init.dul`, `control.dul`, `dul.log`, and `dmdul_dict` in the working/data directory so large user/database exports no longer clutter it.
 - Avoid using stale init.dul charset/case settings when switching databases.
 - Database metadata is now associated with the current SYSTEM.DBF.
 - Parameter loading can restore previous bootstrap environment.
+- DDL formatting now preserves lengths for `CHARACTER VARYING`, `NATIONAL CHARACTER`,
+  `NATIONAL CHARACTER VARYING`, and `NCHAR VARYING` dictionary types.
+
+### Fixed
+
+- Fixed `BINARY(n)` row decoding: DM stores it as a fixed-width field, not a length-prefixed value.
+- Fixed the negative NUMBER base-100 exponent, which shifted some negative decimals by two digits.
+- Fixed ROWID formatting to decode the physical 12-byte `epno/partno/real_rowid` layout and emit
+  the official 18-character value.
+- Fixed generated `CONS<number>` constraint names: recovered DDL now lets DM assign a new name,
+  because those internal names cannot be reused in `ALTER TABLE ADD CONSTRAINT`.
+- Documented and validated the DM8 JSON/JSONB DMP limitation: use `FAST_LOAD=N`; both dmdul and
+  official `dexp` files can become unqueryable when imported with `FAST_LOAD=Y`.
 
 ### Parameter Detection
 
@@ -103,6 +123,9 @@ Native DMP validation also includes:
 - RANGE/LIST/HASH partition tables
 - 32 MiB out-of-line LOB streaming
 - multi-phase output and 64-bit size regression coverage
+- official `dimp` loading of the complete regular-type matrix
+- 15 JSONB scalar/container samples with `FAST_LOAD=N`
+- recovered SQL DDL and data replay in an isolated schema
 
 ## v0.4.0
 

@@ -13,6 +13,7 @@ dmdul.exe
 init.dul
 control.dul
 dmdul_dict/
+output/             # 首次 unload/recover 时自动创建
 dul.log
 SYSTEM.DBF
 MAIN.DBF
@@ -133,14 +134,14 @@ DMDUL> list table HR_TEST;
 DMDUL> unload table HR_TEST.EMP_INFO;
 ```
 
-默认会生成两个文件。未设置 `output_dir` 时，如果设置过 `data_dir`，文件会输出到
-`data_dir`；如果也没有设置 `data_dir`，文件会输出到当前目录。`control.dul` 和
-`dul.log` 也遵循同样的目录规则。交互模式还会自动生成 `init.dul`：
-未设置 `data_dir` 时写到当前目录，设置 `data_dir` 后写到 `data_dir`。
+默认会在工作目录下自动创建 `output` 子目录并生成两个文件。设置过 `data_dir` 时，
+工作目录是 `data_dir`；否则是当前目录。`control.dul`、`dul.log`、`init.dul` 和
+`dmdul_dict` 留在工作目录，与 `output` 同级。显式执行 `set output_dir <directory>;`
+时，卸载结果直接写入指定目录，其他工作文件不移动。
 
 ```text
-HR_TEST_EMP_INFO_ddl.sql
-HR_TEST_EMP_INFO_data.sql
+output/HR_TEST_EMP_INFO_ddl.sql
+output/HR_TEST_EMP_INFO_data.sql
 ```
 
 也可以指定输出前缀：
@@ -152,8 +153,8 @@ DMDUL> unload table HR_TEST.EMP_INFO to emp_info;
 生成：
 
 ```text
-emp_info_ddl.sql
-emp_info_data.sql
+output/emp_info_ddl.sql
+output/emp_info_data.sql
 ```
 
 导出 CSV 数据：
@@ -166,8 +167,8 @@ DMDUL> unload table HR_TEST.EMP_INFO;
 生成：
 
 ```text
-HR_TEST_EMP_INFO_ddl.sql
-HR_TEST_EMP_INFO_data.csv
+output/HR_TEST_EMP_INFO_ddl.sql
+output/HR_TEST_EMP_INFO_data.csv
 ```
 
 导出达梦纯数据 DMP：
@@ -180,12 +181,14 @@ DMDUL> unload table HR_TEST.EMP_INFO;
 生成：
 
 ```text
-HR_TEST_EMP_INFO_ddl.sql
-HR_TEST_EMP_INFO_data.dmp
+output/HR_TEST_EMP_INFO_ddl.sql
+output/HR_TEST_EMP_INFO_data.dmp
 ```
 
 DMP 使用 `bootstrap` 识别出的数据库字符集，支持 UTF-8、GB18030 和 EUC-KR。
 数据文件可在先执行 DDL 后，通过 `dimp DATA_ONLY=Y FAST_LOAD=Y` 按表装载。
+JSON/JSONB 表是例外，必须使用 `FAST_LOAD=N`；当前测试中官方 `dexp` 文件也会在
+`FAST_LOAD=Y` 后产生不可查询的 JSONB 内容。
 DM 当前 DMP 行格式不能保存 `TIME` 的小数秒；遇到非零小数秒时 DMDUL 会打印明确告警。
 `case_sensitive=auto` 会读取 `SYSTEM.DBF` 第 4 页偏移 `0x2C` 的建库大小写敏感标志，
 并写入 DMP 文件头，不依赖 `dm.ini`。若文件损坏导致该控制字节无法识别，可执行
@@ -217,7 +220,7 @@ DMDUL> recover table USERS1.T_TEST to users1_t_test_drop_recover;
 DMDUL> unload object HR_TEST;
 ```
 
-默认生成 `HR_TEST_objects.sql`，其中包含该 owner 可恢复的用户定义、角色授权、表、
+默认生成 `output/HR_TEST_objects.sql`，其中包含该 owner 可恢复的用户定义、角色授权、表、
 索引、约束、注释、视图、序列、存储过程、函数、包、触发器、同义词和对象权限。
 导出全部 owner 的对象字典：
 
@@ -225,7 +228,7 @@ DMDUL> unload object HR_TEST;
 DMDUL> unload object all;
 ```
 
-默认生成 `DATABASE_objects.sql`。也可以使用 `to` 指定输出前缀：
+默认生成 `output/DATABASE_objects.sql`。也可以使用 `to` 指定输出前缀：
 
 ```text
 DMDUL> unload object HR_TEST to hr_test_dictionary;
@@ -242,19 +245,19 @@ DMDUL> unload user HR_TEST;
 包、同义词或用户定义。例如 SQL 格式会生成：
 
 ```text
-HR_TEST_EMP_INFO_ddl.sql
-HR_TEST_EMP_INFO_data.sql
-HR_TEST_T_LOG_HEAP_ddl.sql
-HR_TEST_T_LOG_HEAP_data.sql
+output/HR_TEST_EMP_INFO_ddl.sql
+output/HR_TEST_EMP_INFO_data.sql
+output/HR_TEST_T_LOG_HEAP_ddl.sql
+output/HR_TEST_T_LOG_HEAP_data.sql
 ```
 
 如果 `data_format=csv`，每张表仍会生成自己的 DDL，数据写入对应 CSV；没有数据的表
 只保留 DDL，不生成空 CSV。例如：
 
 ```text
-HR_TEST_EMP_INFO_ddl.sql
-HR_TEST_EMP_INFO_data.csv
-HR_TEST_T_LOG_HEAP_ddl.sql
+output/HR_TEST_EMP_INFO_ddl.sql
+output/HR_TEST_EMP_INFO_data.csv
+output/HR_TEST_T_LOG_HEAP_ddl.sql
 ```
 
 如果 `data_format=dmp`，同样按表生成 `<prefix>_<table>_data.dmp`，空表不生成 DMP。
@@ -283,8 +286,8 @@ DMDUL> unload database;
 默认生成：
 
 ```text
-DATABASE_ddl.sql
-DATABASE_data.sql
+output/DATABASE_ddl.sql
+output/DATABASE_data.sql
 ```
 
 `DATABASE_ddl.sql` 包含可识别用户、用户表、视图、序列、存储过程/函数/包、触发器、同义词和表/视图/序列授权 DDL；`DATABASE_data.sql`
@@ -294,17 +297,17 @@ DATABASE_data.sql
 分别生成 CSV 文件；没有数据的表不会生成空 CSV。例如：
 
 ```text
-DATABASE_ddl.sql
-DATABASE_HR_TEST_EMP_INFO_data.csv
-DATABASE_SYSDBA_T_data.csv
+output/DATABASE_ddl.sql
+output/DATABASE_HR_TEST_EMP_INFO_data.csv
+output/DATABASE_SYSDBA_T_data.csv
 ```
 
 如果 `data_format=dmp`，会生成一个全库 DDL 文件，并按 owner/table 分别生成纯数据 DMP：
 
 ```text
-DATABASE_ddl.sql
-DATABASE_HR_TEST_EMP_INFO_data.dmp
-DATABASE_SYSDBA_T_data.dmp
+output/DATABASE_ddl.sql
+output/DATABASE_HR_TEST_EMP_INFO_data.dmp
+output/DATABASE_SYSDBA_T_data.dmp
 ```
 
 每表一个 DMP 便于失败后逐表重试和并行执行 `dimp FAST_LOAD=Y`；没有数据的表不会生成空 DMP。
