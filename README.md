@@ -14,7 +14,7 @@
 - 尝试恢复 `DROP` / `TRUNCATE` 后尚未被覆盖的残留数据；
 - 处理大表、分区表、行外 LOB 和 `STORAGE(USING LONG ROW)` 场景。
 
-**v0.4.1 主题：Standard Bootstrap & Native DMP Export**
+**v0.5.1 主题：Direct Page Plan & Layered Fallback**
 
 ![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go)
 ![License](https://img.shields.io/github/license/greatfinish/dmdul)
@@ -70,8 +70,11 @@ SYSTEM.DBF / dm.ctl / user tablespace DBF
   序列、过程、函数、包、包体、触发器、同义词和对象授权。
 - **三级数据卸载**：支持 `unload table`、`unload user` 和 `unload database`，输出
   SQL、CSV 或每表一个纯数据 DMP。
-- **精确数据页定位**：优先 `storage root -> internal page refs -> leaf chain`，使用段范围
-  辅助校验，最后才进入段扫描或全文件救援扫描。
+- **精确数据页定位**：为选中表及分区按 `storage root -> internal page refs -> leaf chain`
+  生成 page plan；计划完整时仅用 `ReadAt` 读取计划页，失败时依次回退到同 group
+  `storage_id` 扫描和段范围读取，只有 `recover table` 才执行全文件残留页扫描。
+- **可诊断数据卸载**：控制台和 `dul.log` 记录 planned pages、direct pages read、
+  fallback pages scanned 及具体 fallback reason，便于核对实际物理读取范围。
 - **完整常规类型路径**：支持定长/变长字符与二进制、精确/近似数值、9 位时间戳、
   时区类型、13 种 INTERVAL、ROWID、BFILE、JSON/JSONB，以及国家字符兼容类型。
 - **复杂行与大对象**：支持显式 2-bit NULL metadata、ALTER TABLE 历史短行、21 字节
@@ -556,7 +559,7 @@ go test ./...
 Windows 构建：
 
 ```powershell
-$ver = "v0.4.1"
+$ver = git describe --tags --abbrev=0
 $commit = git rev-parse --short HEAD
 $buildTime = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
 
@@ -666,7 +669,9 @@ dul.log
 | 版本   | 方向 |
 | --- | --- |
 | v0.4.1 | Standard Bootstrap、磁盘字典、原生兼容 DMP、参数持久化 |
-| v0.5.x | 迁移行/链式行、损坏页诊断、更多类型和 DM8 版本兼容验证 |
+| v0.5.0 | 完整常规类型矩阵、SQL/CSV/DMP 一致解析、统一 `output/` 输出目录 |
+| v0.5.1 | page plan 直读、同 group storage fallback、segment fallback、卸载 I/O 诊断 |
+| v0.6.x | 迁移行/链式行、损坏页诊断、更多 DM8 版本兼容验证 |
 | v1.0.0 | 固化文件格式兼容矩阵、恢复报告和稳定发布流程 |
 
 ------

@@ -12,7 +12,15 @@ v主版本.次版本.修订版本
 
 ------
 
-## Unreleased
+## v0.5.1 - Direct Page Plan & Layered Fallback
+
+Release theme: execute normal table unload through direct page-plan reads, with bounded layered
+fallbacks and auditable physical I/O diagnostics.
+
+### Added
+
+- `unload` / `recover` 控制台与 `dul.log` 新增 `planned pages`、`direct pages read`、
+  `fallback pages scanned` 和 `fallback reason` 诊断。
 
 ### Changed
 
@@ -21,15 +29,52 @@ v主版本.次版本.修订版本
 - page plan 不完整或计划页校验失败时，按“同 group `storage_id` 扫描 -> 段范围读取”分层回退；
   全文件残留页扫描仅用于 `recover table`。
 - `tables.tsv` 中的 `storage_id/root_file/root_page` 现在会直接参与数据页计划生成。
-- `unload` / `recover` 控制台与 `dul.log` 新增 `planned pages`、`direct pages read`、
-  `fallback pages scanned` 和 `fallback reason` 诊断。
+
+### Fixed
+
 - leaf 链断裂、循环或页身份/storage id 不一致时不再接受部分 page plan。
+- 精确 page ref 不再被可能过期的段范围或表空间元数据错误否决。
 
 ### Validation
 
 - 新增“计划成功时直接读取页数等于计划页数”回归测试。
 - 新增断链、同 group storage fallback、segment fallback 和 recover 全文件扫描测试。
 - `go test -count=1 ./...` 与 `go vet ./...` 通过。
+
+## v0.5.0 - Data Type Matrix & Output Layout
+
+Release theme: complete regular-column recovery across SQL/CSV/DMP and organize large unload
+artifact sets under a predictable output directory.
+
+### Added
+
+- 补齐 SQL/CSV/DMP 共用的常规字段类型恢复路径，包括 13 种 INTERVAL、9 位时间戳、
+  带时区时间、ROWID、BFILE、JSON/JSONB、国家字符类型及达梦兼容别名。
+- 新增 `docs/data-types.md`，记录官网类型对照、字典类型归一化、输出格式限制和
+  2026-07-13 DM8 实机验证矩阵。
+
+### Changed
+
+- 默认 `unload` / `recover` 结果统一写入与 `dmdul_dict` 同级的 `output/` 目录；显式
+  `output_dir` 仍具有最高优先级。
+- `init.dul`、`control.dul`、`dul.log` 和 `dmdul_dict` 保留在工作目录，避免大型用户级或
+  整库导出污染工作目录。
+- DDL 格式化保留 `CHARACTER VARYING`、`NATIONAL CHARACTER`、
+  `NATIONAL CHARACTER VARYING` 和 `NCHAR VARYING` 的长度。
+
+### Fixed
+
+- 修复 `BINARY(n)` 被误按变长字段解析的问题。
+- 修复负数 NUMBER base-100 指数偏移导致部分负小数错位的问题。
+- 修复 ROWID 物理 12 字节 `epno/partno/real_rowid` 布局及 18 字符显示值输出。
+- 生成的 `CONS<number>` 内部约束名不再写入恢复 DDL，由达梦重新分配名称。
+- 明确 JSON/JSONB DMP 应使用 `FAST_LOAD=N`，避免导入后内容不可查询。
+
+### Validation
+
+- 完整常规类型矩阵通过官方 `dimp` 导入验证。
+- 15 个 JSONB 标量和容器样例通过 `FAST_LOAD=N` 验证。
+- 恢复后的 SQL DDL 与数据在隔离模式中完成回放验证。
 
 ## v0.4.1 - Standard Bootstrap & Native DMP Export
 
@@ -50,11 +95,6 @@ dictionary recovery to SQL/CSV/DMP data output and official `dimp` loading.
 - Added RANGE/LIST/HASH partition-table DMP compatibility with `dimp`; rows are exported through the parent table and routed by DM during import.
 - Added UTF-8, GB18030, and EUC-KR DMP headers, including page size, extent size, `UNICODE_FLAG`, and `CASE_SENSITIVE` metadata.
 - Added standard two-stage bootstrap through page-0 anchors, storage roots, internal page references, and leaf chains.
-- Added complete regular-column type recovery for SQL/CSV/DMP paths, including 13 INTERVAL
-  qualifiers, 9-digit timestamps, timezone types, ROWID, BFILE, JSON/JSONB, national character
-  variants, and DM-compatible aliases.
-- Added `docs/data-types.md` with the official-document comparison, catalog normalization rules,
-  output-format limits, and the 2026-07-13 DM8 validation matrix.
 - Bootstrap now automatically detects database parameters from offline files.
 - Added persistent parameter metadata in init.dul.
 - Added interactive commands:
@@ -76,24 +116,9 @@ Supported parameters:
 
 ### Improved
 
-- Grouped default `unload` and `recover` artifacts under a dedicated `output/` directory beside `dmdul_dict`; explicit `output_dir` still overrides the destination.
-- Kept `init.dul`, `control.dul`, `dul.log`, and `dmdul_dict` in the working/data directory so large user/database exports no longer clutter it.
 - Avoid using stale init.dul charset/case settings when switching databases.
 - Database metadata is now associated with the current SYSTEM.DBF.
 - Parameter loading can restore previous bootstrap environment.
-- DDL formatting now preserves lengths for `CHARACTER VARYING`, `NATIONAL CHARACTER`,
-  `NATIONAL CHARACTER VARYING`, and `NCHAR VARYING` dictionary types.
-
-### Fixed
-
-- Fixed `BINARY(n)` row decoding: DM stores it as a fixed-width field, not a length-prefixed value.
-- Fixed the negative NUMBER base-100 exponent, which shifted some negative decimals by two digits.
-- Fixed ROWID formatting to decode the physical 12-byte `epno/partno/real_rowid` layout and emit
-  the official 18-character value.
-- Fixed generated `CONS<number>` constraint names: recovered DDL now lets DM assign a new name,
-  because those internal names cannot be reused in `ALTER TABLE ADD CONSTRAINT`.
-- Documented and validated the DM8 JSON/JSONB DMP limitation: use `FAST_LOAD=N`; both dmdul and
-  official `dexp` files can become unqueryable when imported with `FAST_LOAD=Y`.
 
 ### Parameter Detection
 
@@ -142,9 +167,6 @@ Native DMP validation also includes:
 - RANGE/LIST/HASH partition tables
 - 32 MiB out-of-line LOB streaming
 - multi-phase output and 64-bit size regression coverage
-- official `dimp` loading of the complete regular-type matrix
-- 15 JSONB scalar/container samples with `FAST_LOAD=N`
-- recovered SQL DDL and data replay in an isolated schema
 
 ## v0.4.0
 
