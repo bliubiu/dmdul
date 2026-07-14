@@ -461,6 +461,184 @@ func TestBuildStoragePagePlanUsesInternalNextWhenLeftmostChildIsMissing(t *testi
 	}
 }
 
+func TestBuildStoragePagePlanRejectsBrokenLeafChain(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "MAIN.DBF")
+	raw := make([]byte, 32*8192)
+	putTestDMPageHeader(raw[16*8192:17*8192], 4, 0, 16, dmPageKindBTreeLeaf, 1041)
+	putTestDMPageRef(raw[16*8192:17*8192], dmPageNextRefOff, 0, 17)
+	putTestDMPageHeader(raw[17*8192:18*8192], 4, 0, 17, dmPageKindBTreeLeaf, 9999)
+	putTestDMNullPageRef(raw[17*8192:18*8192], dmPageNextRefOff)
+	if err := os.WriteFile(path, raw, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cache := newDataFilePageCache([]dataFileRef{{key: dataFileKey{groupID: 4, fileID: 0}, path: path}}, 8192)
+	plan, reason := buildStoragePagePlanDetailed(indexDef{ID: 1041, GroupID: 4, RootFile: 0, RootPage: 16}, cache)
+	if len(plan) != 0 {
+		t.Fatalf("broken leaf chain must not return a partial plan: %+v", plan)
+	}
+	if !strings.Contains(reason, "storage_id=9999") {
+		t.Fatalf("unexpected broken-chain reason %q", reason)
+	}
+}
+
+func TestExportDataReadsOnlyPlannedPages(t *testing.T) {
+	dir := t.TempDir()
+	systemPath := filepath.Join(dir, "SYSTEM.DBF")
+	mainPath := filepath.Join(dir, "MAIN.DBF")
+	writeDataExportTestSystem(t, systemPath)
+	const storageID = 33555433
+	raw := make([]byte, 128*8192)
+	putTestDMPageHeader(raw[:8192], 4, 0, 0, 0, 0)
+	putTestIntDataPage(raw[96*8192:97*8192], 4, 0, 96, storageID, 100)
+	putTestDMPageRef(raw[96*8192:97*8192], dmPageNextRefOff, 0, 97)
+	putTestIntDataPage(raw[97*8192:98*8192], 4, 0, 97, storageID, 101)
+	putTestDMNullPageRef(raw[97*8192:98*8192], dmPageNextRefOff)
+	if err := os.WriteFile(mainPath, raw, 0644); err != nil {
+		t.Fatal(err)
+	}
+	dict := testDataExportDictionary(systemPath, storageID, 96, 0, 0)
+	result, err := ExportData(DataExportOptions{
+		SystemPath:  systemPath,
+		DataDir:     dir,
+		OutputPath:  filepath.Join(dir, "planned.sql"),
+		OwnerFilter: "APP",
+		TableFilter: "APP.T_PLAN",
+		Charset:     "utf-8",
+		Dictionary:  dict,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.PlannedPages != 2 || result.DirectPagesRead != result.PlannedPages || result.FallbackPagesScanned != 0 || result.PagesScanned != 2 {
+		t.Fatalf("unexpected page counters: planned=%d direct=%d fallback=%d total=%d", result.PlannedPages, result.DirectPagesRead, result.FallbackPagesScanned, result.PagesScanned)
+	}
+	if result.DataFileCount != 1 || result.RowsExported != 2 || len(result.FallbackReasons) != 0 {
+		t.Fatalf("unexpected export result: %+v", result)
+	}
+	if sql := readDataExportTestFile(t, result.OutputPath); !strings.Contains(sql, "VALUES (100)") || !strings.Contains(sql, "VALUES (101)") {
+		t.Fatalf("planned export did not recover the row: %q", sql)
+	}
+}
+
+func TestExportDataStorageFallbackScansOnlyMatchingGroup(t *testing.T) {
+	dir := t.TempDir()
+	systemPath := filepath.Join(dir, "SYSTEM.DBF")
+	writeDataExportTestSystem(t, systemPath)
+	const storageID = 33555434
+	mainRaw := make([]byte, 8*8192)
+	putTestDMPageHeader(mainRaw[:8192], 4, 0, 0, 0, 0)
+	putTestIntDataPage(mainRaw[3*8192:4*8192], 4, 0, 3, storageID, 200)
+	if err := os.WriteFile(filepath.Join(dir, "MAIN.DBF"), mainRaw, 0644); err != nil {
+		t.Fatal(err)
+	}
+	otherRaw := make([]byte, 13*8192)
+	putTestDMPageHeader(otherRaw[:8192], 5, 0, 0, 0, 0)
+	putTestIntDataPage(otherRaw[4*8192:5*8192], 5, 0, 4, storageID, 999)
+	if err := os.WriteFile(filepath.Join(dir, "OTHER.DBF"), otherRaw, 0644); err != nil {
+		t.Fatal(err)
+	}
+	dict := testDataExportDictionary(systemPath, storageID, 7, 0, 0)
+	result, err := ExportData(DataExportOptions{
+		SystemPath:  systemPath,
+		DataDir:     dir,
+		OutputPath:  filepath.Join(dir, "storage-fallback.sql"),
+		OwnerFilter: "APP",
+		TableFilter: "APP.T_PLAN",
+		Charset:     "utf-8",
+		Dictionary:  dict,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.PlannedPages != 0 || result.DirectPagesRead != 0 || result.FallbackPagesScanned != 8 || result.DataFileCount != 1 {
+		t.Fatalf("storage fallback escaped its group: %+v", result)
+	}
+	if sql := readDataExportTestFile(t, result.OutputPath); !strings.Contains(sql, "VALUES (200)") || strings.Contains(sql, "VALUES (999)") {
+		t.Fatalf("unexpected storage fallback rows: %q", sql)
+	}
+}
+
+func TestExportDataUsesSegmentAfterStorageFallbackMiss(t *testing.T) {
+	dir := t.TempDir()
+	systemPath := filepath.Join(dir, "SYSTEM.DBF")
+	writeDataExportTestSystem(t, systemPath)
+	const storageID = 33555435
+	raw := make([]byte, 8*8192)
+	putTestDMPageHeader(raw[:8192], 4, 0, 0, 0, 0)
+	putTestIntDataPage(raw[4*8192:5*8192], 4, 0, 4, 44556677, 300)
+	if err := os.WriteFile(filepath.Join(dir, "MAIN.DBF"), raw, 0644); err != nil {
+		t.Fatal(err)
+	}
+	dict := testDataExportDictionary(systemPath, storageID, 7, 4, 1)
+	result, err := ExportData(DataExportOptions{
+		SystemPath:  systemPath,
+		DataDir:     dir,
+		OutputPath:  filepath.Join(dir, "segment-fallback.sql"),
+		OwnerFilter: "APP",
+		TableFilter: "APP.T_PLAN",
+		Charset:     "utf-8",
+		Dictionary:  dict,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.FallbackPagesScanned != 9 || result.RowsExported != 1 {
+		t.Fatalf("segment fallback counters/result are wrong: %+v", result)
+	}
+	if sql := readDataExportTestFile(t, result.OutputPath); !strings.Contains(sql, "VALUES (300)") {
+		t.Fatalf("segment fallback did not recover the row: %q", sql)
+	}
+	foundReason := false
+	for _, reason := range result.FallbackReasons {
+		if strings.Contains(reason, "scanning segment") {
+			foundReason = true
+		}
+	}
+	if !foundReason {
+		t.Fatalf("segment fallback reason is missing: %v", result.FallbackReasons)
+	}
+}
+
+func TestExportDataRecoveryModeIsTheFullFileScanPath(t *testing.T) {
+	dir := t.TempDir()
+	systemPath := filepath.Join(dir, "SYSTEM.DBF")
+	writeDataExportTestSystem(t, systemPath)
+	const storageID = 33555436
+	mainRaw := make([]byte, 8*8192)
+	putTestDMPageHeader(mainRaw[:8192], 4, 0, 0, 0, 0)
+	putTestIntDataPage(mainRaw[3*8192:4*8192], 4, 0, 3, storageID, 400)
+	if err := os.WriteFile(filepath.Join(dir, "MAIN.DBF"), mainRaw, 0644); err != nil {
+		t.Fatal(err)
+	}
+	otherRaw := make([]byte, 13*8192)
+	putTestDMPageHeader(otherRaw[:8192], 5, 0, 0, 0, 0)
+	if err := os.WriteFile(filepath.Join(dir, "OTHER.DBF"), otherRaw, 0644); err != nil {
+		t.Fatal(err)
+	}
+	dict := testDataExportDictionary(systemPath, storageID, 3, 0, 0)
+	result, err := ExportData(DataExportOptions{
+		SystemPath:   systemPath,
+		DataDir:      dir,
+		OutputPath:   filepath.Join(dir, "recovery.sql"),
+		OwnerFilter:  "APP",
+		TableFilter:  "APP.T_PLAN",
+		Charset:      "utf-8",
+		RecoveryMode: true,
+		Dictionary:   dict,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.PlannedPages != 0 || result.DirectPagesRead != 0 || result.FallbackPagesScanned != 21 || result.DataFileCount != 2 || result.RowsExported != 1 {
+		t.Fatalf("recovery mode did not use the full-file path: %+v", result)
+	}
+	if len(result.FallbackReasons) != 1 || !strings.Contains(result.FallbackReasons[0], "full-file residual") {
+		t.Fatalf("recovery fallback reason is missing: %v", result.FallbackReasons)
+	}
+}
+
 func TestCandidateMatchesFileUsesPagePlanBeforeSegmentRange(t *testing.T) {
 	info := dataTableInfo{
 		table: dictionaryObject{ID: 1038, Owner: "SYSDBA", Name: "BIN_TEST2"},
@@ -472,19 +650,19 @@ func TestCandidateMatchesFileUsesPagePlanBeforeSegmentRange(t *testing.T) {
 			fileID:       0,
 			headerPage:   16,
 			blocks:       16,
-			tablespaceID: 5,
+			tablespaceID: 4,
 		},
 		segmentKnown: true,
 	}
 	file := dataFileRef{key: dataFileKey{groupID: 5, fileID: 0}}
 	if !candidateMatchesFile(info, file, 144) {
-		t.Fatal("exact page plan should take precedence over the old contiguous segment window")
+		t.Fatal("exact page plan should take precedence over stale segment identity and range metadata")
 	}
 	if candidateMatchesFile(info, file, 145) {
 		t.Fatal("page outside the exact page plan should not match")
 	}
 	if candidateMatchesFile(info, dataFileRef{key: dataFileKey{groupID: 4, fileID: 0}}, 144) {
-		t.Fatal("segment identity check should still reject a different tablespace")
+		t.Fatal("the exact page reference should reject a different tablespace")
 	}
 }
 
@@ -1427,6 +1605,57 @@ func TestTableNameMatcherAllDefaultBehavior(t *testing.T) {
 	if newTableNameMatcher("").allowed("SYSDBA", "BIN_TEST2") {
 		t.Fatal("empty matcher should not allow tables by itself")
 	}
+}
+
+func writeDataExportTestSystem(t *testing.T, path string) {
+	t.Helper()
+	raw := make([]byte, 5*8192)
+	binary.LittleEndian.PutUint32(raw[0x80:], 16)
+	binary.LittleEndian.PutUint32(raw[0x84:], 8192)
+	binary.LittleEndian.PutUint32(raw[0x8C:], 5)
+	raw[4*8192+0x2D] = 1
+	if err := os.WriteFile(path, raw, 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func testDataExportDictionary(systemPath string, storageID uint32, rootPage uint32, headerPage uint32, blocks uint32) *DictionaryInfo {
+	return &DictionaryInfo{
+		SystemPath: systemPath,
+		PageSize:   8192,
+		Users:      []DictionaryUser{{ID: 10, Name: "APP"}},
+		Tables: []DictionaryTable{{
+			ID: 1001, Owner: "APP", Name: "T_PLAN", ColumnCount: 1,
+			Tablespace: "MAIN", GroupID: 4, Storage: "CLUSTERBTR",
+			StorageID: storageID, RootFile: 0, RootPage: rootPage,
+			HeaderFile: 0, HeaderBlock: headerPage, Blocks: blocks, Extents: 1,
+		}},
+		Columns: []DictionaryColumn{{
+			TableID: 1001, TableOwner: "APP", TableName: "T_PLAN",
+			ColID: 1, Name: "ID", DataType: "INT", Nullable: "N",
+		}},
+	}
+}
+
+func putTestIntDataPage(page []byte, groupID uint16, fileID uint16, pageNo uint32, storageID uint32, value int32) {
+	putTestDMPageHeader(page, groupID, fileID, pageNo, dmPageKindRowData, storageID)
+	binary.LittleEndian.PutUint16(page[dataPageSlotCountOff:], 1)
+	binary.LittleEndian.PutUint16(page[dataPageFreeEndOff:], dataRowAreaStart+7)
+	binary.LittleEndian.PutUint16(page[dataPageRecordCountOff:], 1)
+	binary.LittleEndian.PutUint16(page[dataPageTreeLevelOff:], 0)
+	binary.BigEndian.PutUint16(page[dataRowAreaStart:], 7)
+	page[dataRowAreaStart+2] = 0
+	binary.LittleEndian.PutUint32(page[dataRowAreaStart+3:], uint32(value))
+	putTestDataPageSlot(page, len(page), 1, 1, dataRowAreaStart)
+}
+
+func readDataExportTestFile(t *testing.T, path string) string {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
 }
 
 func putTestRow(page []byte, pos int, length int, flag byte) {

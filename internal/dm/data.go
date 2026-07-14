@@ -54,25 +54,29 @@ type DataExportOptions struct {
 }
 
 type DataExportResult struct {
-	SystemPath        string
-	OutputPath        string
-	DataDir           string
-	PageSize          uint32
-	ObjectCount       int
-	TableCount        int
-	ColumnCount       int
-	AssistIndexCount  int
-	DataFileCount     int
-	PagesScanned      int
-	RowsLocated       int
-	RowsExported      int
-	RowsFailed        int
-	TablesWithRows    int
-	TablesWithoutRows int
-	TableRowCounts    []DataTableRowCount
-	TableOutputs      []DataTableOutput
-	OutputFormat      string
-	TimeFractionLoss  int
+	SystemPath           string
+	OutputPath           string
+	DataDir              string
+	PageSize             uint32
+	ObjectCount          int
+	TableCount           int
+	ColumnCount          int
+	AssistIndexCount     int
+	DataFileCount        int
+	PagesScanned         int
+	PlannedPages         int
+	DirectPagesRead      int
+	FallbackPagesScanned int
+	FallbackReasons      []string
+	RowsLocated          int
+	RowsExported         int
+	RowsFailed           int
+	TablesWithRows       int
+	TablesWithoutRows    int
+	TableRowCounts       []DataTableRowCount
+	TableOutputs         []DataTableOutput
+	OutputFormat         string
+	TimeFractionLoss     int
 }
 
 type DataTableOutput struct {
@@ -116,6 +120,9 @@ type dataTableInfo struct {
 	lobReader       *dmLOBReader
 	pagePlan        map[dataPageRef]bool
 	pagePlanKnown   bool
+	storageUnitID   uint32
+	scanGroupOnly   bool
+	scanGroupID     uint32
 	recoveryMode    bool
 	recoveryGroupID uint32
 	segment         tableSegment
@@ -737,6 +744,7 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 	}
 
 	assistByParentID := assistIndexesByParentID(tables, indexObjects, indexes)
+	mergeDictionaryStorageRoots(assistByParentID, dictionaryTables)
 	partitionsByTable, err := stream.partitionsByTable(decoder, tables, ownerMatcher)
 	if err != nil {
 		return nil, err
@@ -749,12 +757,9 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 	dataFilePages := newDataFilePageCache(dataFiles, pageSize)
 	lobReader := &dmLOBReader{cache: dataFilePages}
 	selectedTables := make(map[uint32]dataTableInfo)
+	storageUnits := make(map[uint32]dataTableInfo)
 	assistByID := make(map[uint32][]dataTableInfo)
-	neededFiles := make(map[dataFileKey]bool)
-	scanAllDataFiles := false
-	if opts.RecoveryMode {
-		scanAllDataFiles = true
-	}
+	planFailureReasons := make(map[uint32][]string)
 	for tableID, table := range tables {
 		if !ownerMatcher.allowed(table.Owner) || !tableMatcher.allowed(table.Owner, table.Name) || excludeMatcher.allowed(table.Owner, table.Name) {
 			continue
@@ -767,17 +772,27 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 			columns:         columnsByTable[tableID],
 			dataStorageID:   dataStorageIDForTable(dictionaryTables, dataStorageByTable, tableID),
 			lobReader:       lobReader,
+			storageUnitID:   tableID,
 			recoveryMode:    opts.RecoveryMode,
 			recoveryGroupID: dictionaryTableGroupID(dictionaryTables, tableID),
 			segment:         segmentByTableID(opts.Dictionary, tableID),
 			segmentKnown:    hasSegmentRange(opts.Dictionary, tableID),
 		}
 		selectedTables[tableID] = baseInfo
+		storageUnits[tableID] = baseInfo
 		for _, storage := range assistByParentID[tableID] {
 			if baseInfo.dataStorageID != 0 && storage.ID != baseInfo.dataStorageID {
 				continue
 			}
-			addKnownDataAssistID(assistByID, neededFiles, baseInfo, storage.ID, storage, buildStoragePagePlan(storage, dataFilePages))
+			var pagePlan map[dataPageRef]bool
+			var reason string
+			if !opts.RecoveryMode {
+				pagePlan, reason = buildStoragePagePlanDetailed(storage, dataFilePages)
+			}
+			addKnownDataAssistID(assistByID, baseInfo, storage.ID, storage, pagePlan)
+			if !opts.RecoveryMode && len(pagePlan) == 0 {
+				planFailureReasons[tableID] = append(planFailureReasons[tableID], formatStoragePlanFailure(baseInfo, storage.ID, reason))
+			}
 		}
 		for _, assistID := range dictionaryDataAssistIDs(dictionaryTables, tableID) {
 			addHistoricalDataAssistID(assistByID, baseInfo, assistID)
@@ -787,30 +802,36 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 				addRecoveryDataAssistID(assistByID, baseInfo, assistID)
 			}
 		}
-		if addHiddenIndexObjectAssistIDs(assistByID, baseInfo, tableID, indexObjects, indexes) {
-			scanAllDataFiles = true
-		}
-		if addUnknownDataAssistID(assistByID, baseInfo, tableDataAssistID(tableID)) {
-			scanAllDataFiles = true
-		}
+		addHiddenIndexObjectAssistIDs(assistByID, baseInfo, tableID, indexObjects, indexes)
+		addUnknownDataAssistID(assistByID, baseInfo, tableDataAssistID(tableID))
 		for _, part := range partitionsByTable[tableID] {
+			partInfo := baseInfo
+			partInfo.storageUnitID = part.PartTableID
 			partitionStorageID := dataStorageIDForTable(dictionaryTables, dataStorageByTable, part.PartTableID)
+			partInfo.dataStorageID = partitionStorageID
+			storageUnits[part.PartTableID] = partInfo
 			for _, storage := range assistByParentID[part.PartTableID] {
 				if partitionStorageID != 0 && storage.ID != partitionStorageID {
 					continue
 				}
-				addKnownDataAssistID(assistByID, neededFiles, baseInfo, storage.ID, storage, buildStoragePagePlan(storage, dataFilePages))
+				partInfo.recoveryGroupID = uint32(storage.GroupID)
+				storageUnits[part.PartTableID] = partInfo
+				var pagePlan map[dataPageRef]bool
+				var reason string
+				if !opts.RecoveryMode {
+					pagePlan, reason = buildStoragePagePlanDetailed(storage, dataFilePages)
+				}
+				addKnownDataAssistID(assistByID, partInfo, storage.ID, storage, pagePlan)
+				if !opts.RecoveryMode && len(pagePlan) == 0 {
+					planFailureReasons[part.PartTableID] = append(planFailureReasons[part.PartTableID], formatStoragePlanFailure(partInfo, storage.ID, reason))
+				}
 			}
-			if addHiddenIndexObjectAssistIDs(assistByID, baseInfo, part.PartTableID, indexObjects, indexes) {
-				scanAllDataFiles = true
-			}
-			if addUnknownDataAssistID(assistByID, baseInfo, tableDataAssistID(part.PartTableID)) {
-				scanAllDataFiles = true
-			}
+			addHiddenIndexObjectAssistIDs(assistByID, partInfo, part.PartTableID, indexObjects, indexes)
+			addUnknownDataAssistID(assistByID, partInfo, tableDataAssistID(part.PartTableID))
 		}
 	}
 
-	dataFiles = filterNeededDataFiles(dataFiles, neededFiles, scanAllDataFiles)
+	directCandidates, plannedRefs, plannedUnits := buildDirectDataPageCandidates(assistByID)
 
 	result := &DataExportResult{
 		SystemPath:       opts.SystemPath,
@@ -822,7 +843,8 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 		TableCount:       len(selectedTables),
 		ColumnCount:      columnCount,
 		AssistIndexCount: len(assistByID),
-		DataFileCount:    len(dataFiles),
+		DataFileCount:    0,
+		PlannedPages:     len(plannedRefs),
 	}
 	rowStats := initDataTableRowStats(selectedTables)
 	if (outputFormat == "csv" || outputFormat == "dmp") && opts.TableOutputPath == nil && len(selectedTables) > 1 {
@@ -857,109 +879,247 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 	stop := false
 	coveredRowPrefixes := make(map[uint32]map[string]bool)
 	var pendingPartialRows []pendingPartialDataRow
-	for _, file := range dataFiles {
-		if stop {
-			break
+	touchedFiles := make(map[dataFileKey]bool)
+	processedDirectPages := make(map[dataPageRef]bool)
+	failedPlanUnits := make(map[uint32]bool)
+	fallbackReasonSeen := make(map[string]bool)
+	addFallbackReason := func(reason string) {
+		reason = strings.TrimSpace(reason)
+		if reason == "" || fallbackReasonSeen[reason] {
+			return
 		}
-		pagesScanned, scanErr := forEachDataFilePage(file.path, pageSize, func(page []byte, pageNo uint32) error {
+		fallbackReasonSeen[reason] = true
+		result.FallbackReasons = append(result.FallbackReasons, reason)
+	}
+	processPage := func(file dataFileRef, pageNo uint32, page []byte, candidates []dataTableInfo) error {
+		if stop {
+			return errStopPageScan
+		}
+		if len(candidates) == 0 || !isProbableDMDataPage(page, pageSize) {
+			return nil
+		}
+		nRec := int(binary.LittleEndian.Uint16(page[dataPageRecordCountOff:]))
+		if nRec <= 0 {
+			return nil
+		}
+		rows := locateRowsInDataPage(page, pageSize, nRec)
+		info, ok := selectDataPageCandidate(candidates, file, pageNo, page, pageSize, rows, decoder)
+		if !ok {
+			return nil
+		}
+		for _, row := range rows {
+			if opts.MaxRows > 0 && result.RowsLocated >= opts.MaxRows {
+				stop = true
+				break
+			}
+			result.RowsLocated++
+			rowStart := int(row.offset)
+			rowEnd := rowStart + int(row.length)
+			rowBytes := append([]byte(nil), page[rowStart:rowEnd]...)
+			var line string
+			var record []string
+			var fields []DMPField
+			var meta dataRowRenderMeta
+			var timeFractionLoss bool
+			var err error
+			switch outputFormat {
+			case "csv":
+				record, _, _, meta, err = renderCSVForDataRowWithMeta(info, rowBytes, decoder)
+			case "dmp":
+				fields, _, _, meta, timeFractionLoss, err = renderDMPForDataRowWithMeta(info, rowBytes, decoder, dmpConfig.charset)
+			default:
+				line, _, _, meta, err = renderInsertForDataRowWithMeta(info, rowBytes, decoder)
+			}
+			stats := rowStats[info.table.ID]
+			if stats != nil {
+				stats.RowsLocated++
+			}
+			if err != nil {
+				result.RowsFailed++
+				if stats != nil {
+					stats.RowsFailed++
+				}
+				if opts.WriteFailedComments {
+					message := fmt.Sprintf("-- FAILED %s.%s page=%d slot=%d off=0x%X len=%d: %v",
+						quoteIdent(info.table.Owner), quoteIdent(info.table.Name), pageNo, row.slotNo, row.offset, row.length, err)
+					if writeErr := output.writeFailure(info, message); writeErr != nil {
+						return writeErr
+					}
+				}
+				continue
+			}
+			if meta.partial {
+				pendingPartialRows = append(pendingPartialRows, pendingPartialDataRow{
+					tableID:          info.table.ID,
+					line:             line,
+					record:           record,
+					fields:           fields,
+					timeFractionLoss: timeFractionLoss,
+					stats:            stats,
+					meta:             meta,
+				})
+				continue
+			}
+			if timeFractionLoss {
+				result.TimeFractionLoss++
+			}
+			markCoveredRowPrefixes(coveredRowPrefixes, info.table.ID, meta.coverageKeys)
+			result.RowsExported++
+			if stats != nil {
+				stats.RowsExported++
+			}
+			if err := output.writeRow(info, line, record, fields); err != nil {
+				return err
+			}
+		}
+		if stop {
+			return errStopPageScan
+		}
+		return nil
+	}
+
+	pageReader := newDataFilePageReader(dataFiles, pageSize)
+	defer func() { _ = pageReader.close() }()
+
+	if opts.RecoveryMode {
+		addFallbackReason("recovery mode requested a full-file residual page scan")
+		for _, file := range dataFiles {
 			if stop {
-				return errStopPageScan
+				break
 			}
-			if !isProbableDMDataPage(page, pageSize) {
-				return nil
+			touchedFiles[file.key] = true
+			pagesScanned, scanErr := forEachDataFilePage(file.path, pageSize, func(page []byte, pageNo uint32) error {
+				assistIndexID := dataPageStorageID(page)
+				return processPage(file, pageNo, page, assistByID[assistIndexID])
+			})
+			result.FallbackPagesScanned += pagesScanned
+			result.PagesScanned += pagesScanned
+			if scanErr != nil && scanErr != errStopPageScan {
+				return nil, fmt.Errorf("scan recovery data file %s: %w", file.path, scanErr)
 			}
-			assistIndexID := binary.LittleEndian.Uint32(page[dataPageAssistIndexOff:])
-			candidates := assistByID[assistIndexID]
-			if len(candidates) == 0 {
-				return nil
+			if scanErr == errStopPageScan {
+				stop = true
 			}
-			nRec := int(binary.LittleEndian.Uint16(page[dataPageRecordCountOff:]))
-			if nRec <= 0 {
-				return nil
+		}
+	} else {
+		for _, ref := range sortedDataPageRefs(plannedRefs) {
+			if stop {
+				break
 			}
-			rows := locateRowsInDataPage(page, pageSize, nRec)
-			info, ok := selectDataPageCandidate(candidates, file, pageNo, page, pageSize, rows, decoder)
-			if !ok {
-				return nil
+			candidates := directCandidates[ref]
+			page, readErr := pageReader.readPage(ref)
+			if readErr != nil {
+				markFailedPlanUnits(failedPlanUnits, candidates)
+				addFallbackReason(formatDirectPageFailure(ref, readErr))
+				continue
 			}
-			for _, row := range rows {
-				if opts.MaxRows > 0 && result.RowsLocated >= opts.MaxRows {
+			result.DirectPagesRead++
+			result.PagesScanned++
+			touchedFiles[ref.key] = true
+			if !plannedDataPageMatches(page, ref, candidates) {
+				markFailedPlanUnits(failedPlanUnits, candidates)
+				addFallbackReason(formatDirectPageFailure(ref, fmt.Errorf("page identity, kind, or storage_id validation failed")))
+				continue
+			}
+			file := dataFileRefForKey(dataFiles, ref.key)
+			if err := processPage(file, ref.pageNo, page, candidates); err != nil {
+				if err == errStopPageScan {
 					stop = true
 					break
 				}
-				result.RowsLocated++
-				rowStart := int(row.offset)
-				rowEnd := rowStart + int(row.length)
-				rowBytes := append([]byte(nil), page[rowStart:rowEnd]...)
-				var line string
-				var record []string
-				var fields []DMPField
-				var meta dataRowRenderMeta
-				var timeFractionLoss bool
-				var err error
-				switch outputFormat {
-				case "csv":
-					record, _, _, meta, err = renderCSVForDataRowWithMeta(info, rowBytes, decoder)
-				case "dmp":
-					fields, _, _, meta, timeFractionLoss, err = renderDMPForDataRowWithMeta(info, rowBytes, decoder, dmpConfig.charset)
-				default:
-					line, _, _, meta, err = renderInsertForDataRowWithMeta(info, rowBytes, decoder)
+				return nil, err
+			}
+			processedDirectPages[ref] = true
+		}
+
+		storageCandidates, fallbackGroups, fallbackUnits := buildStorageFallbackCandidates(assistByID, plannedUnits, failedPlanUnits)
+		for unitID := range fallbackUnits {
+			if reasons := planFailureReasons[unitID]; len(reasons) > 0 {
+				for _, reason := range reasons {
+					addFallbackReason(reason)
 				}
-				stats := rowStats[info.table.ID]
-				if stats != nil {
-					stats.RowsLocated++
+			} else if info, ok := storageUnits[unitID]; ok {
+				addFallbackReason(fmt.Sprintf("%s.%s storage unit %d has no complete page plan; scanning group %d by storage_id", info.table.Owner, info.table.Name, unitID, fallbackGroupForInfo(info)))
+			}
+		}
+
+		storagePagesFound := make(map[uint32]bool)
+		if !stop && len(storageCandidates) > 0 {
+			for _, file := range dataFiles {
+				if stop {
+					break
 				}
-				if err != nil {
-					result.RowsFailed++
-					if stats != nil {
-						stats.RowsFailed++
+				if !fallbackGroups[file.key.groupID] {
+					continue
+				}
+				touchedFiles[file.key] = true
+				pagesScanned, scanErr := forEachDataFilePage(file.path, pageSize, func(page []byte, pageNo uint32) error {
+					ref := dataPageRef{key: file.key, pageNo: pageNo}
+					if processedDirectPages[ref] || !pageHeaderMatchesRef(page, ref) || !isProbableDMDataPage(page, pageSize) {
+						return nil
 					}
-					if opts.WriteFailedComments {
-						message := fmt.Sprintf("-- FAILED %s.%s page=%d slot=%d off=0x%X len=%d: %v",
-							quoteIdent(info.table.Owner), quoteIdent(info.table.Name), pageNo, row.slotNo, row.offset, row.length, err)
-						if writeErr := output.writeFailure(info, message); writeErr != nil {
-							return writeErr
+					assistIndexID := dataPageStorageID(page)
+					candidates := storageCandidates[assistIndexID]
+					if len(candidates) == 0 {
+						return nil
+					}
+					matched := candidates[:0]
+					for _, candidate := range candidates {
+						if candidateMatchesFile(candidate, file, pageNo) {
+							storagePagesFound[candidate.storageUnitID] = true
+							matched = append(matched, candidate)
 						}
 					}
-					continue
+					return processPage(file, pageNo, page, matched)
+				})
+				result.FallbackPagesScanned += pagesScanned
+				result.PagesScanned += pagesScanned
+				if scanErr != nil && scanErr != errStopPageScan {
+					return nil, fmt.Errorf("scan storage fallback file %s: %w", file.path, scanErr)
 				}
-				if meta.partial {
-					pendingPartialRows = append(pendingPartialRows, pendingPartialDataRow{
-						tableID:          info.table.ID,
-						line:             line,
-						record:           record,
-						fields:           fields,
-						timeFractionLoss: timeFractionLoss,
-						stats:            stats,
-						meta:             meta,
-					})
-					continue
-				}
-				if timeFractionLoss {
-					result.TimeFractionLoss++
-				}
-				markCoveredRowPrefixes(coveredRowPrefixes, info.table.ID, meta.coverageKeys)
-				result.RowsExported++
-				if stats != nil {
-					stats.RowsExported++
-				}
-				if err := output.writeRow(info, line, record, fields); err != nil {
-					return err
+				if scanErr == errStopPageScan {
+					stop = true
 				}
 			}
-			if stop {
-				return errStopPageScan
-			}
-			return nil
-		})
-		result.PagesScanned += pagesScanned
-		if scanErr != nil && scanErr != errStopPageScan {
-			return nil, fmt.Errorf("scan data file %s: %w", file.path, scanErr)
 		}
-		if scanErr == errStopPageScan {
-			stop = true
+
+		unresolvedUnits := unresolvedStorageUnits(storageUnits, plannedUnits, failedPlanUnits, fallbackUnits, storagePagesFound)
+		segmentPages := buildSegmentFallbackPages(storageUnits, unresolvedUnits)
+		for unitID := range unresolvedUnits {
+			info := storageUnits[unitID]
+			if info.segmentKnown {
+				addFallbackReason(fmt.Sprintf("%s.%s storage unit %d has no matching storage page; scanning segment file=%d header=%d blocks=%d", info.table.Owner, info.table.Name, unitID, info.segment.fileID, info.segment.headerPage, info.segment.blocks))
+			} else {
+				addFallbackReason(fmt.Sprintf("%s.%s storage unit %d has no matching storage page or usable segment range", info.table.Owner, info.table.Name, unitID))
+			}
+		}
+		for _, ref := range sortedSegmentPageRefs(segmentPages) {
+			if stop {
+				break
+			}
+			page, readErr := pageReader.readPage(ref)
+			if readErr != nil {
+				addFallbackReason(formatDirectPageFailure(ref, readErr))
+				continue
+			}
+			result.FallbackPagesScanned++
+			result.PagesScanned++
+			touchedFiles[ref.key] = true
+			if !pageHeaderMatchesRef(page, ref) {
+				continue
+			}
+			file := dataFileRefForKey(dataFiles, ref.key)
+			if err := processPage(file, ref.pageNo, page, segmentPages[ref]); err != nil {
+				if err == errStopPageScan {
+					stop = true
+					break
+				}
+				return nil, err
+			}
 		}
 	}
+	result.DataFileCount = len(touchedFiles)
+	sort.Strings(result.FallbackReasons)
 	for _, pending := range pendingPartialRows {
 		if coveredRowPrefixes[pending.tableID][pending.meta.prefixKey] || coveredRowPrefixes[pending.tableID][pending.meta.weakPrefixKey] {
 			continue
@@ -1000,7 +1160,177 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 	return result, nil
 }
 
-func addKnownDataAssistID(assistByID map[uint32][]dataTableInfo, neededFiles map[dataFileKey]bool, info dataTableInfo, assistID uint32, storage indexDef, pagePlan map[dataPageRef]bool) {
+func formatStoragePlanFailure(info dataTableInfo, storageID uint32, reason string) string {
+	if strings.TrimSpace(reason) == "" {
+		reason = "storage root did not produce a complete leaf chain"
+	}
+	return fmt.Sprintf("%s.%s storage unit %d storage_id=%d: %s; scanning the same group by storage_id", info.table.Owner, info.table.Name, info.storageUnitID, storageID, reason)
+}
+
+func buildDirectDataPageCandidates(assistByID map[uint32][]dataTableInfo) (map[dataPageRef][]dataTableInfo, map[dataPageRef]bool, map[uint32]bool) {
+	pages := make(map[dataPageRef][]dataTableInfo)
+	refs := make(map[dataPageRef]bool)
+	units := make(map[uint32]bool)
+	for _, candidates := range assistByID {
+		for _, candidate := range candidates {
+			if !candidate.pagePlanKnown || len(candidate.pagePlan) == 0 {
+				continue
+			}
+			units[candidate.storageUnitID] = true
+			for ref := range candidate.pagePlan {
+				refs[ref] = true
+				pages[ref] = appendUniqueDataCandidate(pages[ref], candidate)
+			}
+		}
+	}
+	return pages, refs, units
+}
+
+func sortedDataPageRefs(refs map[dataPageRef]bool) []dataPageRef {
+	result := make([]dataPageRef, 0, len(refs))
+	for ref := range refs {
+		result = append(result, ref)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].key.groupID != result[j].key.groupID {
+			return result[i].key.groupID < result[j].key.groupID
+		}
+		if result[i].key.fileID != result[j].key.fileID {
+			return result[i].key.fileID < result[j].key.fileID
+		}
+		return result[i].pageNo < result[j].pageNo
+	})
+	return result
+}
+
+func sortedSegmentPageRefs(pages map[dataPageRef][]dataTableInfo) []dataPageRef {
+	refs := make(map[dataPageRef]bool, len(pages))
+	for ref := range pages {
+		refs[ref] = true
+	}
+	return sortedDataPageRefs(refs)
+}
+
+func appendUniqueDataCandidate(items []dataTableInfo, candidate dataTableInfo) []dataTableInfo {
+	for _, existing := range items {
+		if existing.table.ID == candidate.table.ID && existing.storageUnitID == candidate.storageUnitID && existing.storage.ID == candidate.storage.ID && existing.pagePlanKnown == candidate.pagePlanKnown && existing.scanGroupOnly == candidate.scanGroupOnly && existing.historicalRows == candidate.historicalRows {
+			return items
+		}
+	}
+	return append(items, candidate)
+}
+
+func markFailedPlanUnits(failed map[uint32]bool, candidates []dataTableInfo) {
+	for _, candidate := range candidates {
+		if candidate.storageUnitID != 0 {
+			failed[candidate.storageUnitID] = true
+		}
+	}
+}
+
+func plannedDataPageMatches(page []byte, ref dataPageRef, candidates []dataTableInfo) bool {
+	if !pageHeaderMatchesRef(page, ref) || dataPageKind(page) != dmPageKindRowData {
+		return false
+	}
+	storageID := dataPageStorageID(page)
+	for _, candidate := range candidates {
+		if candidate.pagePlanKnown && candidate.pagePlan[ref] && candidate.storage.ID == storageID {
+			return true
+		}
+	}
+	return false
+}
+
+func formatDirectPageFailure(ref dataPageRef, err error) string {
+	return fmt.Sprintf("planned page group=%d file=%d page=%d: %v; enabling storage fallback", ref.key.groupID, ref.key.fileID, ref.pageNo, err)
+}
+
+func fallbackGroupForInfo(info dataTableInfo) uint32 {
+	if info.storageKnown {
+		return uint32(info.storage.GroupID)
+	}
+	if info.recoveryGroupID != 0 {
+		return info.recoveryGroupID
+	}
+	return info.segment.tablespaceID
+}
+
+func buildStorageFallbackCandidates(assistByID map[uint32][]dataTableInfo, plannedUnits map[uint32]bool, failedPlanUnits map[uint32]bool) (map[uint32][]dataTableInfo, map[uint32]bool, map[uint32]bool) {
+	result := make(map[uint32][]dataTableInfo)
+	groups := make(map[uint32]bool)
+	units := make(map[uint32]bool)
+	for assistID, candidates := range assistByID {
+		for _, candidate := range candidates {
+			needsFallback := !plannedUnits[candidate.storageUnitID] || failedPlanUnits[candidate.storageUnitID]
+			if !needsFallback || candidate.pagePlanKnown || isLooseHistoricalCandidate(candidate) {
+				continue
+			}
+			candidate.scanGroupOnly = true
+			candidate.scanGroupID = fallbackGroupForInfo(candidate)
+			result[assistID] = appendUniqueDataCandidate(result[assistID], candidate)
+			groups[candidate.scanGroupID] = true
+			units[candidate.storageUnitID] = true
+		}
+	}
+	return result, groups, units
+}
+
+func unresolvedStorageUnits(storageUnits map[uint32]dataTableInfo, plannedUnits map[uint32]bool, failedPlanUnits map[uint32]bool, fallbackUnits map[uint32]bool, storagePagesFound map[uint32]bool) map[uint32]bool {
+	result := make(map[uint32]bool)
+	for unitID := range storageUnits {
+		if plannedUnits[unitID] && !failedPlanUnits[unitID] {
+			continue
+		}
+		if fallbackUnits[unitID] && storagePagesFound[unitID] {
+			continue
+		}
+		result[unitID] = true
+	}
+	return result
+}
+
+func buildSegmentFallbackPages(storageUnits map[uint32]dataTableInfo, unresolved map[uint32]bool) map[dataPageRef][]dataTableInfo {
+	result := make(map[dataPageRef][]dataTableInfo)
+	for unitID := range unresolved {
+		info, ok := storageUnits[unitID]
+		if !ok || !info.segmentKnown || info.segment.blocks == 0 {
+			continue
+		}
+		info.pagePlan = nil
+		info.pagePlanKnown = false
+		info.scanGroupOnly = false
+		info.historicalRows = false
+		groupID := info.segment.tablespaceID
+		if groupID == 0 {
+			groupID = info.recoveryGroupID
+		}
+		end := uint64(info.segment.headerPage) + uint64(info.segment.blocks)
+		if end > uint64(^uint32(0)) {
+			end = uint64(^uint32(0))
+		}
+		for pageNo := uint64(info.segment.headerPage); pageNo < end; pageNo++ {
+			ref := dataPageRef{key: dataFileKey{groupID: groupID, fileID: info.segment.fileID}, pageNo: uint32(pageNo)}
+			result[ref] = appendUniqueDataCandidate(result[ref], info)
+			if info.dataStorageID != 0 {
+				historical := info
+				historical.historicalRows = true
+				result[ref] = appendUniqueDataCandidate(result[ref], historical)
+			}
+		}
+	}
+	return result
+}
+
+func dataFileRefForKey(files []dataFileRef, key dataFileKey) dataFileRef {
+	for _, file := range files {
+		if file.key == key {
+			return file
+		}
+	}
+	return dataFileRef{key: key}
+}
+
+func addKnownDataAssistID(assistByID map[uint32][]dataTableInfo, info dataTableInfo, assistID uint32, storage indexDef, pagePlan map[dataPageRef]bool) {
 	if storage.RootFile < 0 {
 		return
 	}
@@ -1013,15 +1343,11 @@ func addKnownDataAssistID(assistByID map[uint32][]dataTableInfo, neededFiles map
 		exactInfo.pagePlan = pagePlan
 		exactInfo.pagePlanKnown = true
 		addDataAssistCandidate(assistByID, assistID, exactInfo)
-		for ref := range pagePlan {
-			neededFiles[ref.key] = true
-		}
 	}
 	info.pagePlan = nil
 	info.pagePlanKnown = false
 	info.historicalRows = allowHistoricalRows
 	addDataAssistCandidate(assistByID, assistID, info)
-	neededFiles[dataFileKey{groupID: uint32(storage.GroupID), fileID: storage.RootFile}] = true
 }
 
 func addUnknownDataAssistID(assistByID map[uint32][]dataTableInfo, info dataTableInfo, assistID uint32) bool {
@@ -1121,6 +1447,34 @@ func assistIndexesByParentID(tables map[uint32]dictionaryObject, indexObjects ma
 	return result
 }
 
+func mergeDictionaryStorageRoots(result map[uint32][]indexDef, tables map[uint32]DictionaryTable) {
+	for tableID, table := range tables {
+		if table.StorageID == 0 || table.RootFile < 0 || table.RootPage == 0 {
+			continue
+		}
+		duplicate := false
+		for _, storage := range result[tableID] {
+			if storage.ID == table.StorageID {
+				duplicate = true
+				break
+			}
+		}
+		if duplicate {
+			continue
+		}
+		result[tableID] = append(result[tableID], indexDef{
+			ID:       table.StorageID,
+			GroupID:  uint16(table.GroupID),
+			RootFile: table.RootFile,
+			RootPage: int32(table.RootPage),
+			Flag:     1,
+		})
+		sort.Slice(result[tableID], func(i, j int) bool {
+			return result[tableID][i].ID < result[tableID][j].ID
+		})
+	}
+}
+
 func isCandidateDataIndex(table dictionaryObject, idx indexDef) bool {
 	if idx.Flag&1 != 0 && idx.KeyNum == 0 {
 		return true
@@ -1199,13 +1553,15 @@ func candidateMatchesFile(info dataTableInfo, file dataFileRef, pageNo uint32) b
 		if len(info.pagePlan) == 0 || !info.pagePlan[dataPageRef{key: file.key, pageNo: pageNo}] {
 			return false
 		}
-		if info.recoveryMode {
-			return candidateMatchesRecoveryFile(info, file)
-		}
-		return candidateMatchesSegmentIdentity(info, file)
+		// The exact physical reference is authoritative. Segment metadata may be
+		// stale after extent movement and remains an auxiliary fallback only.
+		return true
 	}
 	if info.recoveryMode {
 		return candidateMatchesRecoveryFile(info, file)
+	}
+	if info.scanGroupOnly {
+		return file.key.groupID == info.scanGroupID
 	}
 	if info.segmentKnown {
 		if !candidateMatchesSegmentIdentity(info, file) {

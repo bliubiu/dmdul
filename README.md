@@ -464,13 +464,25 @@ DMDUL> load dictionary;
 `dmdul` 当前采用分层定位策略：
 
 ```text
-优先级 1：storage root / internal refs / leaf chain
-优先级 2：header_file / header_block / blocks 段范围校验
-优先级 3：段范围扫描
-优先级 4：全文件残留页扫描
+1. storage root / internal refs / leaf chain 生成 page plan
+2. page plan 完整时，仅用 ReadAt 读取计划页
+3. root 无效、leaf 断链或计划页校验失败时，仅扫描同 group 文件并匹配 storage_id
+4. storage_id 扫描仍无法定位时，读取 header_file / header_block / blocks 段范围
+5. 只有 recover table 恢复模式才扫描全部数据文件中的残留页
 ```
 
-正常表数据导出时，优先通过 storage root 和 leaf chain 精确定位数据页，减少同名表、相似行格式、索引页误识别带来的误导出。
+正常表数据导出不会全面扫描整个数据文件。计划页在导出时再次校验
+`group_id/file_id/page_no`、`page_kind=0x14` 和 `storage_id`；精确 page ref 是主定位依据，
+段信息只参与辅助校验和后续兜底。
+
+每次 `unload` / `recover` 都会在控制台和 `dul.log` 中记录：
+
+```text
+planned pages: 12
+direct pages read: 12
+fallback pages scanned: 0
+fallback reason: none
+```
 
 当 root 损坏、leaf 链断裂或 TRUNCATE / DROP 后当前字典范围已经变化时，可以使用恢复扫描模式进行兜底救援。
 

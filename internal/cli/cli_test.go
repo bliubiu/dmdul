@@ -348,7 +348,7 @@ func TestInteractiveListUserShowsObjectCounts(t *testing.T) {
 }
 
 func TestInteractiveUnloadDatabaseSQLAutoLoadsDictionary(t *testing.T) {
-	cwd, _, outDir := setupUnloadDatabaseFixture(t)
+	cwd, dataDir, outDir := setupUnloadDatabaseFixture(t)
 	runInDir(t, cwd, func() {
 		var stdout bytes.Buffer
 		var stderr bytes.Buffer
@@ -372,6 +372,10 @@ func TestInteractiveUnloadDatabaseSQLAutoLoadsDictionary(t *testing.T) {
 			"tab privileges exported: 3",
 			"rows exported: 1",
 			"rows failed: 0",
+			"planned pages: 0",
+			"direct pages read: 0",
+			"fallback pages scanned: 1",
+			"fallback reason:",
 		} {
 			if !strings.Contains(output, want) {
 				t.Fatalf("interactive output should contain %q, got %q", want, output)
@@ -405,6 +409,12 @@ func TestInteractiveUnloadDatabaseSQLAutoLoadsDictionary(t *testing.T) {
 		data := readTestFile(t, filepath.Join(outDir, "DATABASE_data.sql"))
 		if !strings.Contains(data, "INSERT INTO APP.WITH_ROWS (ID) VALUES (100);") {
 			t.Fatalf("DATABASE_data.sql should contain exported row, got %q", data)
+		}
+		logText := readTestFile(t, filepath.Join(dataDir, "dul.log"))
+		for _, want := range []string{"[UNLOAD] planned_pages=0 direct_pages_read=0 fallback_pages_scanned=1", "[UNLOAD] fallback_reason="} {
+			if !strings.Contains(logText, want) {
+				t.Fatalf("dul.log should contain %q, got %q", want, logText)
+			}
 		}
 	})
 }

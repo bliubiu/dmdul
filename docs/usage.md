@@ -144,6 +144,19 @@ output/HR_TEST_EMP_INFO_ddl.sql
 output/HR_TEST_EMP_INFO_data.sql
 ```
 
+命令末尾会显示本次数据页定位和物理读取统计，例如：
+
+```text
+planned pages: 12
+direct pages read: 12
+fallback pages scanned: 0
+fallback reason: none
+```
+
+正常路径只用 `ReadAt` 读取 page plan 中的页。计划不完整或计划页校验失败时，依次回退到
+同 group 的 `storage_id` 扫描和字典段范围；只有 `recover table` 会启用全数据文件残留页扫描。
+相同统计及具体回退原因也会写入 `dul.log`。
+
 也可以指定输出前缀：
 
 ```text
@@ -264,8 +277,9 @@ output/HR_TEST_T_LOG_HEAP_ddl.sql
 超大 LOB 从当前活动行的 locator 出发逐页流式写入，不会先把整个 LOB 读入内存；
 超过 4 GiB 的整表数据通过多个 DMP phase 持续输出。
 
-整个用户只扫描一次 SYSTEM.DBF 和一次所需数据文件，扫描过程中按表分流写入，
-不会因表数量增加而为每张表重复扫描完整 DBF 文件集。
+整个用户只读取一次 SYSTEM.DBF 字典，并为所有选中表统一生成 page plan。计划完整时仅直接读取
+计划页并按表分流写入；需要回退时，同一 group 数据文件也只扫描一次，不会因表数量增加而
+为每张表重复扫描完整 DBF 文件集。
 
 也可以指定输出前缀：
 

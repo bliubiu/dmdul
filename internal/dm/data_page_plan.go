@@ -2,6 +2,8 @@ package dm
 
 import (
 	"encoding/binary"
+	"fmt"
+	"io"
 	"os"
 )
 
@@ -22,6 +24,67 @@ type dataFilePageCache struct {
 	sizes    map[dataFileKey]int64
 	pages    map[dataPageRef][]byte
 	pageFIFO []dataPageRef
+}
+
+type dataFilePageReader struct {
+	pageSize uint32
+	refs     map[dataFileKey]dataFileRef
+	files    map[dataFileKey]*os.File
+}
+
+func newDataFilePageReader(files []dataFileRef, pageSize uint32) *dataFilePageReader {
+	reader := &dataFilePageReader{
+		pageSize: pageSize,
+		refs:     make(map[dataFileKey]dataFileRef, len(files)),
+		files:    make(map[dataFileKey]*os.File),
+	}
+	for _, file := range files {
+		reader.refs[file.key] = file
+	}
+	return reader
+}
+
+func (r *dataFilePageReader) readPage(ref dataPageRef) ([]byte, error) {
+	if r == nil || r.pageSize == 0 {
+		return nil, fmt.Errorf("invalid data page reader")
+	}
+	fileRef, ok := r.refs[ref.key]
+	if !ok || fileRef.path == "" {
+		return nil, fmt.Errorf("data file group=%d file=%d is unavailable", ref.key.groupID, ref.key.fileID)
+	}
+	file := r.files[ref.key]
+	if file == nil {
+		var err error
+		file, err = os.Open(fileRef.path)
+		if err != nil {
+			return nil, fmt.Errorf("open data file %s: %w", fileRef.path, err)
+		}
+		r.files[ref.key] = file
+	}
+	page := make([]byte, int(r.pageSize))
+	n, err := file.ReadAt(page, int64(ref.pageNo)*int64(r.pageSize))
+	if err != nil && err != io.EOF {
+		return nil, fmt.Errorf("read data page %d from %s: %w", ref.pageNo, fileRef.path, err)
+	}
+	if n != len(page) {
+		return nil, fmt.Errorf("read data page %d from %s: short read %d/%d", ref.pageNo, fileRef.path, n, len(page))
+	}
+	restorePageProtectionBytes(page, r.pageSize)
+	return page, nil
+}
+
+func (r *dataFilePageReader) close() error {
+	if r == nil {
+		return nil
+	}
+	var firstErr error
+	for key, file := range r.files {
+		if err := file.Close(); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("close data file group=%d file=%d: %w", key.groupID, key.fileID, err)
+		}
+	}
+	r.files = make(map[dataFileKey]*os.File)
+	return firstErr
 }
 
 func newDataFilePageCache(files []dataFileRef, pageSize uint32) *dataFilePageCache {
@@ -108,8 +171,13 @@ func (c *dataFilePageCache) totalPageCount() int {
 }
 
 func buildStoragePagePlan(storage indexDef, cache *dataFilePageCache) map[dataPageRef]bool {
+	plan, _ := buildStoragePagePlanDetailed(storage, cache)
+	return plan
+}
+
+func buildStoragePagePlanDetailed(storage indexDef, cache *dataFilePageCache) (map[dataPageRef]bool, string) {
 	if cache == nil || storage.ID == 0 || storage.RootFile < 0 || storage.RootPage < 0 {
-		return nil
+		return nil, "storage root metadata is incomplete"
 	}
 	root := dataPageRef{
 		key: dataFileKey{
@@ -119,38 +187,63 @@ func buildStoragePagePlan(storage indexDef, cache *dataFilePageCache) map[dataPa
 		pageNo: uint32(storage.RootPage),
 	}
 	rootPage, ok := cache.readPage(root)
-	if !ok || !pageHeaderMatchesRef(rootPage, root) || dataPageStorageID(rootPage) != storage.ID {
-		return nil
+	if !ok {
+		return nil, fmt.Sprintf("cannot read root page %d/%d", storage.RootFile, storage.RootPage)
+	}
+	if !pageHeaderMatchesRef(rootPage, root) {
+		return nil, fmt.Sprintf("root page identity mismatch at %d/%d", storage.RootFile, storage.RootPage)
+	}
+	if dataPageStorageID(rootPage) != storage.ID {
+		return nil, fmt.Sprintf("root page storage_id=%d, expected %d", dataPageStorageID(rootPage), storage.ID)
 	}
 	switch dataPageKind(rootPage) {
 	case dmPageKindBTreeLeaf:
-		return walkLeafChain(cache, root, storage.ID)
-	case dmPageKindBTreeRoot:
-		leaf, ok := descendLeftmostLeaf(cache, root, storage.ID)
-		if !ok {
-			return nil
+		plan, complete, reason := walkLeafChainDetailed(cache, root, storage.ID)
+		if !complete {
+			return nil, reason
 		}
-		return walkLeafChain(cache, leaf, storage.ID)
+		return plan, ""
+	case dmPageKindBTreeRoot:
+		leaf, reason, ok := descendLeftmostLeafDetailed(cache, root, storage.ID)
+		if !ok {
+			return nil, reason
+		}
+		plan, complete, reason := walkLeafChainDetailed(cache, leaf, storage.ID)
+		if !complete {
+			return nil, reason
+		}
+		return plan, ""
 	default:
-		return nil
+		return nil, fmt.Sprintf("unsupported root page kind 0x%X", dataPageKind(rootPage))
 	}
 }
 
 func descendLeftmostLeaf(cache *dataFilePageCache, start dataPageRef, storageID uint32) (dataPageRef, bool) {
+	ref, _, ok := descendLeftmostLeafDetailed(cache, start, storageID)
+	return ref, ok
+}
+
+func descendLeftmostLeafDetailed(cache *dataFilePageCache, start dataPageRef, storageID uint32) (dataPageRef, string, bool) {
 	current := start
 	seen := make(map[dataPageRef]bool)
 	for depth := 0; depth < maxBTreeDescentDepth; depth++ {
 		if seen[current] {
-			return dataPageRef{}, false
+			return dataPageRef{}, fmt.Sprintf("internal page cycle at file=%d page=%d", current.key.fileID, current.pageNo), false
 		}
 		seen[current] = true
 		page, ok := cache.readPage(current)
-		if !ok || !pageHeaderMatchesRef(page, current) || dataPageStorageID(page) != storageID {
-			return dataPageRef{}, false
+		if !ok {
+			return dataPageRef{}, fmt.Sprintf("cannot read internal page file=%d page=%d", current.key.fileID, current.pageNo), false
+		}
+		if !pageHeaderMatchesRef(page, current) {
+			return dataPageRef{}, fmt.Sprintf("internal page identity mismatch at file=%d page=%d", current.key.fileID, current.pageNo), false
+		}
+		if dataPageStorageID(page) != storageID {
+			return dataPageRef{}, fmt.Sprintf("internal page storage_id=%d, expected %d", dataPageStorageID(page), storageID), false
 		}
 		switch dataPageKind(page) {
 		case dmPageKindBTreeLeaf:
-			return current, true
+			return current, "", true
 		case dmPageKindBTreeRoot:
 			childPage, ok := btreeLeftmostChildPage(page)
 			if ok {
@@ -162,14 +255,14 @@ func descendLeftmostLeaf(cache *dataFilePageCache, start dataPageRef, storageID 
 			}
 			nextRef, ok := btreeNextInternalPage(page, current.key.groupID)
 			if !ok {
-				return dataPageRef{}, false
+				return dataPageRef{}, fmt.Sprintf("internal page file=%d page=%d has no valid child or next reference", current.key.fileID, current.pageNo), false
 			}
 			current = nextRef
 		default:
-			return dataPageRef{}, false
+			return dataPageRef{}, fmt.Sprintf("unexpected internal page kind 0x%X at file=%d page=%d", dataPageKind(page), current.key.fileID, current.pageNo), false
 		}
 	}
-	return dataPageRef{}, false
+	return dataPageRef{}, fmt.Sprintf("internal descent exceeded %d pages", maxBTreeDescentDepth), false
 }
 
 func isBTreePlanPageKind(kind uint32) bool {
@@ -191,6 +284,14 @@ func btreeNextInternalPage(page []byte, groupID uint32) (dataPageRef, bool) {
 }
 
 func walkLeafChain(cache *dataFilePageCache, start dataPageRef, storageID uint32) map[dataPageRef]bool {
+	planned, complete, _ := walkLeafChainDetailed(cache, start, storageID)
+	if !complete {
+		return nil
+	}
+	return planned
+}
+
+func walkLeafChainDetailed(cache *dataFilePageCache, start dataPageRef, storageID uint32) (map[dataPageRef]bool, bool, string) {
 	planned := make(map[dataPageRef]bool)
 	current := start
 	maxSteps := cache.totalPageCount() * maxLeafChainWalkMultiplier
@@ -199,16 +300,28 @@ func walkLeafChain(cache *dataFilePageCache, start dataPageRef, storageID uint32
 	}
 	for steps := 0; steps < maxSteps; steps++ {
 		if planned[current] {
-			break
+			return nil, false, fmt.Sprintf("leaf page cycle at file=%d page=%d", current.key.fileID, current.pageNo)
 		}
 		page, ok := cache.readPage(current)
-		if !ok || !pageHeaderMatchesRef(page, current) || dataPageKind(page) != dmPageKindBTreeLeaf || dataPageStorageID(page) != storageID {
-			break
+		if !ok {
+			return nil, false, fmt.Sprintf("cannot read leaf page file=%d page=%d", current.key.fileID, current.pageNo)
+		}
+		if !pageHeaderMatchesRef(page, current) {
+			return nil, false, fmt.Sprintf("leaf page identity mismatch at file=%d page=%d", current.key.fileID, current.pageNo)
+		}
+		if dataPageKind(page) != dmPageKindBTreeLeaf {
+			return nil, false, fmt.Sprintf("unexpected leaf page kind 0x%X at file=%d page=%d", dataPageKind(page), current.key.fileID, current.pageNo)
+		}
+		if dataPageStorageID(page) != storageID {
+			return nil, false, fmt.Sprintf("leaf page storage_id=%d, expected %d", dataPageStorageID(page), storageID)
 		}
 		planned[current] = true
+		if isNullDMPageRef(page, dmPageNextRefOff) {
+			return planned, true, ""
+		}
 		nextFileID, nextPageNo, ok := readDMPageRef(page, dmPageNextRefOff)
 		if !ok {
-			break
+			return nil, false, fmt.Sprintf("invalid leaf next reference at file=%d page=%d", current.key.fileID, current.pageNo)
 		}
 		current = dataPageRef{
 			key: dataFileKey{
@@ -218,10 +331,19 @@ func walkLeafChain(cache *dataFilePageCache, start dataPageRef, storageID uint32
 			pageNo: nextPageNo,
 		}
 	}
-	if len(planned) == 0 {
-		return nil
+	return nil, false, fmt.Sprintf("leaf chain exceeded %d pages", maxSteps)
+}
+
+func isNullDMPageRef(page []byte, offset int) bool {
+	if offset < 0 || len(page) < offset+6 {
+		return false
 	}
-	return planned
+	for _, value := range page[offset : offset+6] {
+		if value != 0xFF {
+			return false
+		}
+	}
+	return true
 }
 
 func pageHeaderMatchesRef(page []byte, ref dataPageRef) bool {

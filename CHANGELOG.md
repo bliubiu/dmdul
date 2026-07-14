@@ -12,6 +12,25 @@ v主版本.次版本.修订版本
 
 ------
 
+## Unreleased
+
+### Changed
+
+- 表数据正常导出改为真正执行 `storage root -> internal refs -> leaf chain` page plan，并通过
+  `ReadAt` 只读取计划页；不再先全面扫描数据文件后再用计划过滤。
+- page plan 不完整或计划页校验失败时，按“同 group `storage_id` 扫描 -> 段范围读取”分层回退；
+  全文件残留页扫描仅用于 `recover table`。
+- `tables.tsv` 中的 `storage_id/root_file/root_page` 现在会直接参与数据页计划生成。
+- `unload` / `recover` 控制台与 `dul.log` 新增 `planned pages`、`direct pages read`、
+  `fallback pages scanned` 和 `fallback reason` 诊断。
+- leaf 链断裂、循环或页身份/storage id 不一致时不再接受部分 page plan。
+
+### Validation
+
+- 新增“计划成功时直接读取页数等于计划页数”回归测试。
+- 新增断链、同 group storage fallback、segment fallback 和 recover 全文件扫描测试。
+- `go test -count=1 ./...` 与 `go vet ./...` 通过。
+
 ## v0.4.1 - Standard Bootstrap & Native DMP Export
 
 Release theme: complete the offline chain from standard SYSTEM bootstrap and

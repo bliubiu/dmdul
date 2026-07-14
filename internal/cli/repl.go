@@ -746,6 +746,7 @@ func (s *interactiveSession) unloadTable(args []string, stdout io.Writer) error 
 	fmt.Fprintf(stdout, "tab privileges exported: %d\n", ddl.TabPrivilegeCount)
 	fmt.Fprintf(stdout, "rows exported: %d\n", data.RowsExported)
 	fmt.Fprintf(stdout, "rows failed: %d\n", data.RowsFailed)
+	s.printDataExportDiagnostics(stdout, data)
 	printDataExportWarnings(stdout, data)
 	return nil
 }
@@ -812,6 +813,7 @@ func (s *interactiveSession) recoverTable(args []string, stdout io.Writer) error
 	fmt.Fprintf(stdout, "tables exported: %d\n", ddl.TableCount)
 	fmt.Fprintf(stdout, "rows exported: %d\n", data.RowsExported)
 	fmt.Fprintf(stdout, "rows failed: %d\n", data.RowsFailed)
+	s.printDataExportDiagnostics(stdout, data)
 	printDataExportWarnings(stdout, data)
 	return nil
 }
@@ -936,6 +938,7 @@ func (s *interactiveSession) unloadUser(args []string, stdout io.Writer) error {
 	fmt.Fprintf(stdout, "data files exported: %d\n", len(data.TableOutputs))
 	fmt.Fprintf(stdout, "rows exported: %d\n", data.RowsExported)
 	fmt.Fprintf(stdout, "rows failed: %d\n", data.RowsFailed)
+	s.printDataExportDiagnostics(stdout, data)
 	printDataExportWarnings(stdout, data)
 	return nil
 }
@@ -972,17 +975,16 @@ func (s *interactiveSession) unloadDatabase(args []string, stdout io.Writer) err
 	fmt.Fprintf(stdout, "synonyms exported: %d\n", ddl.SynonymCount)
 	fmt.Fprintf(stdout, "tab privileges exported: %d\n", ddl.TabPrivilegeCount)
 	if splitDataFormat(s.dataFormat) {
-		files, rowsExported, rowsFailed, timeFractionLoss, err := s.unloadDatabaseSplitData(prefix, s.dataFormat, stdout)
+		data, err := s.unloadDatabaseSplitData(prefix, s.dataFormat, stdout)
 		if err != nil {
 			return err
 		}
 		fmt.Fprintf(stdout, "%s output dir: %s\n", s.dataFormat, s.effectiveOutputDir())
-		fmt.Fprintf(stdout, "%s files exported: %d\n", s.dataFormat, files)
-		fmt.Fprintf(stdout, "rows exported: %d\n", rowsExported)
-		fmt.Fprintf(stdout, "rows failed: %d\n", rowsFailed)
-		if timeFractionLoss > 0 {
-			fmt.Fprintf(stdout, "warning: TIME fractional seconds are not representable in DM DMP and were cleared in %d row(s)\n", timeFractionLoss)
-		}
+		fmt.Fprintf(stdout, "%s files exported: %d\n", s.dataFormat, len(data.TableOutputs))
+		fmt.Fprintf(stdout, "rows exported: %d\n", data.RowsExported)
+		fmt.Fprintf(stdout, "rows failed: %d\n", data.RowsFailed)
+		s.printDataExportDiagnostics(stdout, data)
+		printDataExportWarnings(stdout, data)
 		return nil
 	}
 	dataPath := s.outputPath(prefix + "_data.sql")
@@ -1006,11 +1008,12 @@ func (s *interactiveSession) unloadDatabase(args []string, stdout io.Writer) err
 	fmt.Fprintf(stdout, "data output: %s\n", data.OutputPath)
 	fmt.Fprintf(stdout, "rows exported: %d\n", data.RowsExported)
 	fmt.Fprintf(stdout, "rows failed: %d\n", data.RowsFailed)
+	s.printDataExportDiagnostics(stdout, data)
 	printDataExportWarnings(stdout, data)
 	return nil
 }
 
-func (s *interactiveSession) unloadDatabaseSplitData(prefix string, format string, stdout io.Writer) (int, int, int, int, error) {
+func (s *interactiveSession) unloadDatabaseSplitData(prefix string, format string, stdout io.Writer) (*dm.DataExportResult, error) {
 	extension := dataOutputExtension(format)
 	data, err := dm.ExportData(dm.DataExportOptions{
 		SystemPath:     s.systemPath,
@@ -1030,7 +1033,7 @@ func (s *interactiveSession) unloadDatabaseSplitData(prefix string, format strin
 		Dictionary:       s.dictionary,
 	})
 	if err != nil {
-		return 0, 0, 0, 0, err
+		return nil, err
 	}
 	outputs := make(map[string]bool, len(data.TableOutputs))
 	for _, output := range data.TableOutputs {
@@ -1042,7 +1045,7 @@ func (s *interactiveSession) unloadDatabaseSplitData(prefix string, format strin
 			fmt.Fprintf(stdout, "%s skipped: %s.%s (no rows)\n", format, table.Owner, table.Name)
 		}
 	}
-	return len(data.TableOutputs), data.RowsExported, data.RowsFailed, data.TimeFractionLoss, nil
+	return data, nil
 }
 
 func dataOutputExtension(format string) string {
@@ -1064,6 +1067,25 @@ func splitDataFormat(format string) bool {
 func printDataExportWarnings(stdout io.Writer, result *dm.DataExportResult) {
 	if result != nil && result.TimeFractionLoss > 0 {
 		fmt.Fprintf(stdout, "warning: TIME fractional seconds are not representable in DM DMP and were cleared in %d row(s)\n", result.TimeFractionLoss)
+	}
+}
+
+func (s *interactiveSession) printDataExportDiagnostics(stdout io.Writer, result *dm.DataExportResult) {
+	if result == nil {
+		return
+	}
+	fmt.Fprintf(stdout, "planned pages: %d\n", result.PlannedPages)
+	fmt.Fprintf(stdout, "direct pages read: %d\n", result.DirectPagesRead)
+	fmt.Fprintf(stdout, "fallback pages scanned: %d\n", result.FallbackPagesScanned)
+	s.log(fmt.Sprintf("[UNLOAD] planned_pages=%d direct_pages_read=%d fallback_pages_scanned=%d", result.PlannedPages, result.DirectPagesRead, result.FallbackPagesScanned))
+	if len(result.FallbackReasons) == 0 {
+		fmt.Fprintln(stdout, "fallback reason: none")
+		s.log("[UNLOAD] fallback_reason=none")
+		return
+	}
+	for _, reason := range result.FallbackReasons {
+		fmt.Fprintf(stdout, "fallback reason: %s\n", reason)
+		s.log("[UNLOAD] fallback_reason=" + reason)
 	}
 }
 
