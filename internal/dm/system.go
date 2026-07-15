@@ -214,6 +214,14 @@ func restorePageProtectionBytes(page []byte, pageSize uint32) {
 	if len(page) < int(pageSize) {
 		return
 	}
+	// PAGE_CHECK=2 stores its digest immediately before the final eight-byte
+	// trailer. Those bytes are not sector-boundary backups.
+	if _, _, ok := detectDMPageHash(page); ok {
+		return
+	}
+	if _, ok := inferDMPageHashSizeFromSlots(page); ok {
+		return
+	}
 	sectors := int(pageSize) / systemSectorSize
 	if sectors <= 1 || int(pageSize)%systemSectorSize != 0 {
 		return
@@ -281,7 +289,7 @@ func scanSysObjectRowsInPage(page []byte, pageNo uint32, pageSize uint32, target
 		return nil
 	}
 
-	slotArrayStart := int(pageSize) - pageSlotTrailerLen - int(slotCount)*2
+	slotArrayStart := int(pageSize) - pageSlotTrailerLenForPage(page) - int(slotCount)*2
 	if slotArrayStart < 0x40 || slotArrayStart >= int(pageSize) {
 		return nil
 	}

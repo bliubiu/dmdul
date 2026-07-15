@@ -651,7 +651,7 @@ func iterDictionaryRowsInPage(page []byte, pageSize uint32, pageNo uint32, visit
 	if slotCount == 0 || slotCount >= 2048 {
 		return
 	}
-	slotArrayStart := int(pageSize) - pageSlotTrailerLen - int(slotCount)*2
+	slotArrayStart := int(pageSize) - pageSlotTrailerLenForPage(page) - int(slotCount)*2
 	if slotArrayStart < 0x40 || slotArrayStart >= int(pageSize) {
 		return
 	}

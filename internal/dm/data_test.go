@@ -174,6 +174,159 @@ func TestLocateRowsInHeapDataPageUsesSlotArray(t *testing.T) {
 	}
 }
 
+func TestLocateRowsTreats002CAnd002EAsPhysicalLengths(t *testing.T) {
+	for _, rowLength := range []int{0x2C, 0x2E} {
+		t.Run(fmt.Sprintf("length_%02X", rowLength), func(t *testing.T) {
+			const pageSize = 8192
+			page := make([]byte, pageSize)
+			binary.LittleEndian.PutUint32(page[dmPageKindOff:], dmPageKindRowData)
+			putTestRow(page, dataRowAreaStart, rowLength, 0x00)
+			binary.LittleEndian.PutUint16(page[dataPageSlotCountOff:], 3)
+			binary.LittleEndian.PutUint16(page[dataPageFreeEndOff:], uint16(dataRowAreaStart+rowLength))
+			binary.LittleEndian.PutUint16(page[dataPageRecordCountOff:], 1)
+			putTestDataPageSlot(page, pageSize, 3, 1, 0xFFFF)
+			putTestDataPageSlot(page, pageSize, 3, 2, dataRowAreaStart)
+			putTestDataPageSlot(page, pageSize, 3, 3, 0xFFFF)
+
+			rows := locateRowsInDataPage(page, pageSize, 1)
+			if len(rows) != 1 || rows[0].offset != dataRowAreaStart || int(rows[0].length) != rowLength {
+				t.Fatalf("row header 00 %02X was not decoded as length %d: %+v", rowLength, rowLength, rows)
+			}
+		})
+	}
+}
+
+func TestLocateRowsUsesConfiguredDMPageSize(t *testing.T) {
+	for _, pageSize := range []int{4096, 8192, 16384, 32768} {
+		t.Run(fmt.Sprintf("page_%d", pageSize), func(t *testing.T) {
+			page := make([]byte, pageSize)
+			binary.LittleEndian.PutUint32(page[dmPageKindOff:], dmPageKindRowData)
+			putTestRow(page, dataRowAreaStart, 7, 0x00)
+			binary.LittleEndian.PutUint16(page[dataPageSlotCountOff:], 1)
+			binary.LittleEndian.PutUint16(page[dataPageFreeEndOff:], dataRowAreaStart+7)
+			binary.LittleEndian.PutUint16(page[dataPageRecordCountOff:], 1)
+			putTestDataPageSlot(page, pageSize, 1, 1, dataRowAreaStart)
+
+			rows := locateRowsInDataPage(page, uint32(pageSize), 1)
+			if len(rows) != 1 || rows[0].offset != dataRowAreaStart || rows[0].length != 7 {
+				t.Fatalf("page size %d row location failed: %+v", pageSize, rows)
+			}
+		})
+	}
+}
+
+func TestLocateRowsNormalIsSlotOnlyAndRecoveryIncludesPhysicalRows(t *testing.T) {
+	const pageSize = 8192
+	page := make([]byte, pageSize)
+	binary.LittleEndian.PutUint32(page[dmPageKindOff:], dmPageKindRowData)
+
+	liveOff := dataRowAreaStart
+	deletedOff := liveOff + 5
+	holeOff := deletedOff + 5
+	putTestRow(page, liveOff, 5, 0x00)
+	putTestRow(page, deletedOff, 5, 0x00)
+	binary.BigEndian.PutUint16(page[deletedOff:], dataRowDeletedMask|5)
+	putTestRow(page, holeOff, 5, 0x00)
+	binary.LittleEndian.PutUint16(page[dataPageSlotCountOff:], 3)
+	binary.LittleEndian.PutUint16(page[dataPageFreeEndOff:], uint16(holeOff+5))
+	binary.LittleEndian.PutUint16(page[dataPageRecordCountOff:], 1)
+	putTestDataPageSlot(page, pageSize, 3, 1, liveOff)
+	putTestDataPageSlot(page, pageSize, 3, 2, deletedOff)
+	putTestDataPageSlot(page, pageSize, 3, 3, 0x52)
+
+	normal := locateRowsInDataPage(page, pageSize, 1)
+	if len(normal) != 1 || normal[0].offset != uint16(liveOff) || normal[0].deleted || !normal[0].fromSlot {
+		t.Fatalf("normal unload did not stay on the live slot: %+v", normal)
+	}
+
+	recovery := locateRowsInDataPageForRecovery(page, pageSize)
+	if len(recovery) != 3 {
+		t.Fatalf("recovery rows=%+v, want live slot, deleted slot, and physical hole", recovery)
+	}
+	if !recovery[1].deleted || !recovery[1].fromSlot || recovery[1].offset != uint16(deletedOff) {
+		t.Fatalf("deleted slot was not preserved for recovery: %+v", recovery[1])
+	}
+	if recovery[2].fromSlot || recovery[2].offset != uint16(holeOff) {
+		t.Fatalf("physical hole was not recovery-only: %+v", recovery[2])
+	}
+}
+
+func TestLocateRowsDoesNotTrustStaleRecordCount(t *testing.T) {
+	const pageSize = 8192
+	page := make([]byte, pageSize)
+	binary.LittleEndian.PutUint32(page[dmPageKindOff:], dmPageKindRowData)
+	firstOff := dataRowAreaStart
+	secondOff := firstOff + 5
+	putTestRow(page, firstOff, 5, 0x00)
+	putTestRow(page, secondOff, 5, 0x00)
+	binary.LittleEndian.PutUint16(page[dataPageSlotCountOff:], 2)
+	binary.LittleEndian.PutUint16(page[dataPageFreeEndOff:], uint16(secondOff+5))
+	// DELETE/space-reuse experiments show that n_rec can lag the slot state.
+	// It is a page hint, not a safe upper bound for active slot rows.
+	binary.LittleEndian.PutUint16(page[dataPageRecordCountOff:], 1)
+	putTestDataPageSlot(page, pageSize, 2, 1, firstOff)
+	putTestDataPageSlot(page, pageSize, 2, 2, secondOff)
+
+	rows := locateRowsInDataPage(page, pageSize, 1)
+	if len(rows) != 2 || rows[0].offset != uint16(firstOff) || rows[1].offset != uint16(secondOff) {
+		t.Fatalf("stale n_rec truncated active slot rows: %+v", rows)
+	}
+}
+
+func TestDecodeDeletedDataRowHeader(t *testing.T) {
+	page := make([]byte, 8192)
+	binary.BigEndian.PutUint16(page[dataRowAreaStart:], dataRowDeletedMask|0x69)
+	binary.LittleEndian.PutUint16(page[dataPageFreeEndOff:], dataRowAreaStart+0x69)
+	header, ok := decodeDataRowHeader(page, dataRowAreaStart, 8192, dataRowAreaStart+0x69)
+	if !ok || header.length != 0x69 || !header.deleted {
+		t.Fatalf("deleted row header decoded as %+v, ok=%t", header, ok)
+	}
+}
+
+func TestDecodeDataRowControlTail(t *testing.T) {
+	// Captured from an uncommitted DELETE whose V$TRX.ID was 135899. The
+	// rollback pointer resolves to ROLL.DBF file 0, page 1040, offset 106.
+	tail, err := hex.DecodeString("08000000000000100400006a00db1202000000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	control, ok := decodeDataRowControlTail(append([]byte{0x00, 0x20, 0x00}, tail...))
+	if !ok {
+		t.Fatal("control tail was not decoded")
+	}
+	if control.clusterRowID != 8 || control.rollFile != 0 || control.rollPage != 1040 || control.rollOffset != 106 || control.transactionID != 135899 {
+		t.Fatalf("unexpected control tail: %+v", control)
+	}
+	if !control.hasRollbackAddress() {
+		t.Fatal("real rollback pointer was treated as a sentinel")
+	}
+
+	clean, err := hex.DecodeString("070000000000ffffffff7fffffa91202000000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanControl, ok := decodeDataRowControlTail(clean)
+	if !ok || cleanControl.hasRollbackAddress() || cleanControl.clusterRowID != 7 || cleanControl.transactionID != 135849 {
+		t.Fatalf("unexpected clean control tail: %+v, ok=%t", cleanControl, ok)
+	}
+}
+
+func TestMetadataState10IsRejectedWithoutHeuristicFallback(t *testing.T) {
+	row := []byte{0x00, 0x07, 0x02, 0x2A, 0x00, 0x00, 0x00}
+	_, _, _, err := parseDataRowValuesForColumns(row, []columnDef{{
+		ColID: 1, Name: "C1", DataType: "INT", Nullable: "Y",
+	}}, textDecoder{preferred: "utf-8"}, nil)
+	if err == nil || !strings.Contains(err.Error(), "metadata state 10") {
+		t.Fatalf("state 10 should remain unsupported, got %v", err)
+	}
+	_, _, _, err = parseDataRowValues(row, []columnDef{{
+		ColID: 1, Name: "C1", DataType: "INT", Nullable: "Y",
+	}}, textDecoder{preferred: "utf-8"}, true, nil)
+	if err == nil || !strings.Contains(err.Error(), "metadata state 10") {
+		t.Fatalf("historical-column fallback accepted state 10: %v", err)
+	}
+}
+
 func TestDecodeDMDateTime(t *testing.T) {
 	var raw [8]byte
 	v := uint64(2026) |
@@ -636,6 +789,65 @@ func TestExportDataRecoveryModeIsTheFullFileScanPath(t *testing.T) {
 	}
 	if len(result.FallbackReasons) != 1 || !strings.Contains(result.FallbackReasons[0], "full-file residual") {
 		t.Fatalf("recovery fallback reason is missing: %v", result.FallbackReasons)
+	}
+}
+
+func TestExportDataKeepsPhysicalHoleAndDeletedRowRecoveryOnly(t *testing.T) {
+	dir := t.TempDir()
+	systemPath := filepath.Join(dir, "SYSTEM.DBF")
+	writeDataExportTestSystem(t, systemPath)
+	const storageID = 33555437
+	raw := make([]byte, 8*8192)
+	putTestDMPageHeader(raw[:8192], 4, 0, 0, 0, 0)
+	page := raw[3*8192 : 4*8192]
+	putTestDMPageHeader(page, 4, 0, 3, dmPageKindRowData, storageID)
+	liveOff := dataRowAreaStart
+	deletedOff := liveOff + 7
+	holeOff := deletedOff + 7
+	for off, value := range map[int]int32{liveOff: 400, deletedOff: 401, holeOff: 402} {
+		binary.BigEndian.PutUint16(page[off:], 7)
+		page[off+2] = 0
+		binary.LittleEndian.PutUint32(page[off+3:], uint32(value))
+	}
+	binary.BigEndian.PutUint16(page[deletedOff:], dataRowDeletedMask|7)
+	binary.LittleEndian.PutUint16(page[dataPageSlotCountOff:], 2)
+	binary.LittleEndian.PutUint16(page[dataPageFreeEndOff:], uint16(holeOff+7))
+	binary.LittleEndian.PutUint16(page[dataPageRecordCountOff:], 1)
+	putTestDataPageSlot(page, len(page), 2, 1, liveOff)
+	putTestDataPageSlot(page, len(page), 2, 2, deletedOff)
+	putTestDMNullPageRef(page, dmPageNextRefOff)
+	if err := os.WriteFile(filepath.Join(dir, "MAIN.DBF"), raw, 0644); err != nil {
+		t.Fatal(err)
+	}
+	dict := testDataExportDictionary(systemPath, storageID, 3, 0, 0)
+
+	normal, err := ExportData(DataExportOptions{
+		SystemPath: systemPath, DataDir: dir, OutputPath: filepath.Join(dir, "normal.sql"),
+		OwnerFilter: "APP", TableFilter: "APP.T_PLAN", Charset: "utf-8", Dictionary: dict,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	normalSQL := readDataExportTestFile(t, normal.OutputPath)
+	if normal.RowsExported != 1 || !strings.Contains(normalSQL, "VALUES (400)") || strings.Contains(normalSQL, "VALUES (401)") || strings.Contains(normalSQL, "VALUES (402)") {
+		t.Fatalf("normal unload escaped the live slot directory: result=%+v sql=%q", normal, normalSQL)
+	}
+
+	recovery, err := ExportData(DataExportOptions{
+		SystemPath: systemPath, DataDir: dir, OutputPath: filepath.Join(dir, "recovery-rows.sql"),
+		OwnerFilter: "APP", TableFilter: "APP.T_PLAN", Charset: "utf-8", RecoveryMode: true, Dictionary: dict,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recoverySQL := readDataExportTestFile(t, recovery.OutputPath)
+	if recovery.RowsExported != 3 {
+		t.Fatalf("recovery rows=%d, want 3: %q", recovery.RowsExported, recoverySQL)
+	}
+	for _, value := range []string{"VALUES (400)", "VALUES (401)", "VALUES (402)"} {
+		if !strings.Contains(recoverySQL, value) {
+			t.Fatalf("recovery output is missing %s: %q", value, recoverySQL)
+		}
 	}
 }
 

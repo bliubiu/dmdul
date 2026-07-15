@@ -606,6 +606,8 @@ go build -ldflags "-s -w" -o bin/dmdul ./cmd/dmdul
 - [本地开发、测试、构建说明](https://github.com/greatfinish/dmdul/blob/main/docs/development.md)
 - [版本变更记录](https://github.com/greatfinish/dmdul/blob/main/CHANGELOG.md)
 - [DM8 DMP 格式研究记录](https://github.com/greatfinish/dmdul/blob/main/docs/dmp-format-research.md)
+- [DM8 普通行页格式与解析边界](https://github.com/greatfinish/dmdul/blob/main/docs/row-page-format.md)
+- [DM8 PAGE_CHECK 页校验实验](https://github.com/greatfinish/dmdul/blob/main/docs/page-check.md)
 - [逆向扫描笔记](https://github.com/greatfinish/dmdul/blob/main/docs/offline-system-scan.md)
 - [系统字典字段笔记](https://github.com/greatfinish/dmdul/blob/main/docs/system-dictionary-fields.md)
 

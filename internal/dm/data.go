@@ -6,6 +6,7 @@ import (
 	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -32,7 +33,11 @@ const (
 	dmLOBPagePayloadLenOff = 0x2C
 	dmLOBLocatorSize       = 21
 	maxOpenSplitDataFiles  = 32
+	dataRowDeletedMask     = uint16(0x8000)
+	dataRowControlTailLen  = 19
 )
+
+var errUnsupportedRowMetadataState = errors.New("unsupported row metadata state")
 
 type DataExportOptions struct {
 	SystemPath          string
@@ -899,10 +904,10 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 			return nil
 		}
 		nRec := int(binary.LittleEndian.Uint16(page[dataPageRecordCountOff:]))
-		if nRec <= 0 {
-			return nil
-		}
 		rows := locateRowsInDataPage(page, pageSize, nRec)
+		if opts.RecoveryMode {
+			rows = locateRowsInDataPageForRecovery(page, pageSize)
+		}
 		info, ok := selectDataPageCandidate(candidates, file, pageNo, page, pageSize, rows, decoder)
 		if !ok {
 			return nil
@@ -1995,9 +2000,11 @@ func filterNeededDataFiles(files []dataFileRef, needed map[dataFileKey]bool, sca
 }
 
 type locatedDataRow struct {
-	slotNo uint16
-	offset uint16
-	length uint16
+	slotNo   uint16
+	offset   uint16
+	length   uint16
+	deleted  bool
+	fromSlot bool
 }
 
 func isProbableDMDataPage(page []byte, pageSize uint32) bool {
@@ -2025,72 +2032,123 @@ func isProbableDMDataPage(page []byte, pageSize uint32) bool {
 }
 
 func locateRowsInDataPage(page []byte, pageSize uint32, expectedRecords int) []locatedDataRow {
+	return locateRowsInDataPageMode(page, pageSize, expectedRecords, false)
+}
+
+func locateRowsInDataPageForRecovery(page []byte, pageSize uint32) []locatedDataRow {
+	return locateRowsInDataPageMode(page, pageSize, -1, true)
+}
+
+func locateRowsInDataPageMode(page []byte, pageSize uint32, _ int, scanPhysicalRows bool) []locatedDataRow {
 	freeEnd := binary.LittleEndian.Uint16(page[dataPageFreeEndOff:])
 	var rows []locatedDataRow
+	seenOffsets := make(map[uint16]bool)
 	nSlot := binary.LittleEndian.Uint16(page[dataPageSlotCountOff:])
-	slotArrayStart := int(pageSize) - pageSlotTrailerLen - int(nSlot)*2
+	slotArrayStart := int(pageSize) - pageSlotTrailerLenForPage(page) - int(nSlot)*2
 	if nSlot > 0 && nSlot < 2048 && slotArrayStart >= 0x40 && slotArrayStart+int(nSlot)*2 <= int(pageSize) {
 		for slotNo := uint16(1); slotNo <= nSlot; slotNo++ {
 			pos := slotArrayStart + int(slotNo-1)*2
 			rowOff := binary.LittleEndian.Uint16(page[pos:])
-			rowLen, ok := dataRowLength(page, rowOff, pageSize, freeEnd)
-			if !ok || !isLiveDataRow(page, rowOff) {
+			header, ok := decodeDataRowHeader(page, rowOff, pageSize, freeEnd)
+			if !ok || (header.deleted && !scanPhysicalRows) {
 				continue
 			}
-			rows = append(rows, locatedDataRow{slotNo: slotNo, offset: rowOff, length: rowLen})
-		}
-		sort.Slice(rows, func(i, j int) bool {
-			if rows[i].offset == rows[j].offset {
-				return rows[i].slotNo < rows[j].slotNo
-			}
-			return rows[i].offset < rows[j].offset
-		})
-		if expectedRecords >= 0 && len(rows) > expectedRecords {
-			rows = rows[:expectedRecords]
-		}
-		if len(rows) > 0 {
-			return rows
+			seenOffsets[rowOff] = true
+			rows = append(rows, locatedDataRow{
+				slotNo:   slotNo,
+				offset:   rowOff,
+				length:   header.length,
+				deleted:  header.deleted,
+				fromSlot: true,
+			})
 		}
 	}
 
-	pos := uint16(dataRowAreaStart)
-	slotNo := uint16(1)
-	for int(pos)+3 <= int(freeEnd) && uint32(pos) < pageSize {
-		rowLen, ok := dataRowLength(page, pos, pageSize, freeEnd)
-		if !ok || rowLen == 0 {
-			break
+	if scanPhysicalRows {
+		pos := uint16(dataRowAreaStart)
+		for int(pos)+3 <= int(freeEnd) && uint32(pos) < pageSize {
+			header, ok := decodeDataRowHeader(page, pos, pageSize, freeEnd)
+			if !ok || header.length == 0 {
+				break
+			}
+			if !seenOffsets[pos] {
+				rows = append(rows, locatedDataRow{
+					offset:  pos,
+					length:  header.length,
+					deleted: header.deleted,
+				})
+			}
+			pos += header.length
 		}
-		if isLiveDataRow(page, pos) {
-			rows = append(rows, locatedDataRow{slotNo: slotNo, offset: pos, length: rowLen})
+	}
+
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].offset == rows[j].offset {
+			return rows[i].slotNo < rows[j].slotNo
 		}
-		slotNo++
-		pos += rowLen
-	}
-	if expectedRecords >= 0 && len(rows) > expectedRecords {
-		rows = rows[:expectedRecords]
-	}
+		return rows[i].offset < rows[j].offset
+	})
 	return rows
 }
 
-func dataRowLength(page []byte, rowOff uint16, pageSize uint32, freeEnd uint16) (uint16, bool) {
-	if int(rowOff)+3 > len(page) || uint32(rowOff)+3 > pageSize {
-		return 0, false
-	}
-	rowLen := binary.BigEndian.Uint16(page[rowOff:])
-	if rowLen < 3 {
-		return 0, false
-	}
-	if uint32(rowOff)+uint32(rowLen) > uint32(freeEnd) || uint32(rowOff)+uint32(rowLen) > pageSize {
-		return 0, false
-	}
-	return rowLen, true
+type dataRowHeader struct {
+	length  uint16
+	deleted bool
 }
 
-func isLiveDataRow(page []byte, rowOff uint16) bool {
-	// The byte at rowOff+2 starts the 2-bit-per-column metadata. It may be
-	// non-zero (or even 0xFF) for a perfectly live row containing NULLs.
-	// Deleted/free slots are rejected earlier by dataRowLength.
-	return int(rowOff)+3 <= len(page)
+func decodeDataRowHeader(page []byte, rowOff uint16, pageSize uint32, freeEnd uint16) (dataRowHeader, bool) {
+	if int(rowOff)+3 > len(page) || uint32(rowOff)+3 > pageSize {
+		return dataRowHeader{}, false
+	}
+	// The first two bytes are a big-endian length/status word. The low 15 bits
+	// are the physical row length; bit 15 marks a deleted row.
+	raw := binary.BigEndian.Uint16(page[rowOff:])
+	rowLen := raw &^ dataRowDeletedMask
+	if rowLen < 3 {
+		return dataRowHeader{}, false
+	}
+	if uint32(rowOff)+uint32(rowLen) > uint32(freeEnd) || uint32(rowOff)+uint32(rowLen) > pageSize {
+		return dataRowHeader{}, false
+	}
+	return dataRowHeader{length: rowLen, deleted: raw&dataRowDeletedMask != 0}, true
+}
+
+type dataRowControlTail struct {
+	clusterRowID  uint64
+	rollFile      uint8
+	rollPage      uint32
+	rollOffset    uint16
+	transactionID uint64
+}
+
+func decodeDataRowControlTail(row []byte) (dataRowControlTail, bool) {
+	if len(row) < dataRowControlTailLen {
+		return dataRowControlTail{}, false
+	}
+	tail := row[len(row)-dataRowControlTailLen:]
+	return dataRowControlTail{
+		clusterRowID:  decodeUint48LE(tail[0:6]),
+		rollFile:      tail[6],
+		rollPage:      binary.LittleEndian.Uint32(tail[7:11]),
+		rollOffset:    binary.LittleEndian.Uint16(tail[11:13]),
+		transactionID: decodeUint48LE(tail[13:19]),
+	}, true
+}
+
+func (tail dataRowControlTail) hasRollbackAddress() bool {
+	return tail.rollFile != 0xFF || tail.rollPage != 0x7FFFFFFF || tail.rollOffset != 0xFFFF
+}
+
+func decodeUint48LE(raw []byte) uint64 {
+	if len(raw) < 6 {
+		return 0
+	}
+	return uint64(raw[0]) |
+		uint64(raw[1])<<8 |
+		uint64(raw[2])<<16 |
+		uint64(raw[3])<<24 |
+		uint64(raw[4])<<32 |
+		uint64(raw[5])<<40
 }
 
 func renderInsertForDataRow(info dataTableInfo, row []byte, decoder textDecoder) (string, int, int, error) {
@@ -2256,6 +2314,9 @@ func parseDataRowValues(row []byte, columns []columnDef, decoder textDecoder, al
 	if err == nil {
 		return values, start, end, nil
 	}
+	if errors.Is(err, errUnsupportedRowMetadataState) {
+		return nil, 0, 0, err
+	}
 	if !allowHistoricalRows {
 		return nil, 0, 0, err
 	}
@@ -2331,14 +2392,6 @@ func decodeRowColumnStates(raw []byte, columnCount int) []byte {
 	return states
 }
 
-func isRowColumnNull(state byte) bool {
-	return state == 0x03
-}
-
-func isRowColumnOutOfLine(state byte) bool {
-	return state == 0x01
-}
-
 func readInRowDataValue(col columnDef, row []byte, pos int, decoder textDecoder, lobReader *dmLOBReader) (any, int, error) {
 	if fixedDataSizeForColumn(col) > 0 {
 		return parseFixedDataValue(col, row, pos)
@@ -2401,6 +2454,9 @@ func parseDataRowValuesForColumns(row []byte, columns []columnDef, decoder textD
 	if err == nil {
 		return values, start, end, nil
 	}
+	if errors.Is(err, errUnsupportedRowMetadataState) {
+		return nil, 0, 0, err
+	}
 	metadataErr := err
 	values, start, end, err = parseDataRowValuesHeuristic(row, columns, decoder, lobReader)
 	if err == nil {
@@ -2425,8 +2481,8 @@ func parseDataRowValuesWithMetadata(row []byte, columns []columnDef, decoder tex
 parseColumns:
 	for i, col := range storageColumns {
 		state := states[i]
-		switch {
-		case isRowColumnNull(state):
+		switch state {
+		case 0x03:
 			if fixedDataSizeForColumn(col) > 0 {
 				pos += fixedDataSizeForColumn(col)
 				if pos > len(row) {
@@ -2434,7 +2490,7 @@ parseColumns:
 				}
 			}
 			values[col.ColID] = dataValue{value: nil}
-		case isRowColumnOutOfLine(state):
+		case 0x01:
 			// State 1 marks special/overflow storage. Inline LOB values also use
 			// it on some DM8 builds, so accept the normal length-prefixed form
 			// first and fall back to a bare 21-byte locator.
@@ -2447,7 +2503,9 @@ parseColumns:
 			}
 			values[col.ColID] = dataValue{value: value}
 			pos = next
-		default:
+		case 0x02:
+			return nil, 0, 0, fmt.Errorf("%w 10 for column %s", errUnsupportedRowMetadataState, col.Name)
+		case 0x00:
 			value, next, err := readInRowDataValue(col, row, pos, decoder, lobReader)
 			if err != nil {
 				if fixedDataSizeForColumn(col) == 0 && canOmitTrailingNullVars(row, pos, storageColumns[i:]) {

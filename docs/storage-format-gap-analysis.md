@@ -7,6 +7,11 @@
 > 类型、21 字节 LOB locator、`0x20` LOB 页链和 `0x22` Long Row 页链均已落地。
 > 当前类型矩阵和实机结果以 [DM8 数据类型支持矩阵](data-types.md) 为准；仍未完成的
 > 主要方向是 HUGE 表、自定义/集合类型和无 SYSTEM 字典的独立 storage scan。
+>
+> **2026-07-15 行页复核**：页头、slot、行长、2-bit metadata 的当前证据和实现边界，
+> 统一记录在 [DM8 普通行页格式与 DMDUL 解析边界](row-page-format.md)。特别注意：
+> `00 2C`、`00 2E` 是两字节大端行长样本，不是正常/删除状态标志；真正删除位是
+> 大端状态字的 `0x8000`。PAGE_CHECK 四模式见 [页校验实验](page-check.md)。
 
 ## 已经基本吻合的部分
 

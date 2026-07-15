@@ -12,6 +12,37 @@ v主版本.次版本.修订版本
 
 ------
 
+## Unreleased
+
+### Added
+
+- 新增 `docs/row-page-format.md`，按官方、已验证、样本观察和待验证四个等级整理普通行页格式。
+- 新增 `docs/page-check.md`，记录 `PAGE_CHECK=0/1/2/3` 的实机字段、CRC32、SHA256 和 CRC32C 公式。
+- 新增 `00 2C/00 2E` 物理行长回归测试，以及 4K/8K/16K/32K page size 的 slot 定位测试。
+- 新增 19 字节 `clu_rowid + rollback address + trx_id` 控制尾解码与真实 Undo 指针测试。
+- 新增 PAGE_CHECK 校验器及单字节损坏回归测试。
+- 新增普通卸载与恢复模式的端到端边界测试：无 slot 空洞和删除行只由恢复模式输出。
+
+### Changed
+
+- 将解析器内部“live row”术语收紧为“addressable physical row”，避免把物理可解析误写成事务可见。
+- 明确 `row[0:2]` 是大端物理行长；禁止把 `0x2C/0x2E` 当作正常/删除状态标志。
+- 普通 `unload` 收紧为 slot-only；无 slot 物理空洞和删除残留扫描只在 `recover table` 启用。
+- `n_rec` 仅作为页结构提示，不再截断有效活动 slot，避免 DELETE/空间复用后计数滞后造成漏行。
+- metadata 状态 `10` 在取得真实样本前改为明确拒绝，不再按普通行内值或启发式偏移解析。
+
+### Fixed
+
+- 正确把行头最高位 `0x8000` 识别为 DELETE 标志，同时用低 15 位读取物理行长。
+- 修复 `PAGE_CHECK=2` 页尾 HASH 使 slot 目录前移时，固定 8 字节尾部公式误读摘要的问题。
+
+### Validation
+
+- DELETE 未提交、Checkpoint、Rollback、Commit 和空间复用差分确认 `0x8000` 删除位及 free-row 链行为。
+- metadata 状态 `10` 在 NULL、LOB、Long Row、ADD DEFAULT、DROP COLUMN 和真实活动行样本中均未出现，继续按未知状态拒绝。
+- PAGE_CHECK 模式 0 和 SHA256 实例的完整 `SYSTEM.DBF` 均以标准 bootstrap 恢复 1063 个对象。
+- 两个实例的 `SYSDBA.PC_T` 均使用一个 planned page 直接导出 3 行，`fallback pages scanned=0`。
+
 ## v0.5.1 - Direct Page Plan & Layered Fallback
 
 Release theme: execute normal table unload through direct page-plan reads, with bounded layered
