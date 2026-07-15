@@ -308,16 +308,28 @@ ordinary data-page layout:
 
 - page `+0x24`: slot count
 - page `+0x26`: free/end offset
-- page `+0x2C`: live record count
+- page `+0x2C`: `n_rec` directory record count; it can lag after DELETE/space
+  reuse and is not a strict visible-row count
+- page `+0x2E`: free/deleted-row chain head; `0xFFFF` means no current entry
 - page `+0x38`: B-tree level; `0` means leaf data page, `1` means root/internal
   page. Data unload skips non-zero levels so root separator rows are not
   exported as table rows.
 - page `+0x3A`: table assist index id
-- row area starts at page `+0x62`
-- data-page row slots are read from the fixed 8-byte trailer:
-  `slot_array_start = page_size - 8 - slot_count * 2`
-- data row length is the first two row bytes in big-endian order; the third byte
-  is the observed live/deleted status byte, with `0x00` meaning live row
+- ordinary row-area samples commonly start at page `+0x62`; this is not a
+  universal offset for every DM page kind
+- CRC/unchecked data-page slots use
+  `slot_array_start = page_size - 8 - slot_count * 2`; `PAGE_CHECK=2` HASH
+  pages use `page_size - digest_size - 8 - slot_count * 2`
+- the first two row bytes are a big-endian length/status word:
+  `physical_length = u16be(row[0:2]) & 0x7FFF` and
+  `deleted = u16be(row[0:2]) & 0x8000 != 0`
+- the third row byte begins the 2-bit-per-column metadata; it is not a
+  live/deleted status byte
+
+Consequently, row headers `00 2C` and `00 2E` mean physical lengths 44 and 46.
+Their deleted forms would be `80 2C` and `80 2E`. See
+[DM8 ordinary row-page format and parser boundaries](row-page-format.md) for
+the controlled DELETE/Checkpoint/Rollback evidence.
 
 The first decoder supports ordinary in-row records with fixed integer values,
 DM `NUMBER`/`DECIMAL`, 3-byte `DATE`, 8-byte `DATETIME`/`TIMESTAMP`, short
