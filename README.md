@@ -11,10 +11,10 @@
 - 恢复数据库对象定义和用户字典；
 - 导出表结构及相关对象 DDL；
 - 导出 SQL、CSV 或达梦 DMP 数据；
-- 尝试恢复 `DROP` / `TRUNCATE` 后尚未被覆盖的残留数据；
+- 尝试恢复 `DELETE` / `DROP` / `TRUNCATE` 后尚未被覆盖的残留数据；
 - 处理大表、分区表、行外 LOB 和 `STORAGE(USING LONG ROW)` 场景。
 
-**v0.5.1 主题：Direct Page Plan & Layered Fallback**
+**v0.5.2 主题：Row Page Semantics, Slot-only Unload & PAGE_CHECK**
 
 ![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go)
 ![License](https://img.shields.io/github/license/greatfinish/dmdul)
@@ -73,13 +73,21 @@ SYSTEM.DBF / dm.ctl / user tablespace DBF
 - **精确数据页定位**：为选中表及分区按 `storage root -> internal page refs -> leaf chain`
   生成 page plan；计划完整时仅用 `ReadAt` 读取计划页，失败时依次回退到同 group
   `storage_id` 扫描和段范围读取，只有 `recover table` 才执行全文件残留页扫描。
+- **普通行页解析**：按页尾 slot 目录定位活动行，正确解释大端行长状态字、`0x8000`
+  DELETE 标志、`n_rec` 滞后和 free-row 链；普通 `unload` 不再扫描无 slot 物理空洞。
+- **事务控制尾识别**：解码常见的 19 字节 `clu_rowid + rollback address + trx_id`
+  行尾，为后续离线事务状态和 Undo PRE IMAGE 恢复保留结构化入口。
+- **页面校验识别**：支持 `PAGE_CHECK=0/1/2/3`，识别 CRC32、页尾 HASH 和 CRC32C；
+  HASH 模式下按摘要长度修正 SYSTEM 字典页、分区页和用户数据页的 slot 起点。
 - **可诊断数据卸载**：控制台和 `dul.log` 记录 planned pages、direct pages read、
   fallback pages scanned 及具体 fallback reason，便于核对实际物理读取范围。
 - **完整常规类型路径**：支持定长/变长字符与二进制、精确/近似数值、9 位时间戳、
   时区类型、13 种 INTERVAL、ROWID、BFILE、JSON/JSONB，以及国家字符兼容类型。
-- **复杂行与大对象**：支持显式 2-bit NULL metadata、ALTER TABLE 历史短行、21 字节
-  LOB locator、行外 CLOB/BLOB 流式读取和 Long Row 页链。
-- **残留数据救援**：表定义仍可获得时，可尝试恢复 `DROP` / `TRUNCATE` 后未覆盖页。
+- **复杂行与大对象**：支持显式 2-bit NULL metadata；未知状态 `10` 会明确拒绝而不进行
+  启发式猜测；支持 ALTER TABLE 历史短行、21 字节 LOB locator、行外 CLOB/BLOB 流式读取
+  和 Long Row 页链。
+- **残留数据救援**：表定义仍可获得时，`recover table` 可尝试读取 DELETE slot、无 slot
+  物理行以及 `DROP` / `TRUNCATE` 后尚未覆盖的残留页。
 - **大规模输出**：DBF 按页流式读取；DMP 支持 64 位长度、多 phase、大表及超过
   4 GiB 的输出路径，不需要把整个数据文件或 LOB 一次性读入内存。
 
@@ -124,7 +132,10 @@ SYSTEM.DBF / dm.ctl / user tablespace DBF
 | 行外 CLOB/BLOB | ✅ 支持 | 从活动行 locator 出发按 `0x20` 页链流式输出 |
 | Long Row | ✅ 初步支持 | 21 字节 locator 与 `0x22` Long Row 页链 |
 | ALTER TABLE 历史行 | ✅ 支持 | 新增尾列的旧行按当前结构补 `NULL` |
-| DROP / TRUNCATE 残留页 | ✅ 初步支持 | 原页未覆盖且具有当前或历史字典时尝试恢复 |
+| 普通行 slot 与删除标志 | ✅ 支持 | 大端行长低 15 位、`0x8000` DELETE、`n_rec` 滞后 |
+| 19 字节事务控制尾 | ✅ 结构已识别 | `clu_rowid`、rollback file/page/offset、48 位 `trx_id` |
+| PAGE_CHECK | ✅ 支持 | 0/CRC32/HASH/CRC32C；HASH 页 slot 目录自动前移 |
+| DELETE / DROP / TRUNCATE 残留页 | ✅ 初步支持 | 仅由 `recover table` 扫描，且要求原页尚未覆盖 |
 | 基础类型与 NULL metadata | ✅ 支持 | 2-bit NULL、数值、二进制、9 位时间戳、时区、13 种 INTERVAL、ROWID |
 | JSON / JSONB / BFILE | ✅ 支持 | JSONB 标量与复合结构、BFILE locator；详见类型支持矩阵 |
 
@@ -662,6 +673,8 @@ dul.log
 - 跨字符集 DMP 不应只修改文件头，应按目标字符集重新生成。
 - 行外 LOB 和 Long Row 已有流式恢复路径，但损坏页、断链和多版本残留仍在持续验证。
 - 迁移行、链式行以及更多版本的复杂物理行格式仍需扩大样例覆盖。
+- 普通 `unload` 已是 slot-only，但 slot-only 不等于 committed-only；未提交 INSERT / DELETE
+  的最终可见性仍需离线事务状态和完整 Undo PRE IMAGE 链才能准确判断。
 - 不保证恢复结果与故障前数据库在事务一致性层面完全一致。
 
 ------
@@ -673,6 +686,7 @@ dul.log
 | v0.4.1 | Standard Bootstrap、磁盘字典、原生兼容 DMP、参数持久化 |
 | v0.5.0 | 完整常规类型矩阵、SQL/CSV/DMP 一致解析、统一 `output/` 输出目录 |
 | v0.5.1 | page plan 直读、同 group storage fallback、segment fallback、卸载 I/O 诊断 |
+| v0.5.2 | 普通行头与 DELETE slot、slot-only 卸载、19 字节事务尾、PAGE_CHECK 四模式 |
 | v0.6.x | 迁移行/链式行、损坏页诊断、更多 DM8 版本兼容验证 |
 | v1.0.0 | 固化文件格式兼容矩阵、恢复报告和稳定发布流程 |
 
