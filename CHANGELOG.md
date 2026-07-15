@@ -12,36 +12,57 @@ v主版本.次版本.修订版本
 
 ------
 
-## Unreleased
-
-### Added
-
-- 新增 `docs/row-page-format.md`，按官方、已验证、样本观察和待验证四个等级整理普通行页格式。
-- 新增 `docs/page-check.md`，记录 `PAGE_CHECK=0/1/2/3` 的实机字段、CRC32、SHA256 和 CRC32C 公式。
-- 新增 `00 2C/00 2E` 物理行长回归测试，以及 4K/8K/16K/32K page size 的 slot 定位测试。
-- 新增 19 字节 `clu_rowid + rollback address + trx_id` 控制尾解码与真实 Undo 指针测试。
-- 新增 PAGE_CHECK 校验器及单字节损坏回归测试。
-- 新增普通卸载与恢复模式的端到端边界测试：无 slot 空洞和删除行只由恢复模式输出。
-
-### Changed
-
-- 将解析器内部“live row”术语收紧为“addressable physical row”，避免把物理可解析误写成事务可见。
-- 明确 `row[0:2]` 是大端物理行长；禁止把 `0x2C/0x2E` 当作正常/删除状态标志。
-- 普通 `unload` 收紧为 slot-only；无 slot 物理空洞和删除残留扫描只在 `recover table` 启用。
-- `n_rec` 仅作为页结构提示，不再截断有效活动 slot，避免 DELETE/空间复用后计数滞后造成漏行。
-- metadata 状态 `10` 在取得真实样本前改为明确拒绝，不再按普通行内值或启发式偏移解析。
+## v0.5.2
 
 ### Fixed
 
-- 正确把行头最高位 `0x8000` 识别为 DELETE 标志，同时用低 15 位读取物理行长。
-- 修复 `PAGE_CHECK=2` 页尾 HASH 使 slot 目录前移时，固定 8 字节尾部公式误读摘要的问题。
+- 修正 DM8 普通行记录头部解析。
+- 明确 `row[0:2]` 为大端 `u16` 物理行长字段：
+  - 低 15 位表示物理行长度
+  - `0x8000` 表示删除标志
+- 修复此前可能将 `00 2C` / `00 2E` 误判为行状态的问题。
+- 修复 `n_rec` 滞后时可能截断有效 slot 的问题。
+- metadata 2-bit 状态 `10` 当前明确拒绝解析，不再启发式猜测。
+
+### Changed
+
+- 普通 `unload` 已收紧为 slot-only。
+- 删除 slot 和无 slot 物理残留仅由 `recover table` 扫描。
+- `isLiveDataRow` 语义调整为物理可解析行判断，避免误表达为事务可见。
+- 不对迁移行 / 链式行做未经验证的跨页拼接。
+
+### Added
+
+- 新增 19 字节事务/MVCC/Undo 行尾识别：
+  - `clu_rowid(6)`
+  - `roll_file(1)`
+  - `roll_page(4)`
+  - `roll_offset(2)`
+  - `trx_id(6)`
+- 新增 PAGE_CHECK 识别与校验支持：
+  - `PAGE_CHECK=0`：无校验
+  - `PAGE_CHECK=1`：页头 `0x18` CRC32/IEEE
+  - `PAGE_CHECK=2`：页尾 HASH，slot 目录随摘要长度前移
+  - `PAGE_CHECK=3`：页头 `0x18` CRC32C/Castagnoli
+- 新增文档：
+  - `docs/row-page-format.md`
+  - `docs/page-check.md`
 
 ### Validation
 
-- DELETE 未提交、Checkpoint、Rollback、Commit 和空间复用差分确认 `0x8000` 删除位及 free-row 链行为。
-- metadata 状态 `10` 在 NULL、LOB、Long Row、ADD DEFAULT、DROP COLUMN 和真实活动行样本中均未出现，继续按未知状态拒绝。
-- PAGE_CHECK 模式 0 和 SHA256 实例的完整 `SYSTEM.DBF` 均以标准 bootstrap 恢复 1063 个对象。
-- 两个实例的 `SYSDBA.PC_T` 均使用一个 planned page 直接导出 3 行，`fallback pages scanned=0`。
+- `go test -count=1 ./...` 通过。
+- `go vet ./...` 通过。
+- `git diff --check` 通过。
+- 已在 `192.168.17.37` DM8 测试环境完成 DELETE 未提交、Rollback、Commit、Checkpoint 差分实验。
+- 已验证 4K / 8K / 16K / 32K 页大小 slot 定位。
+- 已验证 PAGE_CHECK=0/1/2/3。
+- 已完成真实 SYSTEM.DBF bootstrap 和表数据直读验证。
+
+### Notes
+
+- slot-only 不等于事务一致性读。
+- 未提交 INSERT / DELETE 的最终可见性仍需后续离线事务状态和完整 Undo PRE IMAGE 链解析后才能准确判断。
+- 迁移行 / 链式行需要等待可重复物理样本，不在普通行解析中贸然拼接。
 
 ## v0.5.1 - Direct Page Plan & Layered Fallback
 
