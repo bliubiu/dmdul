@@ -1,5 +1,9 @@
 # dmdul
 
+<p align="center">
+  <img src="docs/images/dmdul-logo.png" width="480" alt="dmdul">
+</p>
+
 **Dameng Database Offline Recovery & Data Unloader**
 
 **达梦数据库离线恢复与数据卸载工具**
@@ -55,6 +59,31 @@ SYSTEM.DBF / dm.ctl / user tablespace DBF
 它更接近“离线字典恢复 + DUL + 纯数据 Data Pump 输出”的组合工具，而不再只是一个
 生成 `INSERT` 语句的简单抽取程序。DMP 当前定位为**达梦原生兼容的纯数据文件**；
 对象定义、用户、授权等元数据仍通过 SQL DDL 恢复。
+
+------
+
+## 存储结构理解
+
+下面两张示意图概括了 `dmdul` 当前采用的结构理解：第一张从 `SYSTEM.DBF` 文件布局出发，
+说明初始化参数、系统字典页以及 `SYSOBJECTS`、`SYSCOLUMNS`、`SYSCOLINFOS` 之间的关系；
+第二张进一步展示典型 8K 数据页中页头、行记录、空闲区、槽目录和页尾的组织方式。
+
+### SYSTEM.DBF 与系统字典
+
+![SYSTEM.DBF 结构与数据字典定位示意图](docs/images/system-dbf-dictionary-map.png)
+
+这条链路解释了 `dmdul` 如何从原始文件和关键页入口定位系统字典，并逐步还原用户、表、
+列、类型、索引等结构化元数据。
+
+### DM8 8K 数据页布局
+
+![DM8 8K 数据页结构示意图](docs/images/dm8-8k-data-page-layout.png)
+
+行记录从低地址方向增长，槽目录通常从高地址方向增长；`dmdul` 读取页头和槽目录后，
+按记录偏移定位行数据并依据列定义完成解析。
+
+> **说明：** 两图基于 `dmdul` 的研究与实验观察，用于帮助理解解析思路，并非达梦官方格式文档。
+> 不同数据库版本、表类型和存储策略的实际字段布局可能存在差异，请以目标文件的解析结果为准。
 
 ------
 
