@@ -6,9 +6,9 @@
 
 **Dameng Database Offline Recovery & Data Unloader**
 
-**达梦数据库离线恢复与数据卸载工具**
+**达梦数据库离线恢复与数据抽取工具**
 
-`dmdul` 是一个使用 Go 编写的达梦数据库离线恢复与数据卸载工具。当数据库无法正常
+`dmdul` 是一个使用 Go 编写的达梦数据库离线恢复与数据抽取工具。当数据库无法正常
 `open`、无法通过常规恢复流程启动时，它可以直接读取 `SYSTEM.DBF`、可选的 `dm.ctl`
 以及用户表空间 DBF 文件：
 
