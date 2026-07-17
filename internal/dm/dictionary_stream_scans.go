@@ -82,18 +82,16 @@ func (s *systemPageStream) partitionsByTable(decoder textDecoder, tables map[uin
 	return result, err
 }
 
-func (s *systemPageStream) partitionKeysByTable(tables map[uint32]dictionaryObject, matcher ownerMatcher) (map[uint32][]uint16, error) {
+func (s *systemPageStream) partitionKeysByTable(decoder textDecoder, tables map[uint32]dictionaryObject, matcher ownerMatcher) (map[uint32][]uint16, error) {
 	result := make(map[uint32][]uint16)
-	err := s.forEachDictionarySlotRange(func(page []byte, _ uint32, _ uint16, slotOff uint16, nextOff uint16) {
-		for pos := int(slotOff); pos+16 < int(nextOff); pos++ {
-			tableID, colIDs, ok := parseTabPartInfoAt(page, pos, int(slotOff), int(nextOff))
-			if !ok {
-				continue
-			}
-			table, ok := tables[tableID]
-			if ok && matcher.allowed(table.Owner) && len(colIDs) > 0 {
-				result[tableID] = colIDs
-			}
+	err := s.forEachDictionaryRow(func(page []byte, _ uint32, _ uint16, slotOff uint16) {
+		tableID, colIDs, ok := parseTabPartInfoRow(page, int(slotOff), s.pageSize, decoder)
+		if !ok {
+			return
+		}
+		table, ok := tables[tableID]
+		if ok && matcher.allowed(table.Owner) && len(colIDs) > 0 {
+			result[tableID] = colIDs
 		}
 	})
 	return result, err

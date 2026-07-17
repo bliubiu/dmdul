@@ -376,6 +376,34 @@ func TestDecodeDMTime(t *testing.T) {
 	}
 }
 
+func TestParseDataRowMidnightTimeIsNotNull(t *testing.T) {
+	columns := []columnDef{
+		{ColID: 0, Name: "t", DataType: "time", Length: 5, Scale: 6, Nullable: "Y"},
+	}
+	decoder := textDecoder{preferred: "utf-8"}
+
+	// [2B BE length][1B states][5B TIME] with the state marking the value as
+	// present: an all-zero TIME payload is a real midnight value, not NULL.
+	present := []byte{0x00, 0x08, 0x00, 0, 0, 0, 0, 0}
+	values, _, _, err := parseDataRowValuesWithMetadata(present, columns, decoder, nil)
+	if err != nil {
+		t.Fatalf("parse present midnight TIME: %v", err)
+	}
+	if got, want := values[0].value, "00:00:00.000000"; got != want {
+		t.Fatalf("midnight TIME = %v, want %q", got, want)
+	}
+
+	// The same payload with the NULL state must still decode as NULL.
+	null := []byte{0x00, 0x08, 0x03, 0, 0, 0, 0, 0}
+	values, _, _, err = parseDataRowValuesWithMetadata(null, columns, decoder, nil)
+	if err != nil {
+		t.Fatalf("parse NULL TIME: %v", err)
+	}
+	if values[0].value != nil {
+		t.Fatalf("NULL TIME = %v, want nil", values[0].value)
+	}
+}
+
 func TestDecodeDMNanosecondTimestamp(t *testing.T) {
 	raw := make([]byte, 9)
 	date := uint32(2026) | uint32(7)<<15 | uint32(13)<<19
@@ -789,6 +817,147 @@ func TestExportDataRecoveryModeIsTheFullFileScanPath(t *testing.T) {
 	}
 	if len(result.FallbackReasons) != 1 || !strings.Contains(result.FallbackReasons[0], "full-file residual") {
 		t.Fatalf("recovery fallback reason is missing: %v", result.FallbackReasons)
+	}
+	if len(result.RecoverySources) != 1 || result.RecoverySources[0].Heuristic {
+		t.Fatalf("dictionary-owned recovery source evidence is wrong: %+v", result.RecoverySources)
+	}
+}
+
+func TestExportDataRecoveryModeRecordsOrphanSourceEvidence(t *testing.T) {
+	dir := t.TempDir()
+	systemPath := filepath.Join(dir, "SYSTEM.DBF")
+	writeDataExportTestSystem(t, systemPath)
+	const currentStorageID = 33555438
+	const orphanStorageID = 44556678
+	raw := make([]byte, 8*8192)
+	putTestDMPageHeader(raw[:8192], 4, 0, 0, 0, 0)
+	putTestIntDataPage(raw[3*8192:4*8192], 4, 0, 3, orphanStorageID, 450)
+	if err := os.WriteFile(filepath.Join(dir, "MAIN.DBF"), raw, 0644); err != nil {
+		t.Fatal(err)
+	}
+	dict := testDataExportDictionary(systemPath, currentStorageID, 7, 0, 0)
+	result, err := ExportData(DataExportOptions{
+		SystemPath: systemPath, DataDir: dir, OutputPath: filepath.Join(dir, "orphan-recovery.sql"),
+		OwnerFilter: "APP", TableFilter: "APP.T_PLAN", Charset: "utf-8", RecoveryMode: true, Dictionary: dict,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RowsExported != 1 || len(result.RecoverySources) != 1 {
+		t.Fatalf("orphan recovery result/evidence is wrong: %+v", result)
+	}
+	source := result.RecoverySources[0]
+	if !source.Heuristic || source.Owner != "APP" || source.Name != "T_PLAN" || source.GroupID != 4 || source.FileID != 0 || source.StorageID != orphanStorageID || source.FirstPage != 3 || source.LastPage != 3 || source.Pages != 1 || source.RowsExported != 1 {
+		t.Fatalf("unexpected orphan recovery source: %+v", source)
+	}
+	foundWarning := false
+	for _, reason := range result.FallbackReasons {
+		if strings.Contains(reason, "orphan storage recovery is heuristic") {
+			foundWarning = true
+		}
+	}
+	if !foundWarning {
+		t.Fatalf("orphan attribution warning is missing: %v", result.FallbackReasons)
+	}
+	if sql := readDataExportTestFile(t, result.OutputPath); !strings.Contains(sql, "VALUES (450)") {
+		t.Fatalf("orphan recovery did not export the accepted row: %q", sql)
+	}
+}
+
+func TestExportDataRecoveryDoesNotClaimAnotherDictionaryTableStorage(t *testing.T) {
+	dir := t.TempDir()
+	systemPath := filepath.Join(dir, "SYSTEM.DBF")
+	writeDataExportTestSystem(t, systemPath)
+	const targetStorageID = 33555439
+	const otherStorageID = 33555440
+	raw := make([]byte, 8*8192)
+	putTestDMPageHeader(raw[:8192], 4, 0, 0, 0, 0)
+	putTestIntDataPage(raw[3*8192:4*8192], 4, 0, 3, otherStorageID, 999)
+	if err := os.WriteFile(filepath.Join(dir, "MAIN.DBF"), raw, 0644); err != nil {
+		t.Fatal(err)
+	}
+	dict := testDataExportDictionary(systemPath, targetStorageID, 7, 0, 0)
+	dict.Tables = append(dict.Tables, DictionaryTable{
+		ID: 1002, Owner: "APP", Name: "T_OTHER", ColumnCount: 1,
+		Tablespace: "MAIN", GroupID: 4, Storage: "CLUSTERBTR", StorageID: otherStorageID, RootFile: 0, RootPage: 3,
+	})
+	dict.Columns = append(dict.Columns, DictionaryColumn{
+		TableID: 1002, TableOwner: "APP", TableName: "T_OTHER", ColID: 1, Name: "ID", DataType: "INT", Nullable: "N",
+	})
+	result, err := ExportData(DataExportOptions{
+		SystemPath: systemPath, DataDir: dir, OutputPath: filepath.Join(dir, "target-recovery.sql"),
+		OwnerFilter: "APP", TableFilter: "APP.T_PLAN", Charset: "utf-8", RecoveryMode: true, Dictionary: dict,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RowsExported != 0 || len(result.RecoverySources) != 0 {
+		t.Fatalf("target table claimed another live dictionary storage: %+v", result)
+	}
+	if sql := readDataExportTestFile(t, result.OutputPath); strings.Contains(sql, "VALUES (999)") {
+		t.Fatalf("another table's row leaked into target recovery: %q", sql)
+	}
+}
+
+func TestBuildOrphanRecoveryCandidatesRequiresOneTargetTable(t *testing.T) {
+	table := dictionaryObject{ID: 1001, Owner: "APP", Name: "T_PLAN"}
+	candidates, reason := buildOrphanRecoveryCandidates(map[uint32]dataTableInfo{
+		1001: {table: table, storageUnitID: 1001, recoveryGroupID: 4},
+		2001: {table: table, storageUnitID: 2001, recoveryGroupID: 4},
+	})
+	if reason != "" || len(candidates) != 1 || !candidates[0].orphanRecovery || candidates[0].storageUnitID != table.ID {
+		t.Fatalf("partition storage units should collapse to one target candidate: candidates=%+v reason=%q", candidates, reason)
+	}
+
+	other := dictionaryObject{ID: 1002, Owner: "APP", Name: "T_OTHER"}
+	candidates, reason = buildOrphanRecoveryCandidates(map[uint32]dataTableInfo{
+		1001: {table: table, storageUnitID: 1001},
+		1002: {table: other, storageUnitID: 1002},
+	})
+	if len(candidates) != 0 || !strings.Contains(reason, "disabled for 2 target tables") {
+		t.Fatalf("ambiguous orphan recovery should be disabled: candidates=%+v reason=%q", candidates, reason)
+	}
+}
+
+func TestOrphanRecoveryCandidateRequiresConsistentRowSample(t *testing.T) {
+	page := make([]byte, 8192)
+	putTestDMPageHeader(page, 4, 0, 3, dmPageKindRowData, 44556679)
+	putTestRow(page, dataRowAreaStart, 7, 0)
+	binary.LittleEndian.PutUint32(page[dataRowAreaStart+3:], 451)
+	putTestRow(page, dataRowAreaStart+7, 3, 0)
+	rows := []locatedDataRow{
+		{offset: dataRowAreaStart, length: 7, fromSlot: true},
+		{offset: dataRowAreaStart + 7, length: 3, fromSlot: true},
+	}
+	candidate := dataTableInfo{
+		table:           dictionaryObject{ID: 1001, Owner: "APP", Name: "T_PLAN"},
+		columns:         []columnDef{{ColID: 1, Name: "ID", DataType: "INT", Nullable: "N"}},
+		recoveryMode:    true,
+		orphanRecovery:  true,
+		recoveryGroupID: 4,
+	}
+	if _, ok := selectDataPageCandidate([]dataTableInfo{candidate}, dataFileRef{key: dataFileKey{groupID: 4, fileID: 0}}, 3, page, 8192, rows, textDecoder{preferred: "utf-8"}); ok {
+		t.Fatal("one parseable row must not attribute an inconsistent orphan page")
+	}
+	candidate.orphanRecovery = false
+	if _, ok := selectDataPageCandidate([]dataTableInfo{candidate}, dataFileRef{key: dataFileKey{groupID: 4, fileID: 0}}, 3, page, 8192, rows, textDecoder{preferred: "utf-8"}); !ok {
+		t.Fatal("dictionary-owned recovery candidate should retain the existing tolerant row probe")
+	}
+}
+
+func TestSecondaryIndexStorageIDSet(t *testing.T) {
+	objects := map[uint32]dictionaryObject{
+		101: {ID: 101, Type: "TABOBJ", Subtype: "INDEX"},
+		102: {ID: 102, Type: "TABOBJ", Subtype: "INDEX"},
+	}
+	indexes := map[uint32]indexDef{
+		101: {ID: 101, Flag: 1, KeyNum: 0},
+		102: {ID: 102, Flag: 0, KeyNum: 1},
+		103: {ID: 103, Flag: 0, KeyNum: 1},
+	}
+	got := secondaryIndexStorageIDSet(objects, indexes)
+	if got[101] || !got[102] || got[103] {
+		t.Fatalf("unexpected secondary index storage ids: %+v", got)
 	}
 }
 

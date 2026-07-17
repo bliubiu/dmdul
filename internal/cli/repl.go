@@ -201,6 +201,7 @@ func (s *interactiveSession) executeSet(args []string, stdout io.Writer) error {
 	case "data_dir", "datadir":
 		s.dataDir = value
 		s.dataDirSet = strings.TrimSpace(value) != ""
+		s.dictionary = nil
 	case "control", "ctl":
 		s.controlPath = value
 		s.controlProvided = strings.TrimSpace(value) != ""
@@ -318,6 +319,9 @@ func (s *interactiveSession) executeUnload(args []string, stdout io.Writer) erro
 
 func (s *interactiveSession) bootstrap(stdout io.Writer) error {
 	startedAt := time.Now()
+	// Never retain an older in-memory dictionary after a fresh bootstrap was
+	// requested. If the scan fails, unload must require an explicit reload.
+	s.dictionary = nil
 	systemPath := defaultIfBlank(s.systemPath, defaultSystemPath)
 	ctlPath, ctlProvided := optionalControlPathForSystem(systemPath, s.controlPath, s.controlProvided)
 	if err := validateOptionalControlInputFiles("bootstrap", systemPath, ctlPath, ctlProvided); err != nil {
@@ -375,7 +379,7 @@ func (s *interactiveSession) bootstrap(stdout io.Writer) error {
 	dictDir := s.effectiveDictionaryDir()
 	dict.Source = "SYSTEM.DBF"
 	dict.DictionaryDir = dictDir
-	dictFiles, err := dm.WriteDictionaryFiles(dictDir, dict)
+	dictFiles, dictionaryBackupDir, err := dm.RebuildDictionaryFiles(dictDir, dict)
 	if err != nil {
 		return fmt.Errorf("write dictionary files: %w", err)
 	}
@@ -394,9 +398,13 @@ func (s *interactiveSession) bootstrap(stdout io.Writer) error {
 		status = "SUCCESS_WITH_WARNINGS"
 	}
 	s.emitBootstrapLine(stdout, fmt.Sprintf("[BOOTSTRAP] phase=output name=control.dul status=OK files=%d path=%q", len(dataFiles), controlDULPath))
-	s.emitBootstrapLine(stdout, fmt.Sprintf("[BOOTSTRAP] phase=output name=dmdul_dict status=OK users=%d tables=%d columns=%d views=%d sequences=%d routines=%d triggers=%d synonyms=%d tab_privs=%d path=%q",
+	if dictionaryBackupDir != "" {
+		s.emitBootstrapLine(stdout, fmt.Sprintf("[BOOTSTRAP] phase=output name=dmdul_dict-backup status=OK path=%q", dictionaryBackupDir))
+	}
+	s.emitBootstrapLine(stdout, fmt.Sprintf("[BOOTSTRAP] phase=output name=dmdul_dict status=OK users=%d tables=%d columns=%d views=%d sequences=%d routines=%d triggers=%d synonyms=%d tab_privs=%d partitions=%d partition_keys=%d path=%q",
 		dictFiles.UserCount, dictFiles.TableCount, dictFiles.ColumnCount, dictFiles.ViewCount, dictFiles.SequenceCount,
-		dictFiles.RoutineCount, dictFiles.TriggerCount, dictFiles.SynonymCount, dictFiles.TabPrivilegeCount, dictFiles.Dir))
+		dictFiles.RoutineCount, dictFiles.TriggerCount, dictFiles.SynonymCount, dictFiles.TabPrivilegeCount,
+		dictFiles.PartitionCount, dictFiles.PartitionKeyCount, dictFiles.Dir))
 	s.emitBootstrapLine(stdout, fmt.Sprintf("[BOOTSTRAP] phase=complete status=%s mode=%s objects=%d elapsed_ms=%d",
 		status, dict.BootstrapMode, dict.ObjectCount, time.Since(startedAt).Milliseconds()))
 
@@ -406,8 +414,11 @@ func (s *interactiveSession) bootstrap(stdout io.Writer) error {
 		fmt.Fprintf(stdout, "control file: %s\n", dict.ControlPath)
 	}
 	fmt.Fprintf(stdout, "control.dul: %s (data files: %d)\n", controlDULPath, len(dataFiles))
-	fmt.Fprintf(stdout, "dictionary dir: %s (users=%d tables=%d columns=%d views=%d sequences=%d routines=%d triggers=%d synonyms=%d tab_privs=%d)\n",
-		dictFiles.Dir, dictFiles.UserCount, dictFiles.TableCount, dictFiles.ColumnCount, dictFiles.ViewCount, dictFiles.SequenceCount, dictFiles.RoutineCount, dictFiles.TriggerCount, dictFiles.SynonymCount, dictFiles.TabPrivilegeCount)
+	fmt.Fprintf(stdout, "dictionary dir: %s (users=%d tables=%d columns=%d views=%d sequences=%d routines=%d triggers=%d synonyms=%d tab_privs=%d partitions=%d partition_keys=%d)\n",
+		dictFiles.Dir, dictFiles.UserCount, dictFiles.TableCount, dictFiles.ColumnCount, dictFiles.ViewCount, dictFiles.SequenceCount, dictFiles.RoutineCount, dictFiles.TriggerCount, dictFiles.SynonymCount, dictFiles.TabPrivilegeCount, dictFiles.PartitionCount, dictFiles.PartitionKeyCount)
+	if dictionaryBackupDir != "" {
+		fmt.Fprintf(stdout, "previous dictionary backup: %s\n", dictionaryBackupDir)
+	}
 	fmt.Fprintf(stdout, "database name: %s (%s)\n", metadata.DatabaseName, metadata.DatabaseNameSrc)
 	fmt.Fprintf(stdout, "instance name: %s (%s)\n", metadata.InstanceName, metadata.InstanceNameSrc)
 	fmt.Fprintf(stdout, "page size: %d bytes\n", dict.PageSize)
@@ -433,6 +444,8 @@ func (s *interactiveSession) bootstrap(stdout io.Writer) error {
 	fmt.Fprintf(stdout, "triggers loaded: %d\n", dict.TriggerCount)
 	fmt.Fprintf(stdout, "synonyms loaded: %d\n", dict.SynonymCount)
 	fmt.Fprintf(stdout, "tab privileges loaded: %d\n", dict.TabPrivilegeCount)
+	fmt.Fprintf(stdout, "partitions loaded: %d\n", dict.PartitionCount)
+	fmt.Fprintf(stdout, "partition keys loaded: %d\n", dict.PartitionKeyCount)
 	return nil
 }
 
@@ -649,8 +662,8 @@ func (s *interactiveSession) printDictionarySummary(stdout io.Writer) {
 	if s.dictionary.BootstrapMode != "" {
 		fmt.Fprintf(stdout, "bootstrap mode: %s (fallback=%t)\n", s.dictionary.BootstrapMode, s.dictionary.BootstrapFallback)
 	}
-	fmt.Fprintf(stdout, "dictionary rows: users=%d tables=%d columns=%d views=%d sequences=%d routines=%d triggers=%d synonyms=%d tab_privs=%d objects=%d\n\n",
-		len(s.dictionary.Users), len(s.dictionary.Tables), len(s.dictionary.Columns), len(s.dictionary.Views), len(s.dictionary.Sequences), len(s.dictionary.Routines), len(s.dictionary.Triggers), len(s.dictionary.Synonyms), len(s.dictionary.TabPrivileges), s.dictionary.ObjectCount)
+	fmt.Fprintf(stdout, "dictionary rows: users=%d tables=%d columns=%d views=%d sequences=%d routines=%d triggers=%d synonyms=%d tab_privs=%d partitions=%d partition_keys=%d objects=%d\n\n",
+		len(s.dictionary.Users), len(s.dictionary.Tables), len(s.dictionary.Columns), len(s.dictionary.Views), len(s.dictionary.Sequences), len(s.dictionary.Routines), len(s.dictionary.Triggers), len(s.dictionary.Synonyms), len(s.dictionary.TabPrivileges), len(s.dictionary.Partitions), len(s.dictionary.PartitionKeys), s.dictionary.ObjectCount)
 }
 
 func (s *interactiveSession) printTables(stdout io.Writer, owner string) {
@@ -1065,8 +1078,17 @@ func splitDataFormat(format string) bool {
 }
 
 func printDataExportWarnings(stdout io.Writer, result *dm.DataExportResult) {
-	if result != nil && result.TimeFractionLoss > 0 {
+	if result == nil {
+		return
+	}
+	if result.TimeFractionLoss > 0 {
 		fmt.Fprintf(stdout, "warning: TIME fractional seconds are not representable in DM DMP and were cleared in %d row(s)\n", result.TimeFractionLoss)
+	}
+	for _, source := range result.RecoverySources {
+		if source.Heuristic {
+			fmt.Fprintln(stdout, "warning: orphan storage ownership is heuristic; verify recovery source evidence before import")
+			break
+		}
 	}
 }
 
@@ -1081,11 +1103,34 @@ func (s *interactiveSession) printDataExportDiagnostics(stdout io.Writer, result
 	if len(result.FallbackReasons) == 0 {
 		fmt.Fprintln(stdout, "fallback reason: none")
 		s.log("[UNLOAD] fallback_reason=none")
-		return
+	} else {
+		for _, reason := range result.FallbackReasons {
+			fmt.Fprintf(stdout, "fallback reason: %s\n", reason)
+			s.log("[UNLOAD] fallback_reason=" + reason)
+		}
 	}
-	for _, reason := range result.FallbackReasons {
-		fmt.Fprintf(stdout, "fallback reason: %s\n", reason)
-		s.log("[UNLOAD] fallback_reason=" + reason)
+	for _, source := range result.RecoverySources {
+		attribution := "dictionary"
+		if source.Heuristic {
+			attribution = "heuristic-orphan"
+		}
+		line := fmt.Sprintf(
+			"recovery source: target=%s.%s group=%d file=%d storage_id=%d pages=%d page_range=%d-%d rows_located=%d rows_exported=%d rows_failed=%d attribution=%s",
+			source.Owner,
+			source.Name,
+			source.GroupID,
+			source.FileID,
+			source.StorageID,
+			source.Pages,
+			source.FirstPage,
+			source.LastPage,
+			source.RowsLocated,
+			source.RowsExported,
+			source.RowsFailed,
+			attribution,
+		)
+		fmt.Fprintln(stdout, line)
+		s.log("[RECOVERY] " + line)
 	}
 }
 
@@ -1143,16 +1188,25 @@ func (s *interactiveSession) ensureDictionaryLoaded() error {
 	if s.dictionary != nil {
 		return nil
 	}
-	if err := s.loadDictionaryFiles(io.Discard); err != nil {
+	if err := s.loadDictionaryFilesMode(io.Discard, true); err != nil {
 		return fmt.Errorf("dictionary not loaded, run bootstrap first or load dictionary files from %s: %w", s.effectiveDictionaryDir(), err)
 	}
 	return nil
 }
 
 func (s *interactiveSession) loadDictionaryFiles(stdout io.Writer) error {
+	return s.loadDictionaryFilesMode(stdout, false)
+}
+
+func (s *interactiveSession) loadDictionaryFilesMode(stdout io.Writer, validateCurrentSystem bool) error {
 	dict, files, err := dm.LoadDictionaryFiles(s.effectiveDictionaryDir())
 	if err != nil {
 		return err
+	}
+	if validateCurrentSystem {
+		if err := s.validateAutoLoadedDictionary(dict); err != nil {
+			return err
+		}
 	}
 	s.dictionary = dict
 	if strings.TrimSpace(dict.SystemPath) != "" {
@@ -1169,8 +1223,36 @@ func (s *interactiveSession) loadDictionaryFiles(stdout io.Writer) error {
 	debug.FreeOSMemory()
 	if stdout != io.Discard {
 		fmt.Fprintf(stdout, "dictionary loaded: %s\n", files.Dir)
-		fmt.Fprintf(stdout, "users=%d tables=%d columns=%d views=%d sequences=%d routines=%d triggers=%d synonyms=%d tab_privs=%d\n",
-			files.UserCount, files.TableCount, files.ColumnCount, files.ViewCount, files.SequenceCount, files.RoutineCount, files.TriggerCount, files.SynonymCount, files.TabPrivilegeCount)
+		fmt.Fprintf(stdout, "users=%d tables=%d columns=%d views=%d sequences=%d routines=%d triggers=%d synonyms=%d tab_privs=%d partitions=%d partition_keys=%d\n",
+			files.UserCount, files.TableCount, files.ColumnCount, files.ViewCount, files.SequenceCount, files.RoutineCount, files.TriggerCount, files.SynonymCount, files.TabPrivilegeCount, files.PartitionCount, files.PartitionKeyCount)
+	}
+	return nil
+}
+
+func (s *interactiveSession) validateAutoLoadedDictionary(dict *dm.DictionaryInfo) error {
+	if dict == nil || strings.TrimSpace(dict.SystemPath) == "" || strings.TrimSpace(s.systemPath) == "" {
+		return nil
+	}
+	if info, err := os.Stat(s.systemPath); err != nil || info.IsDir() {
+		return nil
+	}
+	currentPath, err := filepath.Abs(s.systemPath)
+	if err != nil {
+		return nil
+	}
+	dictionaryPath, err := filepath.Abs(dict.SystemPath)
+	if err != nil {
+		return nil
+	}
+	if !strings.EqualFold(filepath.Clean(currentPath), filepath.Clean(dictionaryPath)) {
+		return fmt.Errorf("existing dictionary belongs to SYSTEM.DBF %q, current system is %q; run bootstrap to rebuild it or explicitly load dictionary after verification", dict.SystemPath, s.systemPath)
+	}
+	metadata := dm.InspectDatabaseMetadata(s.systemPath, "", "", "auto")
+	if dict.PageSize != 0 && metadata.PageSize != 0 && dict.PageSize != metadata.PageSize {
+		return fmt.Errorf("existing dictionary page size %d does not match current SYSTEM.DBF page size %d; run bootstrap", dict.PageSize, metadata.PageSize)
+	}
+	if dict.PageCount != 0 && metadata.PageCount != 0 && dict.PageCount != metadata.PageCount {
+		return fmt.Errorf("existing dictionary page count %d does not match current SYSTEM.DBF page count %d; run bootstrap", dict.PageCount, metadata.PageCount)
 	}
 	return nil
 }

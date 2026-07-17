@@ -84,6 +84,40 @@ Offline notes:
 - In the current observed `SYSOBJECTS` row format, logical `INFO1` is at
   row-relative offset `0x1F` and logical `INFO3` starts at `0x27`.
 
+### Sequence runtime state
+
+For `TYPE$='SCHOBJ'` and `SUBTYPE$='SEQ'`, controlled DM8 experiments show:
+
+| Source | Meaning |
+| --- | --- |
+| `INFO3` | Signed initial `START WITH`; it does not advance after `NEXTVAL`. |
+| `INFO4` | Signed `INCREMENT BY`. |
+| `INFO5[0:8]` | Signed little-endian `MAX_VALUE`. |
+| `INFO5[8:16]` | Signed little-endian `MIN_VALUE`. |
+| `INFO5[16:18]` | Little-endian runtime file number. |
+| `INFO5[18:22]` | Little-endian runtime page number. |
+| `INFO5[22:24]` | Little-endian runtime slot number. |
+| `INFO5[24:28]` | Little-endian cache size; zero means `NOCACHE`. |
+
+The observed runtime page stores a little-endian active-slot count at `+0x52` and
+9-byte records from `+0x54`: one state byte followed by a signed 64-bit value.
+The count is not the highest slot plus one: dropped sequences can leave holes,
+so a locator may legally name a higher slot as long as it remains within the
+page record capacity and carries a valid state byte.
+When state bit `0x10` is set, the sequence has not allocated a value and
+`LAST_NUMBER = stored_value`. Otherwise,
+`LAST_NUMBER = stored_value + INCREMENT_BY`. This matched ascending,
+descending, cached, non-cached, cycling, and ordered sequence experiments.
+
+`dmdul` validates the page identity and slot bounds before accepting this
+value. Recovered DDL normally uses `LAST_NUMBER` as `START WITH`; for cached
+sequences this can skip an unused cache tail, but prevents duplicate values
+after recovery. A cycling value just outside its bounds is folded to the
+opposite bound. For an exhausted non-cycling sequence, DDL creates it at the
+terminal bound and consumes that value once so later `NEXTVAL` remains
+exhausted. These offsets are experimental storage-format findings, not an
+official DM compatibility contract.
+
 ## SYSCOLUMNS
 
 Purpose: column definitions for tables, views, and other objects that expose
@@ -401,8 +435,11 @@ Purpose: object dependency/extra information.
 
 Offline notes:
 
-- Lower priority for ordinary table DDL, but important for domains and special
-  object types.
+- `TYPE$ = 'TABPART'` is required for partition-table DDL. `BIN_VALUE` stores
+  the little-endian key count followed by one `COLID` every four bytes; these
+  rows are downloaded during Standard Bootstrap and persisted in
+  `partition_keys.tsv`.
+- Other rows remain important for domains and special object types.
 
 ## SYSUSERINI
 

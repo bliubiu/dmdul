@@ -16,6 +16,7 @@ var bootstrapStage2Tables = []string{
 	"SYSCOLUMNS",
 	"SYSTEXTS",
 	"SYSGRANTS",
+	"SYSOBJINFOS",
 	"SYSHPARTTABLEINFO",
 }
 
@@ -35,7 +36,7 @@ func loadStandardBootstrapCatalog(stream *systemPageStream, decoder textDecoder,
 	catalog := &standardBootstrapCatalog{
 		stream:  stream,
 		decoder: decoder,
-		cache: newDataFilePageCache([]dataFileRef{{
+		cache: newSystemDictionaryPageCache([]dataFileRef{{
 			key:  dataFileKey{groupID: 0, fileID: 0},
 			path: stream.path,
 		}}, stream.pageSize),
@@ -411,6 +412,27 @@ func (c *standardBootstrapCatalog) partitionsByTable(tables map[uint32]dictionar
 	}
 	if used {
 		c.recordTableRows("SYSHPARTTABLEINFO", parsed, true, "")
+	}
+	return result, used, err
+}
+
+func (c *standardBootstrapCatalog) partitionKeysByTable(tables map[uint32]dictionaryObject, matcher ownerMatcher) (map[uint32][]uint16, bool, error) {
+	result := make(map[uint32][]uint16)
+	parsed := 0
+	used, err := c.forEachTableRow("SYSOBJINFOS", func(page []byte, _ uint32, _ uint16, slotOff uint16) {
+		tableID, colIDs, ok := parseTabPartInfoRow(page, int(slotOff), c.stream.pageSize, c.decoder)
+		if !ok {
+			return
+		}
+		parsed++
+		table, ok := tables[tableID]
+		if !ok || !matcher.allowed(table.Owner) || len(colIDs) == 0 {
+			return
+		}
+		result[tableID] = append([]uint16(nil), colIDs...)
+	})
+	if used {
+		c.recordTableRows("SYSOBJINFOS", parsed, true, "TYPE$='TABPART'")
 	}
 	return result, used, err
 }

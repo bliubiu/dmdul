@@ -1,8 +1,10 @@
 package version
 
 var (
-	Name      = "dmdul"
-	Version   = "v0.1.2"
+	Name = "dmdul"
+	// Version is the fallback for builds without -ldflags injection; release
+	// builds override it with the git tag (see docs/development.md).
+	Version   = "v0.5.4"
 	Commit    = "unknown"
 	BuildTime = "unknown"
 )

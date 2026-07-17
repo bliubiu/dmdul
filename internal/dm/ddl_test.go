@@ -2,6 +2,7 @@ package dm
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"strings"
 	"testing"
 )
@@ -122,9 +123,74 @@ func TestRenderCreateUserUsesPlaceholderPasswordAndTablespaces(t *testing.T) {
 	user := dictionaryObject{Name: "HR_TEST", Info3: 4}
 	tablespaces := map[uint32]string{3: "TEMP", 4: "MAIN"}
 	got := renderCreateUser(user, tablespaces)
-	want := `CREATE USER HR_TEST IDENTIFIED BY "dmdul_default_password" DEFAULT TABLESPACE "MAIN" TEMPORARY TABLESPACE "TEMP";`
+	want := `CREATE USER HR_TEST IDENTIFIED BY "Dmdul_2026#Reset" DEFAULT TABLESPACE "MAIN" TEMPORARY TABLESPACE "TEMP";`
 	if got != want {
 		t.Fatalf("renderCreateUser() = %q, want %q", got, want)
+	}
+}
+
+func TestRenderRecoveredSequenceUsesRuntimeLastNumber(t *testing.T) {
+	got := renderRecoveredSequenceSQL(DictionarySequence{
+		Owner: "APP", Name: "SEQ_ORDER", StartWith: 100, HasStartWith: true,
+		MinValue: -100, HasMinValue: true, MaxValue: 0, HasMaxValue: true,
+		IncrementBy: -3, LastNumber: -15, HasLastNumber: true,
+		CycleFlag: "N", OrderFlag: "N", CacheSize: 0,
+	})
+	for _, want := range []string{
+		"CREATE SEQUENCE APP.SEQ_ORDER",
+		"START WITH -15",
+		"INCREMENT BY -3",
+		"MINVALUE -100",
+		"MAXVALUE 0",
+		"NOCACHE",
+		"NOORDER",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("sequence DDL is missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestRenderSequencesWarnsOnlyWhenRuntimeValueIsUnknown(t *testing.T) {
+	var out strings.Builder
+	renderSequences(&out, []DictionarySequence{
+		{Owner: "APP", Name: "SEQ_KNOWN", StartWith: 1, HasStartWith: true, LastNumber: 21, HasLastNumber: true, IncrementBy: 1},
+		{Owner: "APP", Name: "SEQ_UNKNOWN", StartWith: 5, HasStartWith: true, IncrementBy: 1},
+	})
+	got := out.String()
+	if strings.Contains(got, "current value of APP.SEQ_KNOWN") {
+		t.Fatalf("known sequence emitted a runtime warning:\n%s", got)
+	}
+	if !strings.Contains(got, "current value of APP.SEQ_UNKNOWN was not recovered") {
+		t.Fatalf("unknown sequence did not emit a runtime warning:\n%s", got)
+	}
+}
+
+func TestRenderRecoveredSequenceWrapsCyclicLastNumber(t *testing.T) {
+	got := renderRecoveredSequenceSQL(DictionarySequence{
+		Owner: "APP", Name: "SEQ_CYCLE", IncrementBy: 1,
+		MinValue: 1, HasMinValue: true, MaxValue: 5, HasMaxValue: true,
+		LastNumber: 6, HasLastNumber: true, CycleFlag: "Y",
+	})
+	if !strings.Contains(got, "START WITH 1") || strings.Contains(got, "NEXTVAL") {
+		t.Fatalf("cyclic sequence was not wrapped to MINVALUE:\n%s", got)
+	}
+}
+
+func TestRenderRecoveredSequencePreservesExhaustedState(t *testing.T) {
+	seq := DictionarySequence{
+		Owner: "APP", Name: "SEQ_EXHAUSTED", IncrementBy: 1,
+		MinValue: 1, HasMinValue: true, MaxValue: 5, HasMaxValue: true,
+		LastNumber: 6, HasLastNumber: true, CycleFlag: "N",
+	}
+	got := renderRecoveredSequenceSQL(seq)
+	if !strings.Contains(got, "START WITH 5") || !strings.Contains(got, "SELECT APP.SEQ_EXHAUSTED.NEXTVAL") {
+		t.Fatalf("exhausted sequence state was not preserved:\n%s", got)
+	}
+	var out strings.Builder
+	renderSequences(&out, []DictionarySequence{seq})
+	if !strings.Contains(out.String(), "was exhausted") {
+		t.Fatalf("exhausted sequence notice was not emitted:\n%s", out.String())
 	}
 }
 
@@ -268,25 +334,60 @@ func TestParseDDLPartitionRow(t *testing.T) {
 	}
 }
 
-func TestParseTabPartInfoAt(t *testing.T) {
+func TestParseTabPartInfoRow(t *testing.T) {
 	page := make([]byte, 256)
 	pos := 64
-	putUint32LE(page[pos-8:], 1049)
-	page[pos] = 0x87
-	copy(page[pos+1:], []byte("TABPART"))
-	binOff := pos + 8
+	binary.BigEndian.PutUint16(page[pos:], 47)
+	page[pos+2] = 0xC0 // STR_VALUE is NULL; the other four columns are present.
+	putUint32LE(page[pos+4:], 1049)
+	typeOff := pos + 12
+	page[typeOff] = 0x87
+	copy(page[typeOff+1:], []byte("TABPART"))
+	binOff := typeOff + 8
 	page[binOff] = 0x87
 	copy(page[binOff+1:], []byte{0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00})
 
-	tableID, colIDs, ok := parseTabPartInfoAt(page, pos, 0, len(page))
+	tableID, colIDs, ok := parseTabPartInfoRow(page, pos, uint32(len(page)), textDecoder{preferred: "utf-8"})
 	if !ok {
-		t.Fatal("parseTabPartInfoAt() returned false")
+		t.Fatal("parseTabPartInfoRow() returned false")
 	}
 	if tableID != 1049 {
 		t.Fatalf("tableID = %d, want 1049", tableID)
 	}
 	if len(colIDs) != 1 || colIDs[0] != 2 {
 		t.Fatalf("colIDs = %+v, want [2]", colIDs)
+	}
+}
+
+func TestRenderRangePartitionClauseWithIntegerBoundaries(t *testing.T) {
+	decode := func(value string) []byte {
+		raw, err := hex.DecodeString(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	parts := []PartitionInfo{
+		{BaseTableID: 1169, PartTableID: 1170, Type: "RANGE", Name: "p1", HighValue: decode("0100000003003000000030000000000700070007000000000001E8030000000000000192040000000000000100000000")},
+		{BaseTableID: 1169, PartTableID: 1171, Type: "RANGE", Name: "p2", HighValue: decode("0100000003003000000030000000000700070007000000000001D0070000000000000193040000000000000100000000")},
+		{BaseTableID: 1169, PartTableID: 1172, Type: "RANGE", Name: "p3", HighValue: decode("010000000300300000003000000000070007000700000000000200000000000000000194040000000000000100000000")},
+	}
+	wrapped := append([]byte{0xB0}, parts[0].HighValue...)
+	wrapped = append(wrapped, make([]byte, dataRowControlTailLen)...)
+	normalized := normalizePartitionHighValue(wrapped)
+	if hex.EncodeToString(normalized) != hex.EncodeToString(parts[0].HighValue) {
+		t.Fatalf("normalized HIGH_VALUE lost bytes: got=%X want=%X", normalized, parts[0].HighValue)
+	}
+	columns := map[tableColKey]columnDef{
+		{tableID: 1169, colID: 0}: {TableID: 1169, ColID: 0, Name: "id", DataType: "INT"},
+	}
+	got := renderPartitionClause(1169, parts, []uint16{0}, columns)
+	want := "\nPARTITION BY RANGE (\"id\")\n(\n" +
+		"    PARTITION \"p1\" VALUES LESS THAN (1000),\n" +
+		"    PARTITION \"p2\" VALUES LESS THAN (2000),\n" +
+		"    PARTITION \"p3\" VALUES LESS THAN (MAXVALUE)\n)"
+	if got != want {
+		t.Fatalf("renderPartitionClause() =\n%s\nwant:\n%s", got, want)
 	}
 }
 

@@ -12,6 +12,96 @@ v主版本.次版本.修订版本
 
 ------
 
+## v0.5.4 - Protected Page Reads & Auditable Residual Recovery
+
+本版本收口页保护边界、固定长度 NULL、二级索引误识别和残留页归属问题，并把
+`recover table` 的物理来源证据写入控制台与 `dul.log`。
+
+### Fixed
+
+- 修复序列 DDL 把 `MIN_VALUE` 误当作 `START WITH` 的问题；现在从
+  `SYSOBJECTS.INFO5` 的运行槽定位器读取 `SYSTEM.DBF` 序列状态页，并恢复与
+  `DBA_SEQUENCES.LAST_NUMBER` 一致的安全高水位，避免恢复后从旧值重新发号。
+- 序列上下限、初始值、运行值和增量改为有符号 64 位解析，支持负数及降序序列；
+  `CACHE_SIZE=0` 现在显式生成 `NOCACHE`，并补齐 `NOORDER`。
+- 序列状态页的 `+0x52` 字段按活动槽数量处理，不再误当作最大槽号；删除序列留下槽空洞时，
+  仍可通过 `INFO5` 定位器恢复页容量范围内的高编号有效槽。
+- 循环序列越过上下界时把恢复起点折回另一端；已耗尽的非循环序列会在创建后消费一次边界值，
+  保留后续 `NEXTVAL` 继续报耗尽的状态，而不是输出越界或重复发号的 DDL。
+- 修复切换 `data_dir` 后仍保留上一个工作目录内存字典的问题；`system`、`control`、
+  `data_dir` 或 `charset` 改变后均要求重新 bootstrap 或显式加载字典。
+- 新 bootstrap 一开始即清除旧内存字典；扫描或写盘失败后不再允许 unload 静默沿用旧结果。
+- `list/unload/recover` 自动加载字典时会核对当前实际存在的 SYSTEM 路径、页大小和页数；
+  字典属于另一份数据库时明确拒绝，防止旧 `meta.tsv` 把会话静默切回旧库。
+- 用户数据页、LOB 页和 Long Row 页改为按磁盘原始字节读取；页保护边界恢复仅保留在
+  `SYSTEM.DBF` 标准字典下载路径，避免接近满页时把页尾 slot 项覆盖到活动行。
+- SYSTEM 字典页尾 slot 判断支持 `0xFFFF` 空闲/删除槽哨兵，避免混合槽目录被误认为保护备份。
+- 显式 2-bit metadata 已标记字段存在时，不再把全零定长值当作 NULL；
+  `TIME '00:00:00.000000'` 可正确导出。
+- 数据候选排除二级索引 storage，避免索引键/ROWID 被解析成表记录；
+  `0x02000000 | table_id` 猜测只在真实数据 storage id 缺失时启用。
+- 修复只有 `tables.tsv.partitioned=YES`、缺少分区键和边界明细时退化为普通表 DDL 的问题；
+  `RANGE` 整数边界和二进制 `MAXVALUE` 标志现在可直接解码。
+- 交互登录测试不再硬编码历史版本号，改为跟随 `internal/version.Version`。
+
+### Changed
+
+- 孤儿 storage 残留页只允许映射到一个目标表；一次恢复选择多个目标表时禁用该启发式路径；
+  `SYSINDEXES` 与磁盘字典中的全部 `storage_id/assist_ids` 都参与活动归属排除。
+- 孤儿页不再因单条记录碰巧可解析就接受，改为对最多 16 条物理记录执行多行一致性校验。
+- `recover table` 按目标表及源 `group/file/storage_id` 聚合物理证据，记录页数、页范围、
+  定位/导出/失败行数和 `dictionary` / `heuristic-orphan` 归属类型。
+- Standard Bootstrap 第二阶段新增 `SYSOBJINFOS` 精确下载；按真实五列行结构解析
+  `TYPE$='TABPART'`，不再通过原始字符串搜索猜测分区键位置。
+- `dmdul_dict` 新增 `partitions.tsv` 和 `partition_keys.tsv`，完整保留分区顺序、键列及
+  `HIGH_VALUE` 字节；人工修订并 `load dictionary;` 后会直接参与 DDL 和分区数据定位。
+- 生成用户 DDL 的占位密码更新为满足常见 PWD_POLICY 的临时密码；恢复后仍必须立即重置。
+- 序列运行槽不可访问或校验失败时，DDL 才回退到持久化初始值并输出显式复核告警。
+- `dmdul_dict` 改为同级临时目录完整生成、反向加载校验后再切换；已有目录自动归档为
+  `dmdul_dict.backup-YYYYMMDD-HHMMSS`，避免中断写入产生新旧 TSV 混合字典。
+- `.gitignore` 排除字典备份和 bootstrap staging 目录，避免恢复字典被误提交到仓库。
+- 内置版本更新为 `v0.5.4`。
+
+### Added
+
+- 新增页尾 `0xFFFF` 槽哨兵、用户页原样读取、午夜 TIME、多目标孤儿页拒绝、
+  孤儿页多行一致性、二级索引 storage 分类和恢复来源日志回归测试。
+- 新增 `DataRecoverySource` 结果信息，供交互层和后续恢复报告消费。
+- 新增 SYSOBJINFOS TABPART 行解析、分区字典 TSV 往返和整数 RANGE DDL 回归测试。
+- `sequences.tsv` 新增 `last_number`、运行页 `file/page/slot` 和槽状态字段，支持人工审查、
+  修改和 `load dictionary;` 后复用。
+- bootstrap 结构化日志新增 `SEQUENCE_STATE mode=runtime-page-slot`，记录读取页数和成功恢复数。
+- bootstrap 日志新增 `dmdul_dict-backup` 输出证据，并新增残留文件隔离、旧目录备份、
+  `data_dir` 切换和失败 bootstrap 清理内存字典的回归测试。
+
+### Validation
+
+- 使用 `192.168.17.37:/tmp/dulsnap` 的同一份离线快照完成修改前后对照：
+  - `T_BIG`：1 条错行降为 0
+  - `T_PART`：2 条错行降为 0
+  - `T_BASIC`：午夜 TIME 从 NULL 修正为 `00:00:00.000000`
+  - `T_LOB`：由 3 条成功/1 条失败修正为 4 条成功/0 条失败
+  - `T_DEL`：恢复结果由含 100 条二级索引伪记录的 200 条收紧为 100 条
+  - `T_PART`：恢复 `RANGE("id")`、`1000/2000/MAXVALUE`，磁盘字典重载后 DDL 保持一致；
+    数据仍为 16 个计划页、16 次直接读取、0 次 fallback、3000 行成功
+  - 三条测试序列离线恢复的安全高水位为 `100/100/21`，与在线
+    `DBA_SEQUENCES.LAST_NUMBER` 一致；生成 DDL 使用相同 `START WITH`
+  - 32K、GB18030 FEIGE 快照中的 376 条用户序列全部恢复运行值，包含活动数为 378、
+    定位槽为 379 的删除空洞场景
+  - 在已有 `dmdul_dict` 的 8K 快照目录重复 bootstrap：旧目录成功备份、新字典完整启用，
+    `SEQ_T_SEQ_TRG_TEST.last_number=21` 保持不变
+- `go test -count=1 ./...` 通过。
+- `go vet ./...` 通过。
+- `git diff --check` 通过。
+
+### Notes
+
+- `heuristic-orphan` 只能证明页内容与目标结构高度兼容，不能单靠离线物理页证明原始表归属；
+  必须结合源页证据、业务字段和隔离库回放复核。
+- `/tmp/dulsnap` 中已不存在 `T_TRUNC` 的可识别残留载荷，因此该样本恢复 0 条符合快照现状，
+  不代表所有 TRUNCATE 场景都能恢复。
+- DELETE 行的事务可见性和 Undo PRE IMAGE 还未完整恢复，删除行中的历史值仍可能受覆盖影响。
+
 ## v0.5.2
 
 ### Fixed

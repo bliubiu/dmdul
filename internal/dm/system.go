@@ -238,10 +238,45 @@ func restorePageProtectionBytes(page []byte, pageSize uint32) {
 		if src+4 > int(pageSize) || dst+4 > int(pageSize) {
 			return
 		}
+		if tailBytesAreSlotEntries(page, pageSize, src) {
+			continue
+		}
 		if shouldRestoreProtectionBytes(page[dst:dst+4], page[src:src+4]) {
 			copy(page[dst:dst+4], page[src:src+4])
 		}
 	}
+}
+
+// tailBytesAreSlotEntries reports whether the four tail bytes at src belong to
+// the page's slot directory rather than sector-boundary backups. Nearly full
+// pages grow the slot array into the tail reserved area; copying slot entries
+// over the 4 KiB boundary silently corrupts row data. Real backups fail the
+// row-offset plausibility check (e.g. ASCII text decodes to offsets beyond the
+// free-space end), so pages that genuinely carry backups are still restored.
+func tailBytesAreSlotEntries(page []byte, pageSize uint32, src int) bool {
+	if len(page) < dataPageFreeEndOff+2 || src < 0 || src+4 > len(page) {
+		return false
+	}
+	nSlot := int(binary.LittleEndian.Uint16(page[dataPageSlotCountOff:]))
+	if nSlot <= 0 || nSlot >= 2048 {
+		return false
+	}
+	slotArrayEnd := int(pageSize) - pageSlotTrailerLen
+	slotArrayStart := slotArrayEnd - nSlot*2
+	if slotArrayStart < 0x40 || src < slotArrayStart || src+4 > slotArrayEnd {
+		return false
+	}
+	freeEnd := int(binary.LittleEndian.Uint16(page[dataPageFreeEndOff:]))
+	if freeEnd < 0x40 || freeEnd > int(pageSize) {
+		return false
+	}
+	for _, pos := range []int{src, src + 2} {
+		off := int(binary.LittleEndian.Uint16(page[pos:]))
+		if off != 0 && off != 0xFFFF && (off < 0x40 || off >= freeEnd) {
+			return false
+		}
+	}
+	return true
 }
 
 func shouldRestoreProtectionBytes(current []byte, backup []byte) bool {

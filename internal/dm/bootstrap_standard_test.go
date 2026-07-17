@@ -27,10 +27,12 @@ func TestLoadStandardBootstrapCatalogUsesTwoStagePlans(t *testing.T) {
 		{ID: 2, Name: "SYSCOLUMNS", Type: "SCHOBJ", Subtype: "STAB", Valid: "Y"},
 		{ID: 5, Name: "SYSTEXTS", Type: "SCHOBJ", Subtype: "STAB", Valid: "Y"},
 		{ID: 6, Name: "SYSGRANTS", Type: "SCHOBJ", Subtype: "STAB", Valid: "Y"},
+		{ID: 27, Name: "SYSOBJINFOS", Type: "SCHOBJ", Subtype: "STAB", Valid: "Y"},
 		{ID: 19, Name: "SYSHPARTTABLEINFO", Type: "SCHOBJ", Subtype: "STAB", Valid: "Y"},
 		{ID: 2002, ParentID: 2, Name: "SYSINDEXCOLUMNS", Type: "TABOBJ", Subtype: "INDEX", Valid: "Y"},
 		{ID: 2005, ParentID: 5, Name: "SYSINDEXSYSTEXTS", Type: "TABOBJ", Subtype: "INDEX", Valid: "Y"},
 		{ID: 2006, ParentID: 6, Name: "SYSINDEXSYSGRANTS", Type: "TABOBJ", Subtype: "INDEX", Valid: "Y"},
+		{ID: 2027, ParentID: 27, Name: "SYSINDEXSYSOBJINFOS", Type: "TABOBJ", Subtype: "INDEX", Valid: "Y"},
 		{ID: 2019, ParentID: 19, Name: "SYSINDEXSYSHPARTTABLEINFO", Type: "TABOBJ", Subtype: "INDEX", Valid: "Y"},
 	}
 	putBootstrapObjectRows(raw[17*pageSize:18*pageSize], pageSize, objectRows)
@@ -39,14 +41,15 @@ func TestLoadStandardBootstrapCatalogUsesTwoStagePlans(t *testing.T) {
 		{ID: 2002, GroupID: 0, RootFile: 0, RootPage: 20, Type: "BT", Flag: 5},
 		{ID: 2005, GroupID: 0, RootFile: 0, RootPage: 22, Type: "BT", Flag: 5},
 		{ID: 2006, GroupID: 0, RootFile: 0, RootPage: 24, Type: "BT", Flag: 5},
-		{ID: 2019, GroupID: 0, RootFile: 0, RootPage: 26, Type: "BT", Flag: 5},
+		{ID: 2027, GroupID: 0, RootFile: 0, RootPage: 26, Type: "BT", Flag: 5},
+		{ID: 2019, GroupID: 0, RootFile: 0, RootPage: 28, Type: "BT", Flag: 5},
 	}
 	putBootstrapIndexRows(raw[289*pageSize:290*pageSize], pageSize, indexRows)
-	for root := 20; root <= 26; root += 2 {
+	for root := 20; root <= 28; root += 2 {
 		putBootstrapRootAndLeaf(raw, pageSize, uint32(root), uint32(root+1), uint32(1982+root))
 	}
 	// Match each stage-two root storage id to its SYSINDEXES row.
-	for i, root := range []int{20, 22, 24, 26} {
+	for i, root := range []int{20, 22, 24, 26, 28} {
 		storageID := indexRows[i].ID
 		binary.LittleEndian.PutUint32(raw[root*pageSize+dataPageAssistIndexOff:], storageID)
 		binary.LittleEndian.PutUint32(raw[(root+1)*pageSize+dataPageAssistIndexOff:], storageID)

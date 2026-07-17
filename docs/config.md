@@ -204,6 +204,10 @@ datafile 5 0 TBS_BIN_TEST D:\temp\oldpro\TBS_BIN_TEST01.DBF
 `dmdul_dict` 是 `bootstrap;` 生成的文本字典目录。未设置 `data_dir` 时位于当前目录，
 设置 `data_dir` 后位于 `data_dir` 下。`output_dir` 只控制卸载结果，不改变字典目录。
 
+重复 bootstrap 不会读取旧 TSV。新字典先写入同级 staging 目录并完整加载校验，现有目录
+随后备份为 `dmdul_dict.backup-YYYYMMDD-HHMMSS`，最后才切换新目录。备份不会被自动加载；
+确认新字典正确后可自行归档或删除。
+
 当前文件如下：
 
 | 文件 | 说明 |
@@ -212,6 +216,8 @@ datafile 5 0 TBS_BIN_TEST D:\temp\oldpro\TBS_BIN_TEST01.DBF
 | `users.tsv` | 用户/owner 列表。 |
 | `tables.tsv` | 用户表摘要，包含 table id、owner、表名、表空间、段头文件/页号、段大小、存储组织、是否临时表、是否分区。 |
 | `columns.tsv` | 字段摘要，包含 table id、owner、表名、字段序号、字段名、类型、长度、默认值等。 |
+| `partitions.tsv` | 分区顺序、类型、名称、分区子表 ID、完整 `HIGH_VALUE` 十六进制值及 SYSTEM 物理位置。 |
+| `partition_keys.tsv` | 分区键顺序、字段 ID 和字段名；来源为 `SYSOBJINFOS.TYPE$='TABPART'`。 |
 
 这些文件是文本文件，可以人工修正。再次启动后执行：
 
@@ -223,8 +229,8 @@ DMDUL> load dictionary;
 恢复字典摘要。
 
 加载文本字典后，后续 `unload table`、`unload object`、`unload user`、`unload database` 会优先使用
-`dmdul_dict` 中修正后的用户、表、字段、字段类型、默认值、表空间和存储组织信息。
-底层 `SYSTEM.DBF` 仍用于读取索引、约束、分区和数据页定位所需的物理元数据。
+`dmdul_dict` 中修正后的用户、表、字段、字段类型、默认值、表空间、存储组织和分区信息。
+底层 `SYSTEM.DBF` 仍用于读取索引、约束和数据页定位所需的物理元数据。
 如果在 Windows 工具中手工保存 TSV 文件并产生 UTF-8 BOM，DMDUL 会自动兼容。
 
 `tables.tsv` 中的 `header_file`、`header_block`、`bytes`、`blocks`、`extents`
@@ -260,7 +266,7 @@ v0.1.6 开始，`bootstrap` 会尝试通过 DBF 页头和 assist id 自动推断
 | 文件 | 内容 |
 | --- | --- |
 | `views.tsv` | 视图 owner、view name、完整 `CREATE OR REPLACE VIEW` SQL、查询 SQL |
-| `sequences.tsv` | 序列 owner/name、start/min/max、increment、cycle/order、cache，以及可人工修正的序列 SQL |
+| `sequences.tsv` | 序列 owner/name、start/min/max、increment、cycle/order、cache、离线恢复的 `last_number`、运行页 file/page/slot、槽状态，以及可人工修正的序列 SQL |
 | `routines.tsv` | 存储过程、函数、包、包体 owner/name/type、文本序号、状态和完整 `CREATE OR REPLACE` SQL |
 | `triggers.tsv` | 触发器 owner/name、目标表 owner/name、完整 `CREATE OR REPLACE TRIGGER` SQL |
 | `synonyms.tsv` | 同义词 owner/name 以及目标 owner/name |
@@ -269,6 +275,11 @@ v0.1.6 开始，`bootstrap` 会尝试通过 DBF 页头和 assist id 自动推断
 `unload table`、`unload object`、`unload user`、`unload database` 会优先使用这些 TSV
 中的内容生成视图、序列、存储过程/函数/包、触发器、同义词和对象授权 DDL。人工修复这些文件后重新执行
 `load dictionary;` 即可让修正后的字典参与恢复。
+
+`sequences.tsv.last_number` 是生成恢复 DDL 时优先使用的安全下一值。缓存序列可能因此跳过
+故障前尚未实际使用的缓存号段，但可以避免恢复后重复发号。该列为空时，工具才回退到
+`start_with` 并在 DDL 中输出复核告警。`runtime_file/runtime_page/runtime_slot/runtime_state`
+用于保留物理定位证据；人工明确填写的 `last_number` 会优先于再次读取 DBF 的结果。
 
 ## Git 忽略建议
 

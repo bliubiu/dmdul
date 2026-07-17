@@ -126,6 +126,78 @@ func applyDictionaryTableStorage(dictionaryTables map[uint32]DictionaryTable, ta
 	}
 }
 
+func applyDictionaryPartitionOverrides(dict *DictionaryInfo, dictionaryTables map[uint32]DictionaryTable, tables map[uint32]dictionaryObject, matcher ownerMatcher, partitionsByTable map[uint32][]PartitionInfo, keysByTable map[uint32][]uint16) {
+	if dict == nil {
+		return
+	}
+	tableIDsByName := dictionaryTableIDsByOwnerName(dictionaryTables)
+	if len(dict.Partitions) > 0 {
+		parts := append([]DictionaryPartition(nil), dict.Partitions...)
+		sort.SliceStable(parts, func(i, j int) bool {
+			if parts[i].BaseTableID != parts[j].BaseTableID {
+				return parts[i].BaseTableID < parts[j].BaseTableID
+			}
+			if parts[i].Position != parts[j].Position {
+				return parts[i].Position < parts[j].Position
+			}
+			return parts[i].PartTableID < parts[j].PartTableID
+		})
+		replaced := make(map[uint32]bool)
+		for _, part := range parts {
+			tableID := part.BaseTableID
+			if tableID == 0 {
+				tableID = tableIDsByName[ownerTableKey{owner: part.Owner, table: part.TableName}]
+			}
+			table, ok := tables[tableID]
+			if !ok || !matcher.allowed(table.Owner) {
+				continue
+			}
+			if !replaced[tableID] {
+				partitionsByTable[tableID] = nil
+				replaced[tableID] = true
+			}
+			partitionsByTable[tableID] = append(partitionsByTable[tableID], PartitionInfo{
+				BaseTableID:      tableID,
+				PartTableID:      part.PartTableID,
+				Type:             strings.ToUpper(strings.TrimSpace(part.Type)),
+				Name:             part.Name,
+				HighValue:        normalizePartitionHighValue(part.HighValue),
+				HighValuePreview: partitionHighValuePreview(part.HighValue),
+				HighValueHex:     partitionHighValueHex(part.HighValue, 64),
+				PageNo:           part.PageNo,
+				SlotNo:           part.SlotNo,
+				SlotOffset:       part.SlotOffset,
+				RowOffset:        part.RowOffset,
+			})
+		}
+	}
+	if keysByTable != nil && len(dict.PartitionKeys) > 0 {
+		keys := append([]DictionaryPartitionKey(nil), dict.PartitionKeys...)
+		sort.SliceStable(keys, func(i, j int) bool {
+			if keys[i].TableID != keys[j].TableID {
+				return keys[i].TableID < keys[j].TableID
+			}
+			return keys[i].Position < keys[j].Position
+		})
+		replaced := make(map[uint32]bool)
+		for _, key := range keys {
+			tableID := key.TableID
+			if tableID == 0 {
+				tableID = tableIDsByName[ownerTableKey{owner: key.Owner, table: key.TableName}]
+			}
+			table, ok := tables[tableID]
+			if !ok || !matcher.allowed(table.Owner) {
+				continue
+			}
+			if !replaced[tableID] {
+				keysByTable[tableID] = nil
+				replaced[tableID] = true
+			}
+			keysByTable[tableID] = append(keysByTable[tableID], key.ColID)
+		}
+	}
+}
+
 func tablespaceIDByName(tablespaces map[uint32]string, name string) uint32 {
 	for id, existing := range tablespaces {
 		if strings.EqualFold(existing, name) {

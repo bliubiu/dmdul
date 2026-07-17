@@ -65,14 +65,18 @@ SYSTEM.DBF page 0 + 0x7c: SYSINDEXES root page
 - `SYSOBJECTS`：解析 owner、对象名、对象类型、父对象和内部索引对象。
 - `SYSINDEXES`：解析 storage id、group/file、root page、索引类型和键定义。
 
-第一阶段会验证 `SYSOBJECTS`、`SYSCOLUMNS`、`SYSTEXTS`、`SYSGRANTS`、`SYSHPARTTABLEINFO` 等必要对象是否存在。验证失败时才回退到按页流式全文件扫描。
+第一阶段会验证 `SYSOBJECTS`、`SYSCOLUMNS`、`SYSTEXTS`、`SYSGRANTS`、`SYSHPARTTABLEINFO` 等基础对象是否存在，并识别 `SYSOBJINFOS` 等扩展对象。基础验证失败时回退到按页流式全文件扫描；单个扩展对象无法建立 page plan 时，只对该表启用流式 fallback 并记录原因。
 
 第二阶段根据第一阶段得到的对象和索引关系，分别沿 storage root 下载：
 
 - `SYSCOLUMNS`
 - `SYSTEXTS`
 - `SYSGRANTS`
+- `SYSOBJINFOS`（`TYPE$='TABPART'` 分区键）
 - `SYSHPARTTABLEINFO`
+
+序列对象还会从 `SYSOBJECTS.INFO5` 取得运行状态 `file/page/slot` 定位器，直接读取对应
+9 字节状态槽并恢复安全的 `LAST_NUMBER`。该步骤不扫描整份 `SYSTEM.DBF`。
 
 存储过程和触发器源码在 `SYSTEXTS` 信息不足时仍会使用有界 raw window 补充，并在日志中标记为 `raw-window-fallback`。
 
@@ -85,6 +89,7 @@ SYSTEM.DBF page 0 + 0x7c: SYSINDEXES root page
 [BOOTSTRAP] stage=1 phase=anchor name=SYSOBJECTS mode=root-chain status=OK root=0/16 storage=33554540 pages=40 rows=1207
 [BOOTSTRAP] stage=2 phase=dictionary name=SYSCOLUMNS mode=root-chain status=OK root=0/80 storage=33554433 pages=61
 [BOOTSTRAP] stage=2 phase=extract name=SYSCOLUMNS mode=root-chain status=OK pages=61 rows=4284
+[BOOTSTRAP] stage=2 phase=extract name=SEQUENCE_STATE mode=runtime-page-slot status=OK pages=1 rows=376
 [BOOTSTRAP] phase=complete status=SUCCESS mode=standard-two-stage objects=1207 elapsed_ms=628
 ```
 
@@ -112,7 +117,7 @@ bootstrap --scan-storages-without-system-dicts
 
 ## 后续任务
 
-- 将 `SYSOBJINFOS`、`SYSCOLINFOS`、注释和更多扩展字典也切换到第二阶段标准下载。
+- 将 `SYSCOLINFOS`、注释和更多扩展字典也切换到第二阶段标准下载。
 - 为不同 DM8 存储格式增加明确的 parser profile 和版本特征日志。
 - 增加 leaf chain 局部损坏时的跳页、断链续扫和坏页清单。
 - 设计独立的 raw storage scan 救援模式，避免和正常字典恢复混在一起。

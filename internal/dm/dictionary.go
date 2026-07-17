@@ -54,6 +54,8 @@ type DictionaryInfo struct {
 	TriggerCount        int
 	SynonymCount        int
 	TabPrivilegeCount   int
+	PartitionCount      int
+	PartitionKeyCount   int
 	BootstrapMode       string
 	BootstrapFallback   bool
 	Diagnostics         []BootstrapDiagnostic
@@ -66,6 +68,8 @@ type DictionaryInfo struct {
 	Triggers            []DictionaryTrigger
 	Synonyms            []DictionarySynonym
 	TabPrivileges       []DictionaryTabPrivilege
+	Partitions          []DictionaryPartition
+	PartitionKeys       []DictionaryPartitionKey
 }
 
 type DictionaryUser struct {
@@ -107,6 +111,34 @@ type DictionaryColumn struct {
 	Default    string
 }
 
+// DictionaryPartition is the durable representation of one
+// SYSHPARTTABLEINFO row. HighValue keeps the complete binary value so a
+// recovered dictionary can be edited and reused without rescanning SYSTEM.DBF.
+type DictionaryPartition struct {
+	BaseTableID uint32
+	Owner       string
+	TableName   string
+	Position    uint32
+	Type        string
+	Name        string
+	PartTableID uint32
+	HighValue   []byte
+	PageNo      uint32
+	SlotNo      uint16
+	SlotOffset  uint16
+	RowOffset   uint64
+}
+
+// DictionaryPartitionKey is decoded from SYSOBJINFOS.TYPE$='TABPART'.
+type DictionaryPartitionKey struct {
+	TableID    uint32
+	Owner      string
+	TableName  string
+	Position   uint32
+	ColID      uint16
+	ColumnName string
+}
+
 type DictionaryView struct {
 	ID       uint32
 	Owner    string
@@ -117,18 +149,28 @@ type DictionaryView struct {
 }
 
 type DictionarySequence struct {
-	ID          uint32
-	Owner       string
-	Name        string
-	Valid       string
-	StartWith   uint64
-	MinValue    uint64
-	MaxValue    uint64
-	IncrementBy int64
-	CycleFlag   string
-	OrderFlag   string
-	CacheSize   uint32
-	SQL         string
+	ID                uint32
+	Owner             string
+	Name              string
+	Valid             string
+	StartWith         int64
+	HasStartWith      bool
+	MinValue          int64
+	HasMinValue       bool
+	MaxValue          int64
+	HasMaxValue       bool
+	IncrementBy       int64
+	CycleFlag         string
+	OrderFlag         string
+	CacheSize         uint32
+	LastNumber        int64
+	HasLastNumber     bool
+	RuntimeFile       uint16
+	RuntimePage       uint32
+	RuntimeSlot       uint16
+	RuntimeState      uint8
+	HasRuntimeLocator bool
+	SQL               string
 }
 
 type DictionaryRoutine struct {
@@ -319,6 +361,20 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 	}
 	viewList := scanDictionaryViews(objects, texts, ownerMatcher)
 	sequenceList := scanDictionarySequences(objects, texts, ownerMatcher)
+	enrichSequenceRuntimeValues(stream, sequenceList)
+	if len(sequenceList) > 0 {
+		recovered, pages := sequenceRuntimeRecoveryStats(sequenceList)
+		status := "OK"
+		reason := ""
+		if recovered != len(sequenceList) {
+			status = "NOTICE"
+			reason = fmt.Sprintf("recovered %d/%d sequence runtime values", recovered, len(sequenceList))
+		}
+		catalog.addDiagnostic(BootstrapDiagnostic{
+			Stage: 2, Phase: "extract", Name: "SEQUENCE_STATE", Mode: "runtime-page-slot",
+			Status: status, RootFile: -1, Pages: pages, Rows: recovered, Reason: reason,
+		})
+	}
 	rawRoutines, err := stream.rawRoutineTexts(decoder)
 	if err != nil {
 		return nil, err
@@ -369,6 +425,21 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 			return nil, err
 		}
 		catalog.recordTableRows("SYSHPARTTABLEINFO", countPartitions(partitionsByTable), false, defaultIfEmpty(fallbackReason, "standard table plan is unavailable"))
+	}
+	var partitionKeysByTable map[uint32][]uint16
+	usedStandardPartitionKeys := false
+	if !bootstrapFallback {
+		partitionKeysByTable, usedStandardPartitionKeys, err = catalog.partitionKeysByTable(tables, ownerMatcher)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !usedStandardPartitionKeys {
+		partitionKeysByTable, err = stream.partitionKeysByTable(decoder, tables, ownerMatcher)
+		if err != nil {
+			return nil, err
+		}
+		catalog.recordTableRows("SYSOBJINFOS", countPartitionKeys(partitionKeysByTable), false, defaultIfEmpty(fallbackReason, "standard table plan is unavailable"))
 	}
 	var tableList []DictionaryTable
 	userNamesByName := make(map[string]DictionaryUser)
@@ -450,6 +521,8 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 		}
 		return columnList[i].Name < columnList[j].Name
 	})
+	partitionList := dictionaryPartitionsFromMap(tables, partitionsByTable)
+	partitionKeyList := dictionaryPartitionKeysFromMap(tables, partitionKeysByTable, columnList)
 	if !bootstrapFallback && catalog.fallback {
 		bootstrapFallback = true
 		bootstrapMode = "standard-two-stage-with-fallback"
@@ -478,6 +551,8 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 		TriggerCount:        len(triggerList),
 		SynonymCount:        len(synonymList),
 		TabPrivilegeCount:   len(tabPrivilegeList),
+		PartitionCount:      len(partitionList),
+		PartitionKeyCount:   len(partitionKeyList),
 		BootstrapMode:       bootstrapMode,
 		BootstrapFallback:   bootstrapFallback,
 		Diagnostics:         append([]BootstrapDiagnostic(nil), catalog.diagnostics...),
@@ -490,6 +565,8 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 		Triggers:            triggerList,
 		Synonyms:            synonymList,
 		TabPrivileges:       tabPrivilegeList,
+		Partitions:          partitionList,
+		PartitionKeys:       partitionKeyList,
 	}, nil
 }
 

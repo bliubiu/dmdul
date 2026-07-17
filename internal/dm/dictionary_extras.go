@@ -173,18 +173,25 @@ func scanDictionarySequences(objects map[uint32]dictionaryObject, texts map[uint
 		}
 		seqInfo := parseSequencePayload(obj.Payload)
 		sequences = append(sequences, DictionarySequence{
-			ID:          obj.ID,
-			Owner:       obj.Owner,
-			Name:        obj.Name,
-			Valid:       obj.Valid,
-			StartWith:   seqInfo.startWith,
-			MinValue:    seqInfo.minValue,
-			MaxValue:    seqInfo.maxValue,
-			IncrementBy: obj.Info4,
-			CycleFlag:   boolFlag(obj.Info1&0x01 != 0),
-			OrderFlag:   boolFlag(obj.Info1&0xFF00 == 0x100),
-			CacheSize:   seqInfo.cacheSize,
-			SQL:         sequenceTextSQL(texts[obj.ID]),
+			ID:                obj.ID,
+			Owner:             obj.Owner,
+			Name:              obj.Name,
+			Valid:             obj.Valid,
+			StartWith:         int64(obj.Info3),
+			HasStartWith:      true,
+			MinValue:          seqInfo.minValue,
+			HasMinValue:       seqInfo.hasBounds,
+			MaxValue:          seqInfo.maxValue,
+			HasMaxValue:       seqInfo.hasBounds,
+			IncrementBy:       obj.Info4,
+			CycleFlag:         boolFlag(obj.Info1&0x01 != 0),
+			OrderFlag:         boolFlag(obj.Info1&0xFF00 == 0x100),
+			CacheSize:         seqInfo.cacheSize,
+			RuntimeFile:       seqInfo.runtimeFile,
+			RuntimePage:       seqInfo.runtimePage,
+			RuntimeSlot:       seqInfo.runtimeSlot,
+			HasRuntimeLocator: seqInfo.hasRuntimeLocator,
+			SQL:               sequenceTextSQL(texts[obj.ID]),
 		})
 	}
 	sortDictionarySequences(sequences)
@@ -201,20 +208,28 @@ func sequenceTextSQL(seqs map[uint32]string) string {
 }
 
 type sequencePayloadInfo struct {
-	startWith uint64
-	minValue  uint64
-	maxValue  uint64
-	cacheSize uint32
+	minValue          int64
+	maxValue          int64
+	cacheSize         uint32
+	runtimeFile       uint16
+	runtimePage       uint32
+	runtimeSlot       uint16
+	hasRuntimeLocator bool
+	hasBounds         bool
 }
 
 func parseSequencePayload(payload []byte) sequencePayloadInfo {
 	var result sequencePayloadInfo
 	if len(payload) >= 16 {
-		result.maxValue = binary.LittleEndian.Uint64(payload[0:])
-		result.minValue = binary.LittleEndian.Uint64(payload[8:])
-		if result.minValue > 0 {
-			result.startWith = result.minValue
-		}
+		result.maxValue = int64(binary.LittleEndian.Uint64(payload[0:]))
+		result.minValue = int64(binary.LittleEndian.Uint64(payload[8:]))
+		result.hasBounds = true
+	}
+	if len(payload) >= 24 {
+		result.runtimeFile = binary.LittleEndian.Uint16(payload[16:])
+		result.runtimePage = binary.LittleEndian.Uint32(payload[18:])
+		result.runtimeSlot = binary.LittleEndian.Uint16(payload[22:])
+		result.hasRuntimeLocator = result.runtimePage != 0
 	}
 	if len(payload) >= 28 {
 		cache := binary.LittleEndian.Uint32(payload[24:])
@@ -223,6 +238,133 @@ func parseSequencePayload(payload []byte) sequencePayloadInfo {
 		}
 	}
 	return result
+}
+
+const (
+	sequenceRuntimeCountOffset = 0x52
+	sequenceRuntimeRecordBase  = 0x54
+	sequenceRuntimeRecordSize  = 9
+	sequenceRuntimeUnusedFlag  = 0x10
+)
+
+// enrichSequenceRuntimeValues follows the locator embedded in SYSOBJECTS.INFO5
+// to the compact sequence-state slot in SYSTEM.DBF. For an allocated slot DM
+// stores the last reserved value, while DBA_SEQUENCES.LAST_NUMBER exposes the
+// next safe value (stored value + increment).
+func enrichSequenceRuntimeValues(stream *systemPageStream, sequences []DictionarySequence) {
+	if stream == nil {
+		return
+	}
+	pages := make(map[uint32][]byte)
+	for i := range sequences {
+		seq := &sequences[i]
+		if seq.HasLastNumber || !seq.HasRuntimeLocator || seq.RuntimeFile != 0 {
+			continue
+		}
+		page, ok := pages[seq.RuntimePage]
+		if !ok {
+			var err error
+			page, err = stream.readPage(seq.RuntimePage)
+			if err != nil {
+				continue
+			}
+			pages[seq.RuntimePage] = page
+		}
+		last, state, ok := parseSequenceRuntimeValue(page, seq.RuntimePage, seq.RuntimeSlot, seq.IncrementBy)
+		if !ok {
+			continue
+		}
+		seq.LastNumber = last
+		seq.HasLastNumber = true
+		seq.RuntimeState = state
+	}
+}
+
+func mergeSequenceRuntimeMetadata(preferred []DictionarySequence, recovered []DictionarySequence) {
+	byID := make(map[uint32]DictionarySequence, len(recovered))
+	byName := make(map[string]DictionarySequence, len(recovered))
+	for _, seq := range recovered {
+		byID[seq.ID] = seq
+		byName[strings.ToUpper(seq.Owner)+"\x00"+strings.ToUpper(seq.Name)] = seq
+	}
+	for i := range preferred {
+		seq := &preferred[i]
+		recoveredSeq, ok := byID[seq.ID]
+		if !ok {
+			recoveredSeq, ok = byName[strings.ToUpper(seq.Owner)+"\x00"+strings.ToUpper(seq.Name)]
+		}
+		if !ok {
+			continue
+		}
+		if !seq.HasStartWith && seq.StartWith == 0 {
+			seq.StartWith = recoveredSeq.StartWith
+			seq.HasStartWith = recoveredSeq.HasStartWith
+		}
+		if !seq.HasRuntimeLocator {
+			seq.RuntimeFile = recoveredSeq.RuntimeFile
+			seq.RuntimePage = recoveredSeq.RuntimePage
+			seq.RuntimeSlot = recoveredSeq.RuntimeSlot
+			seq.HasRuntimeLocator = recoveredSeq.HasRuntimeLocator
+		}
+		if !seq.HasLastNumber && recoveredSeq.HasLastNumber {
+			seq.LastNumber = recoveredSeq.LastNumber
+			seq.HasLastNumber = true
+			seq.RuntimeState = recoveredSeq.RuntimeState
+		}
+	}
+}
+
+func sequenceRuntimeRecoveryStats(sequences []DictionarySequence) (int, int) {
+	recovered := 0
+	pages := make(map[uint64]bool)
+	for _, seq := range sequences {
+		if !seq.HasLastNumber {
+			continue
+		}
+		recovered++
+		if seq.HasRuntimeLocator {
+			key := uint64(seq.RuntimeFile)<<32 | uint64(seq.RuntimePage)
+			pages[key] = true
+		}
+	}
+	return recovered, len(pages)
+}
+
+func parseSequenceRuntimeValue(page []byte, pageNo uint32, slot uint16, increment int64) (int64, uint8, bool) {
+	if len(page) < sequenceRuntimeRecordBase || len(page) < 8 || binary.LittleEndian.Uint32(page[4:]) != pageNo {
+		return 0, 0, false
+	}
+	count := binary.LittleEndian.Uint16(page[sequenceRuntimeCountOffset:])
+	capacity := (len(page) - sequenceRuntimeRecordBase) / sequenceRuntimeRecordSize
+	// The header field is an active-record count, not the highest slot plus
+	// one. Dropped sequences leave holes, so a valid locator may point beyond
+	// count while still remaining inside the fixed record array.
+	if count == 0 || int(count) > capacity || int(slot) >= capacity {
+		return 0, 0, false
+	}
+	off := sequenceRuntimeRecordBase + int(slot)*sequenceRuntimeRecordSize
+	if off < 0 || off+sequenceRuntimeRecordSize > len(page) {
+		return 0, 0, false
+	}
+	state := page[off]
+	if state&0x01 == 0 || state&0xE0 != 0 {
+		return 0, 0, false
+	}
+	stored := int64(binary.LittleEndian.Uint64(page[off+1:]))
+	if state&sequenceRuntimeUnusedFlag != 0 {
+		return stored, state, true
+	}
+	last, ok := checkedAddInt64(stored, increment)
+	return last, state, ok
+}
+
+func checkedAddInt64(left int64, right int64) (int64, bool) {
+	const maxInt64 = int64(^uint64(0) >> 1)
+	const minInt64 = -maxInt64 - 1
+	if (right > 0 && left > maxInt64-right) || (right < 0 && left < minInt64-right) {
+		return 0, false
+	}
+	return left + right, true
 }
 
 func scanDictionaryRoutines(objects map[uint32]dictionaryObject, texts map[uint32]map[uint32]string, rawTexts map[string]string, matcher ownerMatcher) []DictionaryRoutine {

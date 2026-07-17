@@ -24,6 +24,10 @@ type dataFilePageCache struct {
 	sizes    map[dataFileKey]int64
 	pages    map[dataPageRef][]byte
 	pageFIFO []dataPageRef
+	// restoreProtection enables sector-boundary protection-byte restoration.
+	// Only the SYSTEM.DBF dictionary bootstrap sets it; user data and LOB
+	// pages keep slot metadata in the page tail and must be read verbatim.
+	restoreProtection bool
 }
 
 type dataFilePageReader struct {
@@ -69,7 +73,9 @@ func (r *dataFilePageReader) readPage(ref dataPageRef) ([]byte, error) {
 	if n != len(page) {
 		return nil, fmt.Errorf("read data page %d from %s: short read %d/%d", ref.pageNo, fileRef.path, n, len(page))
 	}
-	restorePageProtectionBytes(page, r.pageSize)
+	// Protection-byte restoration is only proven for SYSTEM.DBF dictionary
+	// pages. User data pages keep slot metadata in the page tail, so restoring
+	// here would overwrite live row bytes (see docs/offline-system-scan.md).
 	return page, nil
 }
 
@@ -100,6 +106,14 @@ func newDataFilePageCache(files []dataFileRef, pageSize uint32) *dataFilePageCac
 	return cache
 }
 
+// newSystemDictionaryPageCache builds a page cache for SYSTEM.DBF dictionary
+// reads, where sector-boundary protection-byte restoration is proven safe.
+func newSystemDictionaryPageCache(files []dataFileRef, pageSize uint32) *dataFilePageCache {
+	cache := newDataFilePageCache(files, pageSize)
+	cache.restoreProtection = true
+	return cache
+}
+
 func (c *dataFilePageCache) readPage(ref dataPageRef) ([]byte, bool) {
 	if c == nil || c.pageSize == 0 {
 		return nil, false
@@ -125,7 +139,9 @@ func (c *dataFilePageCache) readPage(ref dataPageRef) ([]byte, bool) {
 	if err != nil || n != pageSize {
 		return nil, false
 	}
-	restorePageProtectionBytes(page, c.pageSize)
+	if c.restoreProtection {
+		restorePageProtectionBytes(page, c.pageSize)
+	}
 	if len(c.pages) >= maxCachedDataFilePages && len(c.pageFIFO) > 0 {
 		oldest := c.pageFIFO[0]
 		c.pageFIFO = c.pageFIFO[1:]

@@ -182,7 +182,9 @@ func forEachDataFilePage(path string, pageSize uint32, visit func(page []byte, p
 		if n != len(page) {
 			return pageNo, fmt.Errorf("short read %d/%d", n, len(page))
 		}
-		restorePageProtectionBytes(page, pageSize)
+		// User data pages are read verbatim: protection-byte restoration is
+		// only proven for SYSTEM.DBF dictionary pages, and nearly full data
+		// pages keep slot entries in the tail area a restore would read from.
 		if err := visit(page, uint32(pageNo)); err != nil {
 			return pageNo + 1, err
 		}

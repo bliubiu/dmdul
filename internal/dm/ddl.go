@@ -20,9 +20,12 @@ import (
 )
 
 const (
-	defaultStorageOrg                = "CLUSTERBTR"
-	heapStorageOrg                   = "NOBRANCH"
-	defaultRecoveredPassword         = "dmdul_default_password"
+	defaultStorageOrg = "CLUSTERBTR"
+	heapStorageOrg    = "NOBRANCH"
+	// defaultRecoveredPassword must satisfy every DM PWD_POLICY flag
+	// (length >= 9, upper + lower case, digit, punctuation, not a user name)
+	// so the generated CREATE USER statements run on hardened instances.
+	defaultRecoveredPassword         = "Dmdul_2026#Reset"
 	tableIOTInfo1Mask                = 0xFFFF0
 	tableTemporaryInfo3Flag          = 0x40
 	tableTemporarySessionInfo3Flag   = 0x10000
@@ -304,10 +307,11 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	partitionKeysByTable, err := stream.partitionKeysByTable(tables, ownerMatcher)
+	partitionKeysByTable, err := stream.partitionKeysByTable(decoder, tables, ownerMatcher)
 	if err != nil {
 		return nil, err
 	}
+	applyDictionaryPartitionOverrides(opts.Dictionary, dictionaryTables, tables, ownerMatcher, partitionsByTable, partitionKeysByTable)
 	var scanErr error
 	iterRows := func(visit func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16)) {
 		if scanErr == nil {
@@ -462,7 +466,9 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 			views = dictViews
 		}
 		sequences = scanDictionarySequences(objects, texts, ownerMatcher)
+		enrichSequenceRuntimeValues(stream, sequences)
 		if dictSequences, ok := dictionarySequencesForDDL(opts.Dictionary, ownerMatcher); ok {
+			mergeSequenceRuntimeMetadata(dictSequences, sequences)
 			sequences = dictSequences
 		}
 		rawRoutines, routineErr := stream.rawRoutineTexts(decoder)
@@ -1624,6 +1630,12 @@ func rangePartitionBoundary(part PartitionInfo, keyColumn columnDef) (string, bo
 	}
 	upperType := strings.ToUpper(strings.TrimSpace(keyColumn.DataType))
 	switch upperType {
+	case "BYTE", "TINYINT", "SMALLINT", "INT", "INTEGER", "BIGINT":
+		value, ok := decodePartitionIntegerValue(part.HighValue)
+		if !ok {
+			return "", false
+		}
+		return value, true
 	case "DATE", "DATETIME", "TIMESTAMP", "TIME":
 		value, ok := decodePartitionDateValue(part.HighValue)
 		if !ok {
@@ -1644,11 +1656,37 @@ func rangePartitionBoundary(part PartitionInfo, keyColumn columnDef) (string, bo
 }
 
 func isMaxValuePartition(part PartitionInfo) bool {
+	if marker, ok := partitionHighValueMarker(part.HighValue); ok && marker == 0x02 {
+		return true
+	}
 	name := strings.ToUpper(part.Name)
 	return strings.Contains(name, "MAX") || strings.Contains(name, "DEFAULT")
 }
 
+func partitionHighValueMarker(raw []byte) (byte, bool) {
+	raw = normalizePartitionHighValue(raw)
+	// Observed SYSHPARTTABLEINFO values use a 25-byte descriptor followed by
+	// a one-byte boundary marker: 1=value, 2=MAXVALUE/DEFAULT.
+	if len(raw) < 26 || raw[0] != 0x01 || raw[4] != 0x03 {
+		return 0, false
+	}
+	if raw[25] != 0x01 && raw[25] != 0x02 {
+		return 0, false
+	}
+	return raw[25], true
+}
+
+func decodePartitionIntegerValue(raw []byte) (string, bool) {
+	raw = normalizePartitionHighValue(raw)
+	marker, ok := partitionHighValueMarker(raw)
+	if !ok || marker != 0x01 || len(raw) < 34 {
+		return "", false
+	}
+	return strconv.FormatInt(int64(binary.LittleEndian.Uint64(raw[26:34])), 10), true
+}
+
 func decodePartitionDateValue(raw []byte) (string, bool) {
+	raw = normalizePartitionHighValue(raw)
 	for i := 0; i+4 <= len(raw); i++ {
 		year := int(binary.LittleEndian.Uint16(raw[i:]))
 		month := int(raw[i+2])
@@ -1730,6 +1768,14 @@ func renderSequences(out *strings.Builder, sequences []DictionarySequence) {
 	for _, seq := range sequences {
 		sql := strings.TrimSpace(seq.SQL)
 		if sql == "" {
+			if !seq.HasLastNumber {
+				fmt.Fprintf(out, "-- WARNING: current value of %s.%s was not recovered; START WITH uses the persisted initial value\n",
+					quoteIdent(seq.Owner), quoteIdent(seq.Name))
+			}
+			if _, _, exhausted := recoveredSequenceStart(seq); exhausted {
+				fmt.Fprintf(out, "-- NOTICE: %s.%s was exhausted; the following NEXTVAL preserves its exhausted state\n",
+					quoteIdent(seq.Owner), quoteIdent(seq.Name))
+			}
 			sql = renderRecoveredSequenceSQL(seq)
 		}
 		out.WriteString(ensureSQLTerminator(sql))
@@ -1744,14 +1790,15 @@ func renderRecoveredSequenceSQL(seq DictionarySequence) string {
 	}
 	var lines []string
 	lines = append(lines, fmt.Sprintf("CREATE SEQUENCE %s.%s", quoteIdent(seq.Owner), quoteIdent(seq.Name)))
-	if seq.StartWith > 0 {
-		lines = append(lines, fmt.Sprintf("START WITH %d", seq.StartWith))
+	startWith, hasStartWith, exhausted := recoveredSequenceStart(seq)
+	if hasStartWith {
+		lines = append(lines, fmt.Sprintf("START WITH %d", startWith))
 	}
 	lines = append(lines, fmt.Sprintf("INCREMENT BY %d", increment))
-	if seq.MinValue > 0 {
+	if seq.HasMinValue || seq.MinValue != 0 {
 		lines = append(lines, fmt.Sprintf("MINVALUE %d", seq.MinValue))
 	}
-	if seq.MaxValue > 0 {
+	if seq.HasMaxValue || seq.MaxValue != 0 {
 		lines = append(lines, fmt.Sprintf("MAXVALUE %d", seq.MaxValue))
 	}
 	if strings.EqualFold(seq.CycleFlag, "Y") || strings.EqualFold(seq.CycleFlag, "YES") {
@@ -1761,11 +1808,47 @@ func renderRecoveredSequenceSQL(seq DictionarySequence) string {
 	}
 	if seq.CacheSize > 0 {
 		lines = append(lines, fmt.Sprintf("CACHE %d", seq.CacheSize))
+	} else {
+		lines = append(lines, "NOCACHE")
 	}
 	if strings.EqualFold(seq.OrderFlag, "Y") || strings.EqualFold(seq.OrderFlag, "YES") {
 		lines = append(lines, "ORDER")
+	} else {
+		lines = append(lines, "NOORDER")
 	}
-	return strings.Join(lines, "\n")
+	sql := strings.Join(lines, "\n")
+	if exhausted {
+		sql += fmt.Sprintf(";\nSELECT %s.%s.NEXTVAL", quoteIdent(seq.Owner), quoteIdent(seq.Name))
+	}
+	return sql
+}
+
+func recoveredSequenceStart(seq DictionarySequence) (int64, bool, bool) {
+	start := seq.StartWith
+	hasStart := seq.HasStartWith || seq.StartWith != 0
+	if !seq.HasLastNumber {
+		return start, hasStart, false
+	}
+	start = seq.LastNumber
+	hasStart = true
+	increment := seq.IncrementBy
+	if increment == 0 {
+		increment = 1
+	}
+	cycle := strings.EqualFold(seq.CycleFlag, "Y") || strings.EqualFold(seq.CycleFlag, "YES")
+	if increment > 0 && (seq.HasMaxValue || seq.MaxValue != 0) && start > seq.MaxValue {
+		if cycle && (seq.HasMinValue || seq.MinValue != 0) {
+			return seq.MinValue, true, false
+		}
+		return seq.MaxValue, true, true
+	}
+	if increment < 0 && (seq.HasMinValue || seq.MinValue != 0) && start < seq.MinValue {
+		if cycle && (seq.HasMaxValue || seq.MaxValue != 0) {
+			return seq.MaxValue, true, false
+		}
+		return seq.MinValue, true, true
+	}
+	return start, hasStart, false
 }
 
 func renderRoutines(out *strings.Builder, routines []DictionaryRoutine) {

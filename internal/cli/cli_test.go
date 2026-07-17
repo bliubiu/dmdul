@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"dmdul/internal/dm"
+	"dmdul/internal/version"
 )
 
 func TestRunHelp(t *testing.T) {
@@ -62,7 +64,7 @@ func TestRunInteractiveHelpAndExit(t *testing.T) {
 		t.Fatalf("RunInteractive returned error: %v", err)
 	}
 	output := stdout.String()
-	for _, want := range []string{"dmdul: Release v0.1.2", "Dameng Database Offline Recovery & Data Unloader", "Copyright (c) 2026 greatfinish", "https://github.com/greatfinish/dmdul", "DMDUL>", "bootstrap;", "list user;", "unload table", "unload object", "unload database", "recover table", "bye"} {
+	for _, want := range []string{"dmdul: Release " + version.Version, "Dameng Database Offline Recovery & Data Unloader", "Copyright (c) 2026 greatfinish", "https://github.com/greatfinish/dmdul", "DMDUL>", "bootstrap;", "list user;", "unload table", "unload object", "unload database", "recover table", "bye"} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("interactive output should contain %q, got %q", want, output)
 		}
@@ -285,6 +287,64 @@ func TestInteractiveLoadDictionaryUpdatesAutoCharset(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "case_effective= 0 (SYSTEM.DBF page 4 + 0x2C)") {
 		t.Fatalf("load dictionary should resolve case_sensitive=auto, got %q", stdout.String())
+	}
+}
+
+func TestSetDataDirClearsLoadedDictionary(t *testing.T) {
+	session := newInteractiveSession()
+	session.dictionary = &dm.DictionaryInfo{Source: "old dictionary"}
+	if err := session.executeSet([]string{"data_dir", t.TempDir()}, io.Discard); err != nil {
+		t.Fatalf("set data_dir returned error: %v", err)
+	}
+	if session.dictionary != nil {
+		t.Fatal("set data_dir retained a dictionary from the previous work directory")
+	}
+}
+
+func TestFailedBootstrapClearsLoadedDictionary(t *testing.T) {
+	session := newInteractiveSession()
+	session.systemPath = filepath.Join(t.TempDir(), "missing-SYSTEM.DBF")
+	session.dictionary = &dm.DictionaryInfo{Source: "old dictionary"}
+	if err := session.bootstrap(io.Discard); err == nil {
+		t.Fatal("bootstrap unexpectedly succeeded with a missing SYSTEM.DBF")
+	}
+	if session.dictionary != nil {
+		t.Fatal("failed bootstrap retained the old in-memory dictionary")
+	}
+}
+
+func TestImplicitDictionaryLoadRejectsDifferentCurrentSystem(t *testing.T) {
+	dir := t.TempDir()
+	currentSystem := filepath.Join(dir, "CURRENT_SYSTEM.DBF")
+	writeMinimalSystemDBF(t, currentSystem)
+	oldSystem := filepath.Join(dir, "OLD_SYSTEM.DBF")
+	if _, err := dm.WriteDictionaryFiles(filepath.Join(dir, dm.DefaultDictionaryDirName), &dm.DictionaryInfo{
+		SystemPath: oldSystem,
+		Source:     "dictionary files",
+		PageSize:   8192,
+		PageCount:  5,
+		Users:      []dm.DictionaryUser{{ID: 1, Name: "OLD_USER"}},
+	}); err != nil {
+		t.Fatalf("write stale dictionary: %v", err)
+	}
+
+	session := newInteractiveSession()
+	session.systemPath = currentSystem
+	session.dataDir = dir
+	session.dataDirSet = true
+	err := session.ensureDictionaryLoaded()
+	if err == nil || !strings.Contains(err.Error(), "belongs to SYSTEM.DBF") {
+		t.Fatalf("implicit stale dictionary load error = %v", err)
+	}
+	if session.dictionary != nil || session.systemPath != currentSystem {
+		t.Fatalf("stale dictionary changed the session: dictionary=%+v system=%q", session.dictionary, session.systemPath)
+	}
+
+	if err := session.loadDictionaryFiles(io.Discard); err != nil {
+		t.Fatalf("explicit dictionary load should remain available: %v", err)
+	}
+	if session.dictionary == nil || session.systemPath != oldSystem {
+		t.Fatalf("explicit dictionary load did not select its recorded source: dictionary=%+v system=%q", session.dictionary, session.systemPath)
 	}
 }
 
@@ -1035,6 +1095,43 @@ func readTestFile(t *testing.T, path string) string {
 		t.Fatalf("ReadFile %s failed: %v", path, err)
 	}
 	return string(raw)
+}
+
+func TestDataExportDiagnosticsRecordsRecoverySourceEvidence(t *testing.T) {
+	dir := t.TempDir()
+	session := interactiveSession{
+		dataDir:    dir,
+		dataDirSet: true,
+		logPath:    "dul.log",
+		logPathSet: true,
+	}
+	var stdout bytes.Buffer
+	session.printDataExportDiagnostics(&stdout, &dm.DataExportResult{
+		FallbackReasons: []string{"orphan storage recovery is heuristic"},
+		RecoverySources: []dm.DataRecoverySource{{
+			Owner: "APP", Name: "T_RECOVER", GroupID: 4, FileID: 0, StorageID: 44556678,
+			FirstPage: 10, LastPage: 14, Pages: 3, RowsLocated: 8, RowsExported: 7, RowsFailed: 1, Heuristic: true,
+		}},
+	})
+	session.closeLog()
+
+	for _, want := range []string{
+		"recovery source: target=APP.T_RECOVER",
+		"group=4 file=0 storage_id=44556678",
+		"pages=3 page_range=10-14",
+		"attribution=heuristic-orphan",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("diagnostics should contain %q, got %q", want, stdout.String())
+		}
+	}
+	logRaw, err := os.ReadFile(filepath.Join(dir, "dul.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(logRaw), "[RECOVERY] recovery source: target=APP.T_RECOVER") {
+		t.Fatalf("dul.log is missing recovery source evidence: %q", logRaw)
+	}
 }
 
 func TestTimestampedLogLine(t *testing.T) {

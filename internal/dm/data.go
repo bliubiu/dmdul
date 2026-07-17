@@ -80,6 +80,7 @@ type DataExportResult struct {
 	TablesWithoutRows    int
 	TableRowCounts       []DataTableRowCount
 	TableOutputs         []DataTableOutput
+	RecoverySources      []DataRecoverySource
 	OutputFormat         string
 	TimeFractionLoss     int
 }
@@ -97,6 +98,32 @@ type DataTableRowCount struct {
 	RowsLocated  int
 	RowsExported int
 	RowsFailed   int
+}
+
+// DataRecoverySource records the physical source accepted by recover table.
+// Heuristic is true only when the source storage id is absent from the live
+// dictionary and therefore cannot be attributed to the target with certainty.
+type DataRecoverySource struct {
+	Owner        string
+	Name         string
+	GroupID      uint32
+	FileID       int16
+	StorageID    uint32
+	FirstPage    uint32
+	LastPage     uint32
+	Pages        int
+	RowsLocated  int
+	RowsExported int
+	RowsFailed   int
+	Heuristic    bool
+}
+
+type dataRecoverySourceKey struct {
+	tableID   uint32
+	groupID   uint32
+	fileID    int16
+	storageID uint32
+	heuristic bool
 }
 
 type dataFileKey struct {
@@ -129,6 +156,7 @@ type dataTableInfo struct {
 	scanGroupOnly   bool
 	scanGroupID     uint32
 	recoveryMode    bool
+	orphanRecovery  bool
 	recoveryGroupID uint32
 	segment         tableSegment
 	segmentKnown    bool
@@ -754,7 +782,9 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 	if err != nil {
 		return nil, err
 	}
+	applyDictionaryPartitionOverrides(opts.Dictionary, dictionaryTables, tables, ownerMatcher, partitionsByTable, nil)
 	dataStorageByTable := tableStorageByID(tables, indexObjects, indexes, nil)
+	secondaryIndexStorageIDs := secondaryIndexStorageIDSet(indexObjects, indexes)
 	dataFiles, err := resolveDataFiles(opts.ControlPath, opts.ControlDULPath, dataDir)
 	if err != nil {
 		return nil, err
@@ -800,15 +830,23 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 			}
 		}
 		for _, assistID := range dictionaryDataAssistIDs(dictionaryTables, tableID) {
+			// Secondary index storages hold key/rowid entries, not table
+			// rows; scanning them yields garbage rows shaped like the table.
+			if assistID != baseInfo.dataStorageID && secondaryIndexStorageIDs[assistID] {
+				continue
+			}
 			addHistoricalDataAssistID(assistByID, baseInfo, assistID)
-		}
-		if opts.RecoveryMode {
-			for _, assistID := range dictionaryDataAssistIDs(dictionaryTables, tableID) {
+			if opts.RecoveryMode {
 				addRecoveryDataAssistID(assistByID, baseInfo, assistID)
 			}
 		}
 		addHiddenIndexObjectAssistIDs(assistByID, baseInfo, tableID, indexObjects, indexes)
-		addUnknownDataAssistID(assistByID, baseInfo, tableDataAssistID(tableID))
+		if baseInfo.dataStorageID == 0 {
+			// The 0x02000000|table_id guess can collide with unrelated live
+			// storages, so it is only worth scanning when the dictionary has
+			// no real storage id for the table.
+			addUnknownDataAssistID(assistByID, baseInfo, tableDataAssistID(tableID))
+		}
 		for _, part := range partitionsByTable[tableID] {
 			partInfo := baseInfo
 			partInfo.storageUnitID = part.PartTableID
@@ -832,7 +870,9 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 				}
 			}
 			addHiddenIndexObjectAssistIDs(assistByID, partInfo, part.PartTableID, indexObjects, indexes)
-			addUnknownDataAssistID(assistByID, partInfo, tableDataAssistID(part.PartTableID))
+			if partInfo.dataStorageID == 0 {
+				addUnknownDataAssistID(assistByID, partInfo, tableDataAssistID(part.PartTableID))
+			}
 		}
 	}
 
@@ -888,6 +928,7 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 	processedDirectPages := make(map[dataPageRef]bool)
 	failedPlanUnits := make(map[uint32]bool)
 	fallbackReasonSeen := make(map[string]bool)
+	recoverySources := make(map[dataRecoverySourceKey]*DataRecoverySource)
 	addFallbackReason := func(reason string) {
 		reason = strings.TrimSpace(reason)
 		if reason == "" || fallbackReasonSeen[reason] {
@@ -895,6 +936,42 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 		}
 		fallbackReasonSeen[reason] = true
 		result.FallbackReasons = append(result.FallbackReasons, reason)
+	}
+	recordRecoverySource := func(info dataTableInfo, file dataFileRef, pageNo uint32, storageID uint32, located int, exported int, failed int) {
+		if !opts.RecoveryMode {
+			return
+		}
+		key := dataRecoverySourceKey{
+			tableID:   info.table.ID,
+			groupID:   file.key.groupID,
+			fileID:    file.key.fileID,
+			storageID: storageID,
+			heuristic: info.orphanRecovery,
+		}
+		source := recoverySources[key]
+		if source == nil {
+			source = &DataRecoverySource{
+				Owner:     info.table.Owner,
+				Name:      info.table.Name,
+				GroupID:   file.key.groupID,
+				FileID:    file.key.fileID,
+				StorageID: storageID,
+				FirstPage: pageNo,
+				LastPage:  pageNo,
+				Heuristic: info.orphanRecovery,
+			}
+			recoverySources[key] = source
+		}
+		if pageNo < source.FirstPage {
+			source.FirstPage = pageNo
+		}
+		if pageNo > source.LastPage {
+			source.LastPage = pageNo
+		}
+		source.Pages++
+		source.RowsLocated += located
+		source.RowsExported += exported
+		source.RowsFailed += failed
 	}
 	processPage := func(file dataFileRef, pageNo uint32, page []byte, candidates []dataTableInfo) error {
 		if stop {
@@ -912,6 +989,12 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 		if !ok {
 			return nil
 		}
+		if info.orphanRecovery {
+			addFallbackReason(fmt.Sprintf("%s.%s orphan storage recovery is heuristic; verify recovery source group/file/storage_id/page range before import", info.table.Owner, info.table.Name))
+		}
+		locatedBefore := result.RowsLocated
+		exportedBefore := result.RowsExported
+		failedBefore := result.RowsFailed
 		for _, row := range rows {
 			if opts.MaxRows > 0 && result.RowsLocated >= opts.MaxRows {
 				stop = true
@@ -977,6 +1060,15 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 				return err
 			}
 		}
+		recordRecoverySource(
+			info,
+			file,
+			pageNo,
+			dataPageStorageID(page),
+			result.RowsLocated-locatedBefore,
+			result.RowsExported-exportedBefore,
+			result.RowsFailed-failedBefore,
+		)
 		if stop {
 			return errStopPageScan
 		}
@@ -988,6 +1080,28 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 
 	if opts.RecoveryMode {
 		addFallbackReason("recovery mode requested a full-file residual page scan")
+		// TRUNCATE and DROP allocate fresh storage ids, so residual pages
+		// carry ids no live object owns. Offer the recovery targets as
+		// candidates for such orphaned pages; selectDataPageCandidate still
+		// demands that the page rows parse with the target table's columns.
+		liveStorageIDs := make(map[uint32]bool, len(indexes))
+		for storageID := range indexes {
+			liveStorageIDs[storageID] = true
+		}
+		for _, table := range dictionaryTables {
+			if table.StorageID != 0 {
+				liveStorageIDs[table.StorageID] = true
+			}
+			for _, assistID := range table.AssistIDs {
+				if assistID != 0 {
+					liveStorageIDs[assistID] = true
+				}
+			}
+		}
+		orphanCandidates, orphanReason := buildOrphanRecoveryCandidates(storageUnits)
+		if orphanReason != "" {
+			addFallbackReason(orphanReason)
+		}
 		for _, file := range dataFiles {
 			if stop {
 				break
@@ -995,7 +1109,11 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 			touchedFiles[file.key] = true
 			pagesScanned, scanErr := forEachDataFilePage(file.path, pageSize, func(page []byte, pageNo uint32) error {
 				assistIndexID := dataPageStorageID(page)
-				return processPage(file, pageNo, page, assistByID[assistIndexID])
+				candidates := assistByID[assistIndexID]
+				if len(candidates) == 0 && !liveStorageIDs[assistIndexID] {
+					candidates = orphanCandidates
+				}
+				return processPage(file, pageNo, page, candidates)
 			})
 			result.FallbackPagesScanned += pagesScanned
 			result.PagesScanned += pagesScanned
@@ -1124,6 +1242,7 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 		}
 	}
 	result.DataFileCount = len(touchedFiles)
+	result.RecoverySources = finalizeDataRecoverySources(recoverySources)
 	sort.Strings(result.FallbackReasons)
 	for _, pending := range pendingPartialRows {
 		if coveredRowPrefixes[pending.tableID][pending.meta.prefixKey] || coveredRowPrefixes[pending.tableID][pending.meta.weakPrefixKey] {
@@ -1208,6 +1327,34 @@ func sortedDataPageRefs(refs map[dataPageRef]bool) []dataPageRef {
 	return result
 }
 
+func finalizeDataRecoverySources(items map[dataRecoverySourceKey]*DataRecoverySource) []DataRecoverySource {
+	result := make([]DataRecoverySource, 0, len(items))
+	for _, source := range items {
+		if source != nil {
+			result = append(result, *source)
+		}
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Owner != result[j].Owner {
+			return result[i].Owner < result[j].Owner
+		}
+		if result[i].Name != result[j].Name {
+			return result[i].Name < result[j].Name
+		}
+		if result[i].GroupID != result[j].GroupID {
+			return result[i].GroupID < result[j].GroupID
+		}
+		if result[i].FileID != result[j].FileID {
+			return result[i].FileID < result[j].FileID
+		}
+		if result[i].StorageID != result[j].StorageID {
+			return result[i].StorageID < result[j].StorageID
+		}
+		return !result[i].Heuristic && result[j].Heuristic
+	})
+	return result
+}
+
 func sortedSegmentPageRefs(pages map[dataPageRef][]dataTableInfo) []dataPageRef {
 	refs := make(map[dataPageRef]bool, len(pages))
 	for ref := range pages {
@@ -1218,7 +1365,7 @@ func sortedSegmentPageRefs(pages map[dataPageRef][]dataTableInfo) []dataPageRef 
 
 func appendUniqueDataCandidate(items []dataTableInfo, candidate dataTableInfo) []dataTableInfo {
 	for _, existing := range items {
-		if existing.table.ID == candidate.table.ID && existing.storageUnitID == candidate.storageUnitID && existing.storage.ID == candidate.storage.ID && existing.pagePlanKnown == candidate.pagePlanKnown && existing.scanGroupOnly == candidate.scanGroupOnly && existing.historicalRows == candidate.historicalRows {
+		if existing.table.ID == candidate.table.ID && existing.storageUnitID == candidate.storageUnitID && existing.storage.ID == candidate.storage.ID && existing.pagePlanKnown == candidate.pagePlanKnown && existing.scanGroupOnly == candidate.scanGroupOnly && existing.historicalRows == candidate.historicalRows && existing.orphanRecovery == candidate.orphanRecovery {
 			return items
 		}
 	}
@@ -1390,7 +1537,7 @@ func addDataAssistCandidate(assistByID map[uint32][]dataTableInfo, assistID uint
 		return
 	}
 	for _, existing := range assistByID[assistID] {
-		if existing.table.ID == info.table.ID && existing.storageKnown == info.storageKnown && existing.storage.ID == info.storage.ID && existing.pagePlanKnown == info.pagePlanKnown && existing.recoveryMode == info.recoveryMode && existing.historicalRows == info.historicalRows {
+		if existing.table.ID == info.table.ID && existing.storageKnown == info.storageKnown && existing.storage.ID == info.storage.ID && existing.pagePlanKnown == info.pagePlanKnown && existing.recoveryMode == info.recoveryMode && existing.historicalRows == info.historicalRows && existing.orphanRecovery == info.orphanRecovery {
 			return
 		}
 	}
@@ -1425,6 +1572,58 @@ func tableDataAssistID(tableID uint32) uint32 {
 		return 0
 	}
 	return 0x02000000 | (tableID & 0x00FFFFFF)
+}
+
+// buildOrphanRecoveryCandidates creates one heuristic candidate for pages
+// whose storage id no live object owns. Orphan pages cannot prove ownership,
+// so broad recovery is disabled when more than one target table is selected.
+func buildOrphanRecoveryCandidates(storageUnits map[uint32]dataTableInfo) ([]dataTableInfo, string) {
+	byTable := make(map[uint32]dataTableInfo)
+	for _, info := range storageUnits {
+		if info.table.ID == 0 {
+			continue
+		}
+		existing, ok := byTable[info.table.ID]
+		if !ok || info.storageUnitID == info.table.ID || (existing.recoveryGroupID == 0 && info.recoveryGroupID != 0) {
+			byTable[info.table.ID] = info
+		}
+	}
+	if len(byTable) == 0 {
+		return nil, ""
+	}
+	if len(byTable) != 1 {
+		return nil, fmt.Sprintf("orphan storage recovery disabled for %d target tables; use recover table owner.table to avoid ambiguous attribution", len(byTable))
+	}
+	for _, info := range byTable {
+		info.recoveryMode = true
+		info.orphanRecovery = true
+		info.historicalRows = info.dataStorageID != 0
+		info.pagePlan = nil
+		info.pagePlanKnown = false
+		info.storage = indexDef{}
+		info.storageKnown = false
+		info.storageUnitID = info.table.ID
+		return []dataTableInfo{info}, ""
+	}
+	return nil, ""
+}
+
+// secondaryIndexStorageIDSet collects storage ids that belong to secondary
+// indexes. Table data storages carry Flag&1 == 1 with no key columns (see
+// tableStorageByID); everything else with key columns stores index entries
+// whose layout does not match the owning table's rows.
+func secondaryIndexStorageIDSet(indexObjects map[uint32]dictionaryObject, indexes map[uint32]indexDef) map[uint32]bool {
+	result := make(map[uint32]bool)
+	for indexID, idx := range indexes {
+		if _, ok := indexObjects[indexID]; !ok {
+			continue
+		}
+		if idx.Flag&1 == 1 && idx.KeyNum == 0 {
+			continue
+		}
+		result[indexID] = true
+	}
+	return result
 }
 
 func assistIndexesByParentID(tables map[uint32]dictionaryObject, indexObjects map[uint32]dictionaryObject, indexes map[uint32]indexDef) map[uint32][]indexDef {
@@ -1507,6 +1706,12 @@ func selectDataPageCandidate(candidates []dataTableInfo, file dataFileRef, pageN
 		if !candidateMatchesFile(candidate, file, pageNo) {
 			continue
 		}
+		if candidate.orphanRecovery {
+			if orphanRecoveryCandidateMatchesRows(candidate, page, pageSize, rows, decoder) {
+				return candidate, true
+			}
+			continue
+		}
 		limit := len(rows)
 		if limit > 3 {
 			limit = 3
@@ -1524,6 +1729,36 @@ func selectDataPageCandidate(candidates []dataTableInfo, file dataFileRef, pageN
 		}
 	}
 	return dataTableInfo{}, false
+}
+
+// orphanRecoveryCandidateMatchesRows raises the confidence threshold for an
+// unowned storage page. Ownership is still heuristic, but one coincidentally
+// parseable row is no longer enough to attribute a whole page to the target.
+func orphanRecoveryCandidateMatchesRows(candidate dataTableInfo, page []byte, pageSize uint32, rows []locatedDataRow, decoder textDecoder) bool {
+	limit := len(rows)
+	if limit > 16 {
+		limit = 16
+	}
+	matched := 0
+	for i := 0; i < limit; i++ {
+		row := rows[i]
+		rowStart := int(row.offset)
+		rowEnd := rowStart + int(row.length)
+		if rowStart < 0 || rowEnd > int(pageSize) || rowEnd > len(page) {
+			continue
+		}
+		if _, _, _, err := parseDataRowValues(page[rowStart:rowEnd], candidate.columns, decoder, candidate.historicalRows, candidate.lobReader); err == nil {
+			matched++
+		}
+	}
+	if limit == 0 {
+		return false
+	}
+	required := limit
+	if limit >= 4 {
+		required = (limit*3 + 3) / 4
+	}
+	return matched >= required
 }
 
 func isTableDataAssistHeaderCandidate(info dataTableInfo, pageStorageID uint32, pageKind uint32) bool {
@@ -2394,7 +2629,9 @@ func decodeRowColumnStates(raw []byte, columnCount int) []byte {
 
 func readInRowDataValue(col columnDef, row []byte, pos int, decoder textDecoder, lobReader *dmLOBReader) (any, int, error) {
 	if fixedDataSizeForColumn(col) > 0 {
-		return parseFixedDataValue(col, row, pos)
+		// Row metadata states already distinguish NULL from present values,
+		// so decode the bytes as-is instead of guessing at NULL sentinels.
+		return parseFixedDataValuePresent(col, row, pos)
 	}
 	return readVariableDataValue(col, row, pos, decoder, lobReader)
 }
@@ -2778,12 +3015,24 @@ func normalizeDataType(dataType string) string {
 	return strings.Join(strings.Fields(upper), " ")
 }
 
+// parseFixedDataValue decodes a fixed-size value where no per-column NULL
+// metadata is available (heuristic row parsing), so recognizable NULL
+// sentinel encodings are honoured before decoding.
 func parseFixedDataValue(col columnDef, row []byte, pos int) (any, int, error) {
 	dataType := normalizeDataType(col.DataType)
 	size := fixedDataSizeForColumn(col)
 	if size > 0 && pos+size <= len(row) && isNullableColumn(col) && isFixedNullSentinel(dataType, row[pos:pos+size]) {
 		return nil, pos + size, nil
 	}
+	return parseFixedDataValuePresent(col, row, pos)
+}
+
+// parseFixedDataValuePresent decodes a fixed-size value that row metadata has
+// already marked as present. Zero-filled encodings are legitimate values here
+// (for example TIME '00:00:00'), so no NULL sentinel heuristics are applied.
+func parseFixedDataValuePresent(col columnDef, row []byte, pos int) (any, int, error) {
+	dataType := normalizeDataType(col.DataType)
+	size := fixedDataSizeForColumn(col)
 	switch dataType {
 	case "BIT", "BOOL", "BOOLEAN":
 		if pos+1 > len(row) {

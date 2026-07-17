@@ -194,67 +194,108 @@ func countPartitions(partitionsByTable map[uint32][]PartitionInfo) int {
 	return count
 }
 
+func countPartitionKeys(keysByTable map[uint32][]uint16) int {
+	count := 0
+	for _, keys := range keysByTable {
+		count += len(keys)
+	}
+	return count
+}
+
 func scanPartitionKeysByTable(data []byte, pageSize uint32, tables map[uint32]dictionaryObject, matcher ownerMatcher) map[uint32][]uint16 {
 	keysByTable := make(map[uint32][]uint16)
-	iterDictionarySlotRanges(data, pageSize, func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16, nextOff uint16) {
-		_ = pageNo
-		_ = slotNo
-		for pos := int(slotOff); pos+16 < int(nextOff); pos++ {
-			tableID, colIDs, ok := parseTabPartInfoAt(page, pos, int(slotOff), int(nextOff))
-			if !ok {
-				continue
-			}
-			table, ok := tables[tableID]
-			if !ok || !matcher.allowed(table.Owner) {
-				continue
-			}
-			if len(colIDs) > 0 {
-				keysByTable[tableID] = colIDs
-			}
+	decoder := textDecoder{preferred: "utf-8"}
+	iterDictionaryRows(data, pageSize, func(page []byte, _ uint32, _ uint16, slotOff uint16) {
+		tableID, colIDs, ok := parseTabPartInfoRow(page, int(slotOff), pageSize, decoder)
+		if !ok {
+			return
 		}
+		table, ok := tables[tableID]
+		if !ok || !matcher.allowed(table.Owner) {
+			return
+		}
+		keysByTable[tableID] = colIDs
 	})
 	return keysByTable
 }
 
-func parseTabPartInfoAt(page []byte, pos int, slotOff int, nextOff int) (uint32, []uint16, bool) {
-	const tabPartType = "TABPART"
-	typeMarker := pos
-	if typeMarker < slotOff+8 || typeMarker+1+len(tabPartType)+1 >= nextOff {
-		return 0, nil, false
+func sysObjInfosColumns() []columnDef {
+	return []columnDef{
+		{ColID: 0, Name: "ID", DataType: "INT", Nullable: "N"},
+		{ColID: 1, Name: "TYPE$", DataType: "VARCHAR", Nullable: "N"},
+		{ColID: 2, Name: "INT_VALUE", DataType: "INT", Nullable: "Y"},
+		{ColID: 3, Name: "STR_VALUE", DataType: "VARCHAR", Nullable: "Y"},
+		{ColID: 4, Name: "BIN_VALUE", DataType: "VARBINARY", Nullable: "Y"},
 	}
-	if page[typeMarker] != 0x87 || string(page[typeMarker+1:typeMarker+1+len(tabPartType)]) != tabPartType {
-		return 0, nil, false
-	}
+}
 
-	tableID := binary.LittleEndian.Uint32(page[typeMarker-8:])
-	binMarkerOff := typeMarker + 1 + len(tabPartType)
-	if binMarkerOff >= nextOff {
+func parseTabPartInfoRow(page []byte, rowOff int, pageSize uint32, decoder textDecoder) (uint32, []uint16, bool) {
+	if rowOff < 0 || rowOff+3 > len(page) || uint32(rowOff)+3 > pageSize {
 		return 0, nil, false
 	}
-	binMarker := page[binMarkerOff]
-	if binMarker < 0x80 || binMarker > 0xBF {
+	header := binary.BigEndian.Uint16(page[rowOff:])
+	if header&dataRowDeletedMask != 0 {
 		return 0, nil, false
 	}
-	binLen := int(binMarker - 0x80)
-	binStart := binMarkerOff + 1
-	binEnd := binStart + binLen
-	if binLen < 4 || binEnd > nextOff || binEnd > len(page) {
+	rowLen := int(header &^ dataRowDeletedMask)
+	if rowLen < 12 || rowOff+rowLen > len(page) || uint32(rowOff+rowLen) > pageSize {
 		return 0, nil, false
 	}
-	binValue := page[binStart:binEnd]
+	values, _, _, err := parseDataRowValues(page[rowOff:rowOff+rowLen], sysObjInfosColumns(), decoder, false, nil)
+	if err != nil {
+		return 0, nil, false
+	}
+	idValue, ok := values[0]
+	if !ok {
+		return 0, nil, false
+	}
+	var tableID uint32
+	switch value := idValue.value.(type) {
+	case int32:
+		if value <= 0 {
+			return 0, nil, false
+		}
+		tableID = uint32(value)
+	case int64:
+		if value <= 0 || value > int64(^uint32(0)) {
+			return 0, nil, false
+		}
+		tableID = uint32(value)
+	default:
+		return 0, nil, false
+	}
+	typeValue, ok := values[1]
+	if !ok || !strings.EqualFold(strings.TrimSpace(fmt.Sprint(typeValue.value)), "TABPART") {
+		return 0, nil, false
+	}
+	binValue, ok := values[4].value.(dmBinary)
+	if !ok {
+		return 0, nil, false
+	}
+	colIDs, ok := decodeTabPartBinValue(binValue)
+	if !ok {
+		return 0, nil, false
+	}
+	return tableID, colIDs, true
+}
+
+func decodeTabPartBinValue(binValue []byte) ([]uint16, bool) {
+	if len(binValue) < 4 {
+		return nil, false
+	}
 	keyCount := int(binary.LittleEndian.Uint16(binValue[0:]))
-	if keyCount <= 0 || keyCount > 16 {
-		return 0, nil, false
+	if keyCount <= 0 || keyCount > 64 {
+		return nil, false
 	}
 	colIDs := make([]uint16, 0, keyCount)
 	for i := 0; i < keyCount; i++ {
 		off := 2 + i*4
 		if off+2 > len(binValue) {
-			break
+			return nil, false
 		}
 		colIDs = append(colIDs, binary.LittleEndian.Uint16(binValue[off:]))
 	}
-	return tableID, colIDs, true
+	return colIDs, true
 }
 
 func scanDictionaryObjects(data []byte, pageSize uint32, decoder textDecoder) map[uint32]dictionaryObject {
@@ -372,8 +413,7 @@ func parseDDLPartitionRowAt(page []byte, rowOff int, pageNo uint32, slotNo uint1
 
 	rowAbs := uint64(pageNo)*uint64(pageSize) + uint64(rowOff)
 	highValueEnd := rowOff + rowLen
-	highValue := append([]byte(nil), page[next:highValueEnd]...)
-	highValue = trimPartitionHighValue(highValue)
+	highValue := normalizePartitionHighValue(page[next:highValueEnd])
 	return partitionDef{
 		BaseTableID: baseTableID,
 		PartTableID: partTableID,
@@ -382,6 +422,23 @@ func parseDDLPartitionRowAt(page []byte, rowOff int, pageNo uint32, slotNo uint1
 		HighValue:   highValue,
 		Location:    ddlLocation{PageNo: pageNo, SlotNo: slotNo, SlotOffset: slotOff, RowOffset: rowAbs},
 	}, true
+}
+
+func normalizePartitionHighValue(raw []byte) []byte {
+	if len(raw) == 0 {
+		return nil
+	}
+	if value, next, err := readShortDataBytes(raw, 0); err == nil && next <= len(raw) {
+		return append([]byte(nil), value...)
+	}
+	// A decoded SYSHPARTTABLEINFO payload starts with its descriptor, not a
+	// length marker. Its trailing zero bytes are part of the binary value and
+	// must survive dictionary persistence unchanged.
+	if len(raw) >= 26 && raw[0] == 0x01 && raw[4] == 0x03 {
+		return append([]byte(nil), raw...)
+	}
+	raw = trimPartitionHighValue(raw)
+	return append([]byte(nil), raw...)
 }
 
 func trimPartitionHighValue(raw []byte) []byte {
@@ -452,6 +509,79 @@ func partitionHighValueTokens(raw []byte) []string {
 		tokens = tokens[:8]
 	}
 	return tokens
+}
+
+func dictionaryPartitionsFromMap(tables map[uint32]dictionaryObject, partitionsByTable map[uint32][]PartitionInfo) []DictionaryPartition {
+	var result []DictionaryPartition
+	for tableID, parts := range partitionsByTable {
+		table, ok := tables[tableID]
+		if !ok {
+			continue
+		}
+		for i, part := range parts {
+			result = append(result, DictionaryPartition{
+				BaseTableID: part.BaseTableID,
+				Owner:       table.Owner,
+				TableName:   table.Name,
+				Position:    uint32(i + 1),
+				Type:        part.Type,
+				Name:        part.Name,
+				PartTableID: part.PartTableID,
+				HighValue:   normalizePartitionHighValue(part.HighValue),
+				PageNo:      part.PageNo,
+				SlotNo:      part.SlotNo,
+				SlotOffset:  part.SlotOffset,
+				RowOffset:   part.RowOffset,
+			})
+		}
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Owner != result[j].Owner {
+			return result[i].Owner < result[j].Owner
+		}
+		if result[i].TableName != result[j].TableName {
+			return result[i].TableName < result[j].TableName
+		}
+		if result[i].Position != result[j].Position {
+			return result[i].Position < result[j].Position
+		}
+		return result[i].PartTableID < result[j].PartTableID
+	})
+	return result
+}
+
+func dictionaryPartitionKeysFromMap(tables map[uint32]dictionaryObject, keysByTable map[uint32][]uint16, columns []DictionaryColumn) []DictionaryPartitionKey {
+	columnNames := make(map[tableColKey]string)
+	for _, column := range columns {
+		columnNames[tableColKey{tableID: column.TableID, colID: column.ColID}] = column.Name
+	}
+	var result []DictionaryPartitionKey
+	for tableID, colIDs := range keysByTable {
+		table, ok := tables[tableID]
+		if !ok {
+			continue
+		}
+		for i, colID := range colIDs {
+			result = append(result, DictionaryPartitionKey{
+				TableID:    tableID,
+				Owner:      table.Owner,
+				TableName:  table.Name,
+				Position:   uint32(i + 1),
+				ColID:      colID,
+				ColumnName: columnNames[tableColKey{tableID: tableID, colID: colID}],
+			})
+		}
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Owner != result[j].Owner {
+			return result[i].Owner < result[j].Owner
+		}
+		if result[i].TableName != result[j].TableName {
+			return result[i].TableName < result[j].TableName
+		}
+		return result[i].Position < result[j].Position
+	})
+	return result
 }
 
 func isPartitionPreviewRune(r rune) bool {

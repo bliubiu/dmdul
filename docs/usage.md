@@ -46,11 +46,12 @@ DMDUL> help;
 
 ## 设置参数
 
-如果当前目录下就有 `SYSTEM.DBF`，可以直接执行 `bootstrap;`。否则先设置路径：
+如果当前目录下就有 `SYSTEM.DBF`，可以直接执行 `bootstrap;`。否则建议先确定工作目录，
+再指定 SYSTEM 和可选控制文件：
 
 ```text
-DMDUL> set system D:\temp\oldpro\SYSTEM.DBF;
 DMDUL> set data_dir D:\temp\oldpro;
+DMDUL> set system D:\temp\oldpro\SYSTEM.DBF;
 DMDUL> set control D:\temp\oldpro\dm.ctl;
 DMDUL> set output_dir D:\temp\oldpro\out;
 DMDUL> set data_format sql;
@@ -77,6 +78,11 @@ DMDUL> bootstrap;
 `dmdul_dict` 文本目录。成功后会把所有基础数据库参数及来源回写到 `init.dul`。
 成功后才能继续执行 `list` 和 `unload`。
 
+若工作目录中已有 `dmdul_dict`，bootstrap 不会读取它参与本次扫描。新字典先写入同级
+临时目录并完整校验，旧目录随后备份为 `dmdul_dict.backup-YYYYMMDD-HHMMSS`。只有新目录
+切换成功后才会更新会话中的内存字典；任何 bootstrap 失败都会保持字典未加载状态。
+备份目录不会被 `load dictionary` 自动读取，确认新字典可用后可自行归档或删除。
+
 `dmdul_dict` 目录当前包含：
 
 ```text
@@ -84,6 +90,8 @@ meta.tsv
 users.tsv
 tables.tsv
 columns.tsv
+partitions.tsv
+partition_keys.tsv
 views.tsv
 sequences.tsv
 routines.tsv
@@ -99,8 +107,8 @@ DMDUL> load dictionary;
 ```
 
 加载后的 `dmdul_dict` 会真正参与后续恢复：DDL 和数据导出时，用户、表名、字段名、字段类型、
-默认值、表空间、存储组织、视图、序列、存储过程/函数/包、触发器、同义词和对象授权会优先使用文本字典中的内容；
-`SYSTEM.DBF` 仍用于辅助定位索引、约束、分区和数据页等物理信息。Windows 下手工保存为带
+默认值、表空间、存储组织、分区键、分区边界、视图、序列、存储过程/函数/包、触发器、同义词和对象授权会优先使用文本字典中的内容；
+`SYSTEM.DBF` 仍用于辅助定位索引、约束和数据页等物理信息。Windows 下手工保存为带
 UTF-8 BOM 的 TSV 文件也可以正常读取。
 
 `tables.tsv` 还预留了 `header_file`、`header_block`、`bytes`、`blocks`、`extents`
@@ -109,6 +117,13 @@ UTF-8 BOM 的 TSV 文件也可以正常读取。
 
 如果内存中还没有字典，执行 `list user`、`list table`、`unload table`、`unload object`、`unload user`、
 `unload database` 前也会尝试自动从 `dmdul_dict` 加载。
+
+因此推荐二选一：
+
+1. **重新扫描 DBF**：`set data_dir` → `set system/control` → `show parameter` →
+   `bootstrap` → 检查 TSV → 必要时 `load dictionary` → `unload`。
+2. **复用已审核字典**：`set data_dir` → `load dictionary` → 核对 `show parameter`、
+   `list user` 和 `list table` → `unload`，不要再执行 bootstrap 覆盖人工修订版。
 
 ## 查看用户和表
 

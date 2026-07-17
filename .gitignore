@@ -25,4 +25,6 @@ dm.ini
 init.dul
 control.dul
 dmdul_dict/
+dmdul_dict.backup-*/
+.dmdul_dict.bootstrap-*/
 output/

@@ -2,6 +2,7 @@ package dm
 
 import (
 	"encoding/csv"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const DefaultDictionaryDirName = "dmdul_dict"
@@ -25,6 +27,8 @@ type DictionaryFilesResult struct {
 	TriggersPath      string
 	SynonymsPath      string
 	TabPrivilegesPath string
+	PartitionsPath    string
+	PartitionKeysPath string
 	UserCount         int
 	TableCount        int
 	ColumnCount       int
@@ -34,6 +38,8 @@ type DictionaryFilesResult struct {
 	TriggerCount      int
 	SynonymCount      int
 	TabPrivilegeCount int
+	PartitionCount    int
+	PartitionKeyCount int
 }
 
 func WriteDictionaryFiles(dir string, dict *DictionaryInfo) (*DictionaryFilesResult, error) {
@@ -77,6 +83,12 @@ func WriteDictionaryFiles(dir string, dict *DictionaryInfo) (*DictionaryFilesRes
 	if err := writeDictionaryTabPrivileges(result.TabPrivilegesPath, dict.TabPrivileges); err != nil {
 		return nil, err
 	}
+	if err := writeDictionaryPartitions(result.PartitionsPath, dict.Partitions); err != nil {
+		return nil, err
+	}
+	if err := writeDictionaryPartitionKeys(result.PartitionKeysPath, dict.PartitionKeys); err != nil {
+		return nil, err
+	}
 	result.UserCount = len(dict.Users)
 	result.TableCount = len(dict.Tables)
 	result.ColumnCount = len(dict.Columns)
@@ -86,7 +98,105 @@ func WriteDictionaryFiles(dir string, dict *DictionaryInfo) (*DictionaryFilesRes
 	result.TriggerCount = len(dict.Triggers)
 	result.SynonymCount = len(dict.Synonyms)
 	result.TabPrivilegeCount = len(dict.TabPrivileges)
+	result.PartitionCount = len(dict.Partitions)
+	result.PartitionKeyCount = len(dict.PartitionKeys)
 	return result, nil
+}
+
+// RebuildDictionaryFiles writes and validates a complete dictionary in a
+// sibling staging directory before replacing the active directory. An
+// existing dictionary is preserved as a timestamped backup so interrupted or
+// mistaken bootstraps do not destroy manual corrections.
+func RebuildDictionaryFiles(dir string, dict *DictionaryInfo) (*DictionaryFilesResult, string, error) {
+	if dict == nil {
+		return nil, "", fmt.Errorf("dictionary is nil")
+	}
+	dir = filepath.Clean(strings.TrimSpace(dir))
+	base := filepath.Base(dir)
+	if dir == "" || dir == "." || base == "" || base == "." || base == string(os.PathSeparator) {
+		return nil, "", fmt.Errorf("dictionary directory is empty or unsafe: %q", dir)
+	}
+	parent := filepath.Dir(dir)
+	if err := os.MkdirAll(parent, 0755); err != nil {
+		return nil, "", err
+	}
+	stagingDir, err := os.MkdirTemp(parent, "."+base+".bootstrap-")
+	if err != nil {
+		return nil, "", fmt.Errorf("create dictionary staging directory: %w", err)
+	}
+	stagingActive := true
+	defer func() {
+		if stagingActive {
+			_ = os.RemoveAll(stagingDir)
+		}
+	}()
+
+	staged, err := WriteDictionaryFiles(stagingDir, dict)
+	if err != nil {
+		return nil, "", fmt.Errorf("write staged dictionary: %w", err)
+	}
+	loaded, verified, err := LoadDictionaryFiles(stagingDir)
+	if err != nil {
+		return nil, "", fmt.Errorf("validate staged dictionary: %w", err)
+	}
+	if loaded.ObjectCount != dict.ObjectCount || verified.UserCount != staged.UserCount || verified.TableCount != staged.TableCount || verified.ColumnCount != staged.ColumnCount {
+		return nil, "", fmt.Errorf("validate staged dictionary: count mismatch")
+	}
+
+	backupDir := ""
+	if info, statErr := os.Stat(dir); statErr == nil {
+		if !info.IsDir() {
+			return nil, "", fmt.Errorf("dictionary path exists but is not a directory: %s", dir)
+		}
+		backupDir, err = nextDictionaryBackupDir(dir, time.Now())
+		if err != nil {
+			return nil, "", err
+		}
+		if err := os.Rename(dir, backupDir); err != nil {
+			return nil, "", fmt.Errorf("archive previous dictionary to %s: %w", backupDir, err)
+		}
+	} else if !os.IsNotExist(statErr) {
+		return nil, "", fmt.Errorf("inspect dictionary directory: %w", statErr)
+	}
+
+	if err := os.Rename(stagingDir, dir); err != nil {
+		if backupDir != "" {
+			_ = os.Rename(backupDir, dir)
+		}
+		return nil, "", fmt.Errorf("activate staged dictionary: %w", err)
+	}
+	stagingActive = false
+	result := dictionaryFilesResultForDir(dir)
+	result.UserCount = staged.UserCount
+	result.TableCount = staged.TableCount
+	result.ColumnCount = staged.ColumnCount
+	result.ViewCount = staged.ViewCount
+	result.SequenceCount = staged.SequenceCount
+	result.RoutineCount = staged.RoutineCount
+	result.TriggerCount = staged.TriggerCount
+	result.SynonymCount = staged.SynonymCount
+	result.TabPrivilegeCount = staged.TabPrivilegeCount
+	result.PartitionCount = staged.PartitionCount
+	result.PartitionKeyCount = staged.PartitionKeyCount
+	return result, backupDir, nil
+}
+
+func nextDictionaryBackupDir(dir string, now time.Time) (string, error) {
+	base := dir + ".backup-" + now.Format("20060102-150405")
+	for suffix := 0; suffix < 1000; suffix++ {
+		candidate := base
+		if suffix > 0 {
+			candidate = fmt.Sprintf("%s-%02d", base, suffix)
+		}
+		_, err := os.Stat(candidate)
+		if os.IsNotExist(err) {
+			return candidate, nil
+		}
+		if err != nil {
+			return "", fmt.Errorf("inspect dictionary backup path: %w", err)
+		}
+	}
+	return "", fmt.Errorf("cannot allocate dictionary backup path for %s", dir)
 }
 
 func LoadDictionaryFiles(dir string) (*DictionaryInfo, *DictionaryFilesResult, error) {
@@ -155,7 +265,22 @@ func LoadDictionaryFiles(dir string) (*DictionaryInfo, *DictionaryFilesResult, e
 	if err != nil && os.IsNotExist(err) {
 		tabPrivileges = nil
 	}
+	partitions, err := readDictionaryPartitions(result.PartitionsPath)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, nil, err
+	}
+	if err != nil && os.IsNotExist(err) {
+		partitions = nil
+	}
+	partitionKeys, err := readDictionaryPartitionKeys(result.PartitionKeysPath)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, nil, err
+	}
+	if err != nil && os.IsNotExist(err) {
+		partitionKeys = nil
+	}
 	users, tables, columns, views, sequences, routines, triggers, synonyms, tabPrivileges = normalizeDictionaryFromFiles(users, tables, columns, views, sequences, routines, triggers, synonyms, tabPrivileges)
+	partitions, partitionKeys = normalizeDictionaryPartitionsFromFiles(tables, columns, partitions, partitionKeys)
 	dict := &DictionaryInfo{
 		SystemPath:          meta["system_path"],
 		ControlPath:         meta["control_path"],
@@ -180,6 +305,8 @@ func LoadDictionaryFiles(dir string) (*DictionaryInfo, *DictionaryFilesResult, e
 		TriggerCount:        len(triggers),
 		SynonymCount:        len(synonyms),
 		TabPrivilegeCount:   len(tabPrivileges),
+		PartitionCount:      len(partitions),
+		PartitionKeyCount:   len(partitionKeys),
 		BootstrapMode:       meta["bootstrap_mode"],
 		BootstrapFallback:   parseBoolField(meta["bootstrap_fallback"]),
 		Users:               users,
@@ -191,6 +318,8 @@ func LoadDictionaryFiles(dir string) (*DictionaryInfo, *DictionaryFilesResult, e
 		Triggers:            triggers,
 		Synonyms:            synonyms,
 		TabPrivileges:       tabPrivileges,
+		Partitions:          partitions,
+		PartitionKeys:       partitionKeys,
 	}
 	result.UserCount = len(users)
 	result.TableCount = len(tables)
@@ -201,6 +330,8 @@ func LoadDictionaryFiles(dir string) (*DictionaryInfo, *DictionaryFilesResult, e
 	result.TriggerCount = len(triggers)
 	result.SynonymCount = len(synonyms)
 	result.TabPrivilegeCount = len(tabPrivileges)
+	result.PartitionCount = len(partitions)
+	result.PartitionKeyCount = len(partitionKeys)
 	return dict, result, nil
 }
 
@@ -217,6 +348,8 @@ func dictionaryFilesResultForDir(dir string) *DictionaryFilesResult {
 		TriggersPath:      filepath.Join(dir, "triggers.tsv"),
 		SynonymsPath:      filepath.Join(dir, "synonyms.tsv"),
 		TabPrivilegesPath: filepath.Join(dir, "tab_privs.tsv"),
+		PartitionsPath:    filepath.Join(dir, "partitions.tsv"),
+		PartitionKeysPath: filepath.Join(dir, "partition_keys.tsv"),
 	}
 }
 
@@ -253,6 +386,8 @@ func writeDictionaryMeta(path string, dict *DictionaryInfo) error {
 		{"trigger_count", strconv.Itoa(len(dict.Triggers))},
 		{"synonym_count", strconv.Itoa(len(dict.Synonyms))},
 		{"tab_privilege_count", strconv.Itoa(len(dict.TabPrivileges))},
+		{"partition_count", strconv.Itoa(len(dict.Partitions))},
+		{"partition_key_count", strconv.Itoa(len(dict.PartitionKeys))},
 	}
 	return writeTSV(path, []string{"key", "value"}, rows)
 }
@@ -338,17 +473,22 @@ func writeDictionarySequences(path string, sequences []DictionarySequence) error
 			seq.Owner,
 			seq.Name,
 			seq.Valid,
-			formatUint64Field(seq.StartWith),
-			formatUint64Field(seq.MinValue),
-			formatUint64Field(seq.MaxValue),
+			formatKnownInt64Field(seq.StartWith, seq.HasStartWith || seq.StartWith != 0),
+			formatKnownInt64Field(seq.MinValue, seq.HasMinValue || seq.MinValue != 0),
+			formatKnownInt64Field(seq.MaxValue, seq.HasMaxValue || seq.MaxValue != 0),
 			formatInt64Field(seq.IncrementBy),
 			seq.CycleFlag,
 			seq.OrderFlag,
 			formatUint32Field(seq.CacheSize),
 			cleanRecoveredSQLText(seq.SQL),
+			formatKnownInt64Field(seq.LastNumber, seq.HasLastNumber),
+			formatSequenceRuntimeUint(seq.RuntimeFile, seq.HasRuntimeLocator),
+			formatSequenceRuntimeUint(seq.RuntimePage, seq.HasRuntimeLocator),
+			formatSequenceRuntimeUint(seq.RuntimeSlot, seq.HasRuntimeLocator),
+			formatSequenceRuntimeState(seq.RuntimeState, seq.HasLastNumber),
 		})
 	}
-	return writeTSV(path, []string{"sequence_id", "owner", "sequence_name", "valid", "start_with", "min_value", "max_value", "increment_by", "cycle_flag", "order_flag", "cache_size", "sql"}, rows)
+	return writeTSV(path, []string{"sequence_id", "owner", "sequence_name", "valid", "start_with", "min_value", "max_value", "increment_by", "cycle_flag", "order_flag", "cache_size", "sql", "last_number", "runtime_file", "runtime_page", "runtime_slot", "runtime_state"}, rows)
 }
 
 func writeDictionaryRoutines(path string, routines []DictionaryRoutine) error {
@@ -411,6 +551,42 @@ func writeDictionaryTabPrivileges(path string, privileges []DictionaryTabPrivile
 		})
 	}
 	return writeTSV(path, []string{"grantee", "owner", "object_name", "object_type", "privilege", "grantable"}, rows)
+}
+
+func writeDictionaryPartitions(path string, partitions []DictionaryPartition) error {
+	rows := make([][]string, 0, len(partitions))
+	for _, part := range partitions {
+		rows = append(rows, []string{
+			formatUint32Field(part.BaseTableID),
+			part.Owner,
+			part.TableName,
+			strconv.FormatUint(uint64(part.Position), 10),
+			strings.ToUpper(strings.TrimSpace(part.Type)),
+			part.Name,
+			formatUint32Field(part.PartTableID),
+			strings.ToUpper(hex.EncodeToString(part.HighValue)),
+			formatUint32Field(part.PageNo),
+			strconv.FormatUint(uint64(part.SlotNo), 10),
+			strconv.FormatUint(uint64(part.SlotOffset), 10),
+			formatUint64Field(part.RowOffset),
+		})
+	}
+	return writeTSV(path, []string{"base_table_id", "owner", "table_name", "position", "partition_type", "partition_name", "part_table_id", "high_value_hex", "page_no", "slot_no", "slot_offset", "row_offset"}, rows)
+}
+
+func writeDictionaryPartitionKeys(path string, keys []DictionaryPartitionKey) error {
+	rows := make([][]string, 0, len(keys))
+	for _, key := range keys {
+		rows = append(rows, []string{
+			formatUint32Field(key.TableID),
+			key.Owner,
+			key.TableName,
+			strconv.FormatUint(uint64(key.Position), 10),
+			strconv.FormatUint(uint64(key.ColID), 10),
+			key.ColumnName,
+		})
+	}
+	return writeTSV(path, []string{"table_id", "owner", "table_name", "position", "col_id", "column_name"}, rows)
 }
 
 func readDictionaryMeta(path string) (map[string]string, error) {
@@ -569,14 +745,30 @@ func readDictionarySequences(path string) ([]DictionarySequence, error) {
 			Valid: rec[3],
 		}
 		if len(rec) >= 12 {
-			seq.StartWith = parseUint64Field(rec[4])
-			seq.MinValue = parseUint64Field(rec[5])
-			seq.MaxValue = parseUint64Field(rec[6])
+			seq.StartWith = parseInt64Field(rec[4])
+			seq.HasStartWith = strings.TrimSpace(rec[4]) != ""
+			seq.MinValue = parseInt64Field(rec[5])
+			seq.HasMinValue = strings.TrimSpace(rec[5]) != ""
+			seq.MaxValue = parseInt64Field(rec[6])
+			seq.HasMaxValue = strings.TrimSpace(rec[6]) != ""
 			seq.IncrementBy = parseInt64Field(rec[7])
 			seq.CycleFlag = rec[8]
 			seq.OrderFlag = rec[9]
 			seq.CacheSize = parseUint32Field(rec[10])
 			seq.SQL = cleanRecoveredSQLText(rec[11])
+			if len(rec) >= 13 && strings.TrimSpace(rec[12]) != "" {
+				seq.LastNumber = parseInt64Field(rec[12])
+				seq.HasLastNumber = true
+			}
+			if len(rec) >= 16 && (strings.TrimSpace(rec[13]) != "" || strings.TrimSpace(rec[14]) != "" || strings.TrimSpace(rec[15]) != "") {
+				seq.RuntimeFile = uint16(parseUint32Field(rec[13]))
+				seq.RuntimePage = parseUint32Field(rec[14])
+				seq.RuntimeSlot = uint16(parseUint32Field(rec[15]))
+				seq.HasRuntimeLocator = true
+			}
+			if len(rec) >= 17 {
+				seq.RuntimeState = parseSequenceRuntimeState(rec[16])
+			}
 		} else {
 			seq.IncrementBy = parseInt64Field(rec[4])
 			seq.CycleFlag = rec[5]
@@ -588,6 +780,39 @@ func readDictionarySequences(path string) ([]DictionarySequence, error) {
 		sequences = append(sequences, seq)
 	}
 	return sequences, nil
+}
+
+func formatKnownInt64Field(value int64, known bool) string {
+	if !known {
+		return ""
+	}
+	return strconv.FormatInt(value, 10)
+}
+
+func formatSequenceRuntimeUint[T ~uint16 | ~uint32](value T, known bool) string {
+	if !known {
+		return ""
+	}
+	return strconv.FormatUint(uint64(value), 10)
+}
+
+func formatSequenceRuntimeState(value uint8, known bool) string {
+	if !known {
+		return ""
+	}
+	return fmt.Sprintf("0x%02X", value)
+}
+
+func parseSequenceRuntimeState(value string) uint8 {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	parsed, err := strconv.ParseUint(value, 0, 8)
+	if err != nil {
+		return 0
+	}
+	return uint8(parsed)
 }
 
 func readDictionaryRoutines(path string) ([]DictionaryRoutine, error) {
@@ -680,6 +905,70 @@ func readDictionaryTabPrivileges(path string) ([]DictionaryTabPrivilege, error) 
 	return privileges, nil
 }
 
+func readDictionaryPartitions(path string) ([]DictionaryPartition, error) {
+	records, err := readTSV(path)
+	if err != nil {
+		return nil, err
+	}
+	var partitions []DictionaryPartition
+	for rowNo, rec := range records {
+		if len(rec) < 8 || rec[0] == "base_table_id" {
+			continue
+		}
+		highValueText := strings.TrimSpace(rec[7])
+		var highValue []byte
+		if highValueText != "" {
+			highValue, err = hex.DecodeString(highValueText)
+			if err != nil {
+				return nil, fmt.Errorf("read %s row %d high_value_hex: %w", path, rowNo+1, err)
+			}
+		}
+		part := DictionaryPartition{
+			BaseTableID: parseUint32Field(rec[0]),
+			Owner:       rec[1],
+			TableName:   rec[2],
+			Position:    parseUint32Field(rec[3]),
+			Type:        strings.ToUpper(strings.TrimSpace(rec[4])),
+			Name:        rec[5],
+			PartTableID: parseUint32Field(rec[6]),
+			HighValue:   normalizePartitionHighValue(highValue),
+		}
+		if len(rec) >= 12 {
+			part.PageNo = parseUint32Field(rec[8])
+			part.SlotNo = uint16(parseUint32Field(rec[9]))
+			part.SlotOffset = uint16(parseUint32Field(rec[10]))
+			part.RowOffset = parseUint64Field(rec[11])
+		}
+		partitions = append(partitions, part)
+	}
+	return partitions, nil
+}
+
+func readDictionaryPartitionKeys(path string) ([]DictionaryPartitionKey, error) {
+	records, err := readTSV(path)
+	if err != nil {
+		return nil, err
+	}
+	var keys []DictionaryPartitionKey
+	for _, rec := range records {
+		if len(rec) < 5 || rec[0] == "table_id" {
+			continue
+		}
+		key := DictionaryPartitionKey{
+			TableID:   parseUint32Field(rec[0]),
+			Owner:     rec[1],
+			TableName: rec[2],
+			Position:  parseUint32Field(rec[3]),
+			ColID:     uint16(parseUint32Field(rec[4])),
+		}
+		if len(rec) >= 6 {
+			key.ColumnName = rec[5]
+		}
+		keys = append(keys, key)
+	}
+	return keys, nil
+}
+
 func normalizeDictionaryFromFiles(users []DictionaryUser, tables []DictionaryTable, columns []DictionaryColumn, views []DictionaryView, sequences []DictionarySequence, routines []DictionaryRoutine, triggers []DictionaryTrigger, synonyms []DictionarySynonym, privileges []DictionaryTabPrivilege) ([]DictionaryUser, []DictionaryTable, []DictionaryColumn, []DictionaryView, []DictionarySequence, []DictionaryRoutine, []DictionaryTrigger, []DictionarySynonym, []DictionaryTabPrivilege) {
 	columnCounts := make(map[uint32]int)
 	for _, col := range columns {
@@ -730,6 +1019,102 @@ func normalizeDictionaryFromFiles(users []DictionaryUser, tables []DictionaryTab
 	sortDictionarySynonyms(synonyms)
 	sortDictionaryTabPrivileges(privileges)
 	return users, tables, columns, views, sequences, routines, triggers, synonyms, privileges
+}
+
+func normalizeDictionaryPartitionsFromFiles(tables []DictionaryTable, columns []DictionaryColumn, partitions []DictionaryPartition, keys []DictionaryPartitionKey) ([]DictionaryPartition, []DictionaryPartitionKey) {
+	tableIndexByID := make(map[uint32]int)
+	tableIDByName := make(map[string]uint32)
+	for i := range tables {
+		tableIndexByID[tables[i].ID] = i
+		tableIDByName[dictionaryOwnerTableNameKey(tables[i].Owner, tables[i].Name)] = tables[i].ID
+	}
+	columnByID := make(map[tableColKey]DictionaryColumn)
+	columnIDByName := make(map[string]uint16)
+	for _, column := range columns {
+		columnByID[tableColKey{tableID: column.TableID, colID: column.ColID}] = column
+		columnIDByName[fmt.Sprintf("%d\x00%s", column.TableID, strings.ToUpper(column.Name))] = column.ColID
+	}
+	partPositions := make(map[uint32]uint32)
+	for i := range partitions {
+		part := &partitions[i]
+		if part.BaseTableID == 0 {
+			part.BaseTableID = tableIDByName[dictionaryOwnerTableNameKey(part.Owner, part.TableName)]
+		}
+		if tableIndex, ok := tableIndexByID[part.BaseTableID]; ok {
+			table := tables[tableIndex]
+			if part.Owner == "" {
+				part.Owner = table.Owner
+			}
+			if part.TableName == "" {
+				part.TableName = table.Name
+			}
+			tables[tableIndex].Partitioned = true
+		}
+		if part.Position == 0 {
+			partPositions[part.BaseTableID]++
+			part.Position = partPositions[part.BaseTableID]
+		} else if part.Position > partPositions[part.BaseTableID] {
+			partPositions[part.BaseTableID] = part.Position
+		}
+		part.Type = strings.ToUpper(strings.TrimSpace(part.Type))
+		part.HighValue = normalizePartitionHighValue(part.HighValue)
+	}
+	keyPositions := make(map[uint32]uint32)
+	for i := range keys {
+		key := &keys[i]
+		if key.TableID == 0 {
+			key.TableID = tableIDByName[dictionaryOwnerTableNameKey(key.Owner, key.TableName)]
+		}
+		if tableIndex, ok := tableIndexByID[key.TableID]; ok {
+			table := tables[tableIndex]
+			if key.Owner == "" {
+				key.Owner = table.Owner
+			}
+			if key.TableName == "" {
+				key.TableName = table.Name
+			}
+		}
+		column, hasColumn := columnByID[tableColKey{tableID: key.TableID, colID: key.ColID}]
+		if key.ColumnName != "" && (!hasColumn || !strings.EqualFold(column.Name, key.ColumnName)) {
+			if colID, ok := columnIDByName[fmt.Sprintf("%d\x00%s", key.TableID, strings.ToUpper(key.ColumnName))]; ok {
+				key.ColID = colID
+				column = columnByID[tableColKey{tableID: key.TableID, colID: colID}]
+				hasColumn = true
+			}
+		}
+		if key.ColumnName == "" && hasColumn {
+			key.ColumnName = column.Name
+		}
+		if key.Position == 0 {
+			keyPositions[key.TableID]++
+			key.Position = keyPositions[key.TableID]
+		} else if key.Position > keyPositions[key.TableID] {
+			keyPositions[key.TableID] = key.Position
+		}
+	}
+	sort.Slice(partitions, func(i, j int) bool {
+		if partitions[i].Owner != partitions[j].Owner {
+			return partitions[i].Owner < partitions[j].Owner
+		}
+		if partitions[i].TableName != partitions[j].TableName {
+			return partitions[i].TableName < partitions[j].TableName
+		}
+		return partitions[i].Position < partitions[j].Position
+	})
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].Owner != keys[j].Owner {
+			return keys[i].Owner < keys[j].Owner
+		}
+		if keys[i].TableName != keys[j].TableName {
+			return keys[i].TableName < keys[j].TableName
+		}
+		return keys[i].Position < keys[j].Position
+	})
+	return partitions, keys
+}
+
+func dictionaryOwnerTableNameKey(owner string, table string) string {
+	return strings.ToUpper(strings.TrimSpace(owner)) + "\x00" + strings.ToUpper(strings.TrimSpace(table))
 }
 
 func writeTSV(path string, header []string, rows [][]string) error {
