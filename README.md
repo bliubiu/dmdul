@@ -18,7 +18,7 @@
 - 尝试恢复 `DELETE` / `DROP` / `TRUNCATE` 后尚未被覆盖的残留数据；
 - 处理大表、分区表、行外 LOB 和 `STORAGE(USING LONG ROW)` 场景。
 
-**v0.5.4 主题：Protected Page Reads, Auditable Recovery & Native Logical DMP**
+**v0.5.5 主题：Logical Export Engine**
 
 ![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go)
 ![License](https://img.shields.io/github/license/greatfinish/dmdul)
@@ -411,15 +411,11 @@ dmdul_dict/
 不会混进本次结果；bootstrap 失败时，旧内存字典也不会继续被 unload 静默使用。
 备份目录不会被自动加载；确认新字典正确后，可以自行归档或删除旧备份。
 
-首次执行 `unload` 或 `recover` 时会自动创建同级 `output/` 目录，所有 DDL、SQL、
-CSV 和 DMP 都集中写入其中：
+首次执行 `unload` 或 `recover` 时，会在启动 DMDUL 的当前目录创建 `output/`，所有 DDL、
+SQL、CSV 和 DMP 都集中写入其中。该默认目录不跟随 `data_dir`：
 
 ```text
-D:\temp\oldpro\
-├── control.dul
-├── init.dul
-├── dul.log
-├── dmdul_dict\
+D:\OneDrive\learn\dmdul\
 └── output\
     ├── HR_TEST_EMP_INFO_ddl.sql
     └── HR_TEST_EMP_INFO.dmp
@@ -794,7 +790,8 @@ dul.log
 | v0.5.0 | 完整常规类型矩阵、SQL/CSV/DMP 一致解析、统一 `output/` 输出目录 |
 | v0.5.1 | page plan 直读、同 group storage fallback、segment fallback、卸载 I/O 诊断 |
 | v0.5.2 | 普通行头与 DELETE slot、slot-only 卸载、19 字节事务尾、PAGE_CHECK 四模式 |
-| v0.5.4 | 用户页原样读取、序列/分区修复、字典原子重建、可审计残留恢复、四级原生逻辑 DMP |
+| v0.5.4 | 用户页原样读取、序列/分区修复、字典原子重建与可审计残留恢复 |
+| v0.5.5 | FULL/OWNER/SCHEMAS/TABLES 四级原生逻辑 DMP、模式字典与单文件元数据/数据导出 |
 | v0.6.x | 迁移行/链式行、损坏页诊断、更多 DM8 版本兼容验证 |
 | v1.0.0 | 固化文件格式兼容矩阵、恢复报告和稳定发布流程 |
 

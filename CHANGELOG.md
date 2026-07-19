@@ -12,11 +12,54 @@ v主版本.次版本.修订版本
 
 ------
 
-## v0.5.4 - Protected Page Reads, Auditable Recovery & Native Logical DMP
+## v0.5.5 - Logical Export Engine
 
-本版本收口页保护边界、固定长度 NULL、二级索引误识别和残留页归属问题，把
-`recover table` 的物理来源证据写入控制台与 `dul.log`，并把早期“每表纯数据 DMP”
-升级为与达梦 FULL/OWNER/SCHEMAS/TABLES 对应的原生逻辑 DMP。
+本版本把早期“SQL DDL + 每表纯数据 DMP”升级为与达梦逻辑导出语义对应的原生逻辑
+DMP。每次导出生成一个同时包含当前可恢复对象元数据、空表定义和表数据的文件，并继续
+保留配套 SQL，便于审计、人工修订和兜底恢复。
+
+### Added
+
+- 新增 `unload schema <schema>[,<schema>...];` 和 `list schema [owner];`；TABLES 与 OWNER
+  同样支持逗号选择多个对象，FULL、OWNER、SCHEMAS、TABLES 四种 DMP 级别互斥。
+- `dmdul_dict` 新增 `schemas.tsv`，保存模式 ID、模式名及所属用户；旧字典缺少该文件时
+  按用户同名默认模式兼容加载。
+- 新增原生多 schema footer 和对象元数据记录写入，覆盖用户、角色、表、索引、约束、
+  注释、视图、序列、过程、函数、包/包体、触发器、同义词、系统权限、角色授权和对象授权。
+- 新增逻辑 DMP 汇编器：复用已有表数据 phase 并流式复制，不把表数据或大型 LOB
+  重新加载到内存；空表只写 phase-1 元数据。
+- DMP 检查器支持多 schema footer、schema owner、表所属模式和多 phase 累计行数。
+
+### Changed
+
+- `data_format=dmp` 不再按非空表散落生成纯数据文件；TABLES、OWNER、SCHEMAS、FULL
+  每次分别生成一个原生逻辑 DMP，并保留配套 `_ddl.sql` 审计文件。
+- `unload user` 的 DMP 语义改为 OWNER：包含所选用户以及这些用户拥有的全部模式；
+  `unload schema` 只包含明确选择的模式，二者不再混同。
+- 默认卸载目录固定为启动 DMDUL 时当前目录下的 `output/`，不再跟随 `data_dir`；
+  显式 `set output_dir` 仍具有最高优先级。
+
+### Validation
+
+- 使用 DM8 `03134284336-20250117-257733-20132` 完成四种模式实机验证：
+  - TABLES：`dimp SHOW=Y` 识别表、数据、3 个索引、2 个约束和注释，实际重映射导入成功；
+  - OWNER：实际导入 3 张表、EMP_INFO 4 行、4 个 routine 和 11 个 synonym，无告警；
+  - SCHEMAS：单模式、多非空模式以及空模式与非空模式组合均可识别；
+  - FULL：识别 6 个模式、28 张表及视图、序列、routine、包、触发器、同义词、授权和注释。
+- 新增 TABLES、OWNER、SCHEMAS、FULL 单文件行为、空表元数据、多模式 footer、对象授权
+  编码、模式字典往返及默认输出目录回归测试。
+- `go test -count=1 ./...`、`go vet ./...` 和 `git diff --check` 通过。
+
+### Notes
+
+- 当前不生成压缩、加密或多文件 DMP。
+- TABLES 以完整父表为最小单位，暂不支持只选择单个叶子分区；分区行由 DM 导入时路由。
+- 不同 DM8 构建和文件版本仍需先使用 `dimp SHOW=Y`、`CTRL_INFO=4` 和隔离库回灌验证。
+
+## v0.5.4 - Protected Page Reads & Auditable Residual Recovery
+
+本版本收口页保护边界、固定长度 NULL、二级索引误识别和残留页归属问题，并把
+`recover table` 的物理来源证据写入控制台与 `dul.log`。
 
 ### Fixed
 
@@ -47,11 +90,6 @@ v主版本.次版本.修订版本
 
 ### Changed
 
-- `data_format=dmp` 不再按非空表散落生成纯数据文件；TABLES、OWNER、SCHEMAS、FULL
-  每次分别生成一个同时包含对象元数据、空表定义和表数据的逻辑 DMP，并保留配套 SQL
-  作为审计和人工修订副本。
-- `unload user` 的 DMP 语义改为 OWNER：包含所选用户以及这些用户拥有的全部模式；
-  `unload schema` 只包含明确选择的模式，二者不再混同。
 - 孤儿 storage 残留页只允许映射到一个目标表；一次恢复选择多个目标表时禁用该启发式路径；
   `SYSINDEXES` 与磁盘字典中的全部 `storage_id/assist_ids` 都参与活动归属排除。
 - 孤儿页不再因单条记录碰巧可解析就接受，改为对最多 16 条物理记录执行多行一致性校验。
@@ -70,14 +108,6 @@ v主版本.次版本.修订版本
 
 ### Added
 
-- 新增 `unload schema <schema>[,<schema>...];` 和 `list schema [owner];`；TABLES 与 OWNER
-  同样支持逗号选择多个对象，四种 DMP 逻辑级别互斥且与官方命令语义对应。
-- `dmdul_dict` 新增 `schemas.tsv`，保存模式 ID、模式名及所属用户；旧字典缺少该文件时
-  按用户同名默认模式兼容加载。
-- 新增原生多 schema footer 和对象元数据记录写入，覆盖用户、角色、表、索引、约束、
-  注释、视图、序列、过程、函数、包/包体、触发器、同义词、系统权限、角色授权和对象授权。
-- 新增逻辑 DMP 汇编器：复用已有表数据 phase 并流式复制，不把表数据或大型 LOB
-  重新加载到内存；空表只写 phase-1 元数据。
 - 新增页尾 `0xFFFF` 槽哨兵、用户页原样读取、午夜 TIME、多目标孤儿页拒绝、
   孤儿页多行一致性、二级索引 storage 分类和恢复来源日志回归测试。
 - 新增 `DataRecoverySource` 结果信息，供交互层和后续恢复报告消费。
@@ -90,11 +120,6 @@ v主版本.次版本.修订版本
 
 ### Validation
 
-- 使用 DM8 `03134284336-20250117-257733-20132` 完成四种模式实机验证：
-  - TABLES：`dimp SHOW=Y` 识别表、数据、3 个索引、2 个约束和注释，实际重映射导入成功；
-  - OWNER：实际导入 3 张表、EMP_INFO 4 行、4 个 routine 和 11 个 synonym，无告警；
-  - SCHEMAS：单模式、多非空模式以及空模式与非空模式组合均可识别；
-  - FULL：识别 6 个模式、28 张表及视图、序列、routine、包、触发器、同义词、授权和注释。
 - 使用 `192.168.17.37:/tmp/dulsnap` 的同一份离线快照完成修改前后对照：
   - `T_BIG`：1 条错行降为 0
   - `T_PART`：2 条错行降为 0

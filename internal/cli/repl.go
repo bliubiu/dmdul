@@ -163,7 +163,7 @@ func printInteractiveHelp(stdout io.Writer) {
 	fmt.Fprintln(stdout, "  set data_dir <DBF directory>;")
 	fmt.Fprintln(stdout, "  set control <dm.ctl path>;")
 	fmt.Fprintln(stdout, "  set output_dir <directory>;")
-	fmt.Fprintln(stdout, "      Unload/recovery output directory. Defaults to <data_dir>/output or ./output.")
+	fmt.Fprintln(stdout, "      Unload/recovery output directory. Defaults to ./output under the launch directory.")
 	fmt.Fprintln(stdout, "  set data_format sql|csv|dmp;")
 	fmt.Fprintln(stdout, "  set case_sensitive auto|0|1;")
 	fmt.Fprintln(stdout, "  set charset auto|utf-8|gb18030|gbk|euc-kr;")
@@ -1615,7 +1615,10 @@ func (s *interactiveSession) effectiveOutputDir() string {
 	if s.outputDirSet {
 		return defaultIfBlank(s.outputDir, ".")
 	}
-	return filepath.Join(s.effectiveWorkDir(), defaultOutputDirName)
+	if currentDir, err := os.Getwd(); err == nil && strings.TrimSpace(currentDir) != "" {
+		return filepath.Join(currentDir, defaultOutputDirName)
+	}
+	return defaultOutputDirName
 }
 
 func (s *interactiveSession) effectiveWorkDir() string {

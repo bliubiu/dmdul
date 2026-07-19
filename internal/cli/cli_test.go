@@ -73,13 +73,18 @@ func TestRunInteractiveHelpAndExit(t *testing.T) {
 
 func TestInteractiveOutputDirDefaultsToDedicatedSubdirectory(t *testing.T) {
 	session := newInteractiveSession()
-	if got := session.outputPath("HR_TEST_data.sql"); got != filepath.Join("output", "HR_TEST_data.sql") {
+	currentDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(currentDir, "output", "HR_TEST_data.sql")
+	if got := session.outputPath("HR_TEST_data.sql"); got != want {
 		t.Fatalf("default outputPath = %q", got)
 	}
 	session.dataDir = `D:\temp\oldpro`
 	session.dataDirSet = true
-	if got := session.outputPath("HR_TEST_data.sql"); got != `D:\temp\oldpro\output\HR_TEST_data.sql` {
-		t.Fatalf("data_dir outputPath = %q", got)
+	if got := session.outputPath("HR_TEST_data.sql"); got != want {
+		t.Fatalf("data_dir must not change default outputPath, got %q", got)
 	}
 	if got := session.effectiveControlDULPath(); got != `D:\temp\oldpro\control.dul` {
 		t.Fatalf("control.dul path = %q", got)
@@ -101,20 +106,26 @@ func TestInteractiveOutputDirDefaultsToDedicatedSubdirectory(t *testing.T) {
 }
 
 func TestInteractiveEnsureOutputDirCreatesDedicatedSubdirectory(t *testing.T) {
+	currentDir := t.TempDir()
 	dataDir := t.TempDir()
-	session := newInteractiveSession()
-	session.dataDir = dataDir
-	session.dataDirSet = true
-	if err := session.ensureOutputDir(); err != nil {
-		t.Fatalf("ensureOutputDir failed: %v", err)
-	}
-	info, err := os.Stat(filepath.Join(dataDir, defaultOutputDirName))
-	if err != nil {
-		t.Fatalf("output directory was not created: %v", err)
-	}
-	if !info.IsDir() {
-		t.Fatalf("output path is not a directory")
-	}
+	runInDir(t, currentDir, func() {
+		session := newInteractiveSession()
+		session.dataDir = dataDir
+		session.dataDirSet = true
+		if err := session.ensureOutputDir(); err != nil {
+			t.Fatalf("ensureOutputDir failed: %v", err)
+		}
+		info, err := os.Stat(filepath.Join(currentDir, defaultOutputDirName))
+		if err != nil {
+			t.Fatalf("launch-directory output was not created: %v", err)
+		}
+		if !info.IsDir() {
+			t.Fatalf("output path is not a directory")
+		}
+		if _, err := os.Stat(filepath.Join(dataDir, defaultOutputDirName)); !os.IsNotExist(err) {
+			t.Fatalf("default output must not follow data_dir, stat err=%v", err)
+		}
+	})
 }
 
 func TestInteractiveWritesInitDULToCurrentDirThenDataDir(t *testing.T) {
@@ -488,7 +499,7 @@ func TestInteractiveUnloadUserUsesDefaultOutputSubdirectory(t *testing.T) {
 		if err := RunInteractive(strings.NewReader(input), &stdout, &stderr); err != nil {
 			t.Fatalf("RunInteractive returned error: %v", err)
 		}
-		outputDir := filepath.Join(dataDir, defaultOutputDirName)
+		outputDir := filepath.Join(cwd, defaultOutputDirName)
 		for _, name := range []string{"APP_WITH_ROWS_ddl.sql", "APP_WITH_ROWS_data.sql"} {
 			if _, err := os.Stat(filepath.Join(outputDir, name)); err != nil {
 				t.Fatalf("default output %s should exist: %v", name, err)

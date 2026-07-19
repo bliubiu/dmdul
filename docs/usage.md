@@ -162,10 +162,10 @@ DMDUL> list table HR_TEST;
 DMDUL> unload table HR_TEST.EMP_INFO;
 ```
 
-默认会在工作目录下自动创建 `output` 子目录并生成两个文件。设置过 `data_dir` 时，
-工作目录是 `data_dir`；否则是当前目录。`control.dul`、`dul.log`、`init.dul` 和
-`dmdul_dict` 留在工作目录，与 `output` 同级。显式执行 `set output_dir <directory>;`
-时，卸载结果直接写入指定目录，其他工作文件不移动。
+默认会在启动 DMDUL 时的当前目录创建 `output` 子目录并生成文件，不会因为设置了
+`data_dir` 而改到数据库文件目录。`control.dul`、`dul.log`、`init.dul` 和 `dmdul_dict`
+仍按 `data_dir` 确定位置。显式执行 `set output_dir <directory>;` 时，卸载结果直接写入
+指定目录，其他工作文件不移动。
 
 ```text
 output/HR_TEST_EMP_INFO_ddl.sql
