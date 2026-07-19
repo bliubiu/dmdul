@@ -103,8 +103,7 @@ JSON/JSONB 导入示例：
 
 ```bash
 dimp SYSDBA/password \
-  FILE=SYSDBA_DMDUL_T_JSON_data.dmp \
-  DATA_ONLY=Y \
+  FILE=SYSDBA_DMDUL_T_JSON.dmp \
   FAST_LOAD=N
 ```
 

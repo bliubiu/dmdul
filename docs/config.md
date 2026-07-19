@@ -53,7 +53,7 @@ log=
 | `control` | 自动查找 `SYSTEM.DBF` 同目录下的 `dm.ctl` | 可选控制文件路径。 |
 | `data_dir` | `SYSTEM.DBF` 所在目录 | 用户表空间 DBF 文件所在目录。 |
 | `output_dir` | 未设置时为 `<data_dir>/output`；没有 `data_dir` 时为 `./output` | `unload` / `recover` 生成的 DDL、SQL、CSV 和 DMP 目录。显式设置时直接使用指定目录。 |
-| `data_format` | `sql` | 数据导出格式，支持 `sql`、`csv` 和 `dmp`。DMP 按表生成纯数据文件。 |
+| `data_format` | `sql` | 数据导出格式，支持 `sql`、`csv` 和 `dmp`。DMP 生成包含元数据与数据的原生逻辑文件。 |
 | `case_sensitive` | `auto` | DMP 文件头的建库大小写敏感标志。`auto` 优先读取 `SYSTEM.DBF` 第 4 页偏移 `0x2C`；也可显式设为 `0` 或 `1`。 |
 | `charset` | `auto` | 字典和数据文本解码字符集。 |
 | `log` | 工作目录下的 `dul.log` | 交互式执行日志；工作目录为 `data_dir`，未设置时为当前目录。 |
@@ -214,6 +214,7 @@ datafile 5 0 TBS_BIN_TEST D:\temp\oldpro\TBS_BIN_TEST01.DBF
 | --- | --- |
 | `meta.tsv` | SYSTEM.DBF、页大小、字符集、对象数量等摘要。 |
 | `users.tsv` | 用户/owner 列表。 |
+| `schemas.tsv` | 模式 ID、模式名、所属用户 ID 和用户名；用于区分 DMP 的 OWNER 与 SCHEMAS 级别。 |
 | `tables.tsv` | 用户表摘要，包含 table id、owner、表名、表空间、段头文件/页号、段大小、存储组织、是否临时表、是否分区。 |
 | `columns.tsv` | 字段摘要，包含 table id、owner、表名、字段序号、字段名、类型、长度、默认值等。 |
 | `partitions.tsv` | 分区顺序、类型、名称、分区子表 ID、完整 `HIGH_VALUE` 十六进制值及 SYSTEM 物理位置。 |
@@ -225,10 +226,11 @@ datafile 5 0 TBS_BIN_TEST D:\temp\oldpro\TBS_BIN_TEST01.DBF
 DMDUL> load dictionary;
 ```
 
-也可以直接执行 `list user;`，工具会在内存字典为空时自动尝试从 `dmdul_dict`
+也可以直接执行 `list user;` 或 `list schema;`，工具会在内存字典为空时自动尝试从 `dmdul_dict`
 恢复字典摘要。
 
-加载文本字典后，后续 `unload table`、`unload object`、`unload user`、`unload database` 会优先使用
+加载文本字典后，后续 `unload table`、`unload object`、`unload user`、`unload schema`、
+`unload database` 会优先使用
 `dmdul_dict` 中修正后的用户、表、字段、字段类型、默认值、表空间、存储组织和分区信息。
 底层 `SYSTEM.DBF` 仍用于读取索引、约束和数据页定位所需的物理元数据。
 如果在 Windows 工具中手工保存 TSV 文件并产生 UTF-8 BOM，DMDUL 会自动兼容。

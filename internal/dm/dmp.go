@@ -38,6 +38,7 @@ const (
 	dmpCompressionLevelOff   = 0xA66
 	dmpHeaderChecksumOffset  = 0xFFF
 	dmpTableIndexMarker      = 0x9CD81630
+	dmpSchemaIndexMarker     = 0x85F20CD5
 	dmpFieldNull             = 0xFFFD
 	dmpFieldLong             = 0xFFFE
 	dmpMaxShortFieldLength   = dmpFieldNull - 1
@@ -103,12 +104,22 @@ type DMPInfo struct {
 	SchemaRecordOffset  uint64
 	Schema              string
 	Owner               string
+	Schemas             []DMPFooterSchema
 	Tables              []DMPTableIndex
 	FooterParseError    string
 }
 
+type DMPFooterSchema struct {
+	RecordOffset uint64
+	Name         string
+	Owner        string
+	Tables       []DMPTableIndex
+}
+
 type DMPTableIndex struct {
 	ObjectID       uint32
+	Schema         string
+	Owner          string
 	Name           string
 	MetadataOffset uint64
 	PhaseOffsets   []uint64
@@ -304,73 +315,107 @@ func inspectDMPFooter(file *os.File, info *DMPInfo) error {
 	}
 
 	reader := dmpFooterReader{raw: footer, offset: 8, compressed: info.Compressed}
-	if _, err := reader.uint16(); err != nil {
-		return err
-	}
-	schemaRecordOffset, err := reader.uint64()
-	if err != nil {
-		return err
-	}
-	info.SchemaRecordOffset = schemaRecordOffset
-	schemaRaw, err := reader.bytes16()
-	if err != nil {
-		return err
-	}
-	info.Schema = decodeDMPText(schemaRaw, info.Charset)
-	ownerRaw, err := reader.bytes16()
-	if err != nil {
-		return err
-	}
-	info.Owner = decodeDMPText(ownerRaw, info.Charset)
-
+	firstSchema := true
 	for reader.offset < len(reader.raw) {
-		marker, err := reader.uint32()
-		if err != nil {
-			return err
-		}
-		if marker != dmpTableIndexMarker {
-			return fmt.Errorf("unexpected footer table marker 0x%08X at +0x%X", marker, reader.offset-4)
-		}
-		if _, err := reader.uint16(); err != nil {
-			return err
-		}
-		metadataOffset, err := reader.uint64()
-		if err != nil {
-			return err
-		}
-		objectID, err := reader.uint32()
-		if err != nil {
-			return err
-		}
-		nameRaw, err := reader.bytes16()
-		if err != nil {
-			return err
-		}
-		name := decodeDMPText(nameRaw, info.Charset)
-		phaseCount, err := reader.uint32()
-		if err != nil {
-			return err
-		}
-		if phaseCount > 1024 {
-			return fmt.Errorf("unreasonable dmp phase count %d", phaseCount)
-		}
-		table := DMPTableIndex{ObjectID: objectID, Name: name, MetadataOffset: metadataOffset}
-		for i := uint32(0); i < phaseCount; i++ {
-			if _, err := reader.uint16(); err != nil {
-				return err
-			}
-			phaseOffset, err := reader.uint64()
+		if !firstSchema {
+			marker, err := reader.uint32()
 			if err != nil {
 				return err
 			}
-			table.PhaseOffsets = append(table.PhaseOffsets, phaseOffset)
-			if rows, ok := dmpPhaseRowCount(file, phaseOffset, info.FileSize); ok {
-				table.RowCount += uint64(rows)
+			if marker != dmpSchemaIndexMarker {
+				return fmt.Errorf("unexpected footer schema marker 0x%08X at +0x%X", marker, reader.offset-4)
 			}
 		}
-		info.Tables = append(info.Tables, table)
+		firstSchema = false
+		if _, err := reader.uint16(); err != nil {
+			return err
+		}
+		schemaRecordOffset, err := reader.uint64()
+		if err != nil {
+			return err
+		}
+		schemaRaw, err := reader.bytes16()
+		if err != nil {
+			return err
+		}
+		ownerRaw, err := reader.bytes16()
+		if err != nil {
+			return err
+		}
+		schema := DMPFooterSchema{
+			RecordOffset: schemaRecordOffset,
+			Name:         decodeDMPText(schemaRaw, info.Charset),
+			Owner:        decodeDMPText(ownerRaw, info.Charset),
+		}
+		for reader.offset < len(reader.raw) {
+			if len(reader.raw)-reader.offset >= 4 && binary.LittleEndian.Uint32(reader.raw[reader.offset:]) == dmpSchemaIndexMarker {
+				break
+			}
+			table, err := inspectDMPFooterTable(file, info, &reader, schema.Name, schema.Owner)
+			if err != nil {
+				return err
+			}
+			schema.Tables = append(schema.Tables, table)
+			info.Tables = append(info.Tables, table)
+		}
+		info.Schemas = append(info.Schemas, schema)
+	}
+	if len(info.Schemas) > 0 {
+		info.SchemaRecordOffset = info.Schemas[0].RecordOffset
+		info.Schema = info.Schemas[0].Name
+		info.Owner = info.Schemas[0].Owner
 	}
 	return nil
+}
+
+func inspectDMPFooterTable(file *os.File, info *DMPInfo, reader *dmpFooterReader, schema string, owner string) (DMPTableIndex, error) {
+	marker, err := reader.uint32()
+	if err != nil {
+		return DMPTableIndex{}, err
+	}
+	if marker != dmpTableIndexMarker {
+		return DMPTableIndex{}, fmt.Errorf("unexpected footer table marker 0x%08X at +0x%X", marker, reader.offset-4)
+	}
+	if _, err := reader.uint16(); err != nil {
+		return DMPTableIndex{}, err
+	}
+	metadataOffset, err := reader.uint64()
+	if err != nil {
+		return DMPTableIndex{}, err
+	}
+	objectID, err := reader.uint32()
+	if err != nil {
+		return DMPTableIndex{}, err
+	}
+	nameRaw, err := reader.bytes16()
+	if err != nil {
+		return DMPTableIndex{}, err
+	}
+	phaseCount, err := reader.uint32()
+	if err != nil {
+		return DMPTableIndex{}, err
+	}
+	if phaseCount > 1<<20 {
+		return DMPTableIndex{}, fmt.Errorf("unreasonable dmp phase count %d", phaseCount)
+	}
+	table := DMPTableIndex{
+		ObjectID: objectID, Schema: schema, Owner: owner,
+		Name: decodeDMPText(nameRaw, info.Charset), MetadataOffset: metadataOffset,
+	}
+	for i := uint32(0); i < phaseCount; i++ {
+		if _, err := reader.uint16(); err != nil {
+			return DMPTableIndex{}, err
+		}
+		phaseOffset, err := reader.uint64()
+		if err != nil {
+			return DMPTableIndex{}, err
+		}
+		table.PhaseOffsets = append(table.PhaseOffsets, phaseOffset)
+		if rows, ok := dmpPhaseRowCount(file, phaseOffset, info.FileSize); ok {
+			table.RowCount += uint64(rows)
+		}
+	}
+	return table, nil
 }
 
 func dmpPhaseRowCount(file *os.File, offset uint64, fileSize int64) (uint32, bool) {

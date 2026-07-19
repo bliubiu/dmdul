@@ -19,6 +19,7 @@ type DictionaryFilesResult struct {
 	Dir               string
 	MetaPath          string
 	UsersPath         string
+	SchemasPath       string
 	TablesPath        string
 	ColumnsPath       string
 	ViewsPath         string
@@ -30,6 +31,7 @@ type DictionaryFilesResult struct {
 	PartitionsPath    string
 	PartitionKeysPath string
 	UserCount         int
+	SchemaCount       int
 	TableCount        int
 	ColumnCount       int
 	ViewCount         int
@@ -53,10 +55,14 @@ func WriteDictionaryFiles(dir string, dict *DictionaryInfo) (*DictionaryFilesRes
 		return nil, err
 	}
 	result := dictionaryFilesResultForDir(dir)
-	if err := writeDictionaryMeta(result.MetaPath, dict); err != nil {
+	schemas := dictionarySchemasForPersistence(dict)
+	if err := writeDictionaryMeta(result.MetaPath, dict, len(schemas)); err != nil {
 		return nil, err
 	}
 	if err := writeDictionaryUsers(result.UsersPath, dict.Users); err != nil {
+		return nil, err
+	}
+	if err := writeDictionarySchemas(result.SchemasPath, schemas); err != nil {
 		return nil, err
 	}
 	if err := writeDictionaryTables(result.TablesPath, dict.Tables); err != nil {
@@ -90,6 +96,7 @@ func WriteDictionaryFiles(dir string, dict *DictionaryInfo) (*DictionaryFilesRes
 		return nil, err
 	}
 	result.UserCount = len(dict.Users)
+	result.SchemaCount = len(schemas)
 	result.TableCount = len(dict.Tables)
 	result.ColumnCount = len(dict.Columns)
 	result.ViewCount = len(dict.Views)
@@ -101,6 +108,43 @@ func WriteDictionaryFiles(dir string, dict *DictionaryInfo) (*DictionaryFilesRes
 	result.PartitionCount = len(dict.Partitions)
 	result.PartitionKeyCount = len(dict.PartitionKeys)
 	return result, nil
+}
+
+func dictionarySchemasForPersistence(dict *DictionaryInfo) []DictionarySchema {
+	if dict == nil {
+		return nil
+	}
+	result := append([]DictionarySchema(nil), dict.Schemas...)
+	seen := make(map[string]bool, len(result))
+	for _, schema := range result {
+		seen[strings.ToUpper(strings.TrimSpace(schema.Name))] = true
+	}
+	for _, user := range dict.Users {
+		key := strings.ToUpper(strings.TrimSpace(user.Name))
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		result = append(result, DictionarySchema{ID: user.ID, Name: user.Name, OwnerID: user.ID, Owner: user.Name})
+	}
+	for _, table := range dict.Tables {
+		key := strings.ToUpper(strings.TrimSpace(table.Owner))
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		result = append(result, DictionarySchema{Name: table.Owner, Owner: table.Owner})
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Owner != result[j].Owner {
+			return result[i].Owner < result[j].Owner
+		}
+		if result[i].Name != result[j].Name {
+			return result[i].Name < result[j].Name
+		}
+		return result[i].ID < result[j].ID
+	})
+	return result
 }
 
 // RebuildDictionaryFiles writes and validates a complete dictionary in a
@@ -139,7 +183,7 @@ func RebuildDictionaryFiles(dir string, dict *DictionaryInfo) (*DictionaryFilesR
 	if err != nil {
 		return nil, "", fmt.Errorf("validate staged dictionary: %w", err)
 	}
-	if loaded.ObjectCount != dict.ObjectCount || verified.UserCount != staged.UserCount || verified.TableCount != staged.TableCount || verified.ColumnCount != staged.ColumnCount {
+	if loaded.ObjectCount != dict.ObjectCount || verified.UserCount != staged.UserCount || verified.SchemaCount != staged.SchemaCount || verified.TableCount != staged.TableCount || verified.ColumnCount != staged.ColumnCount {
 		return nil, "", fmt.Errorf("validate staged dictionary: count mismatch")
 	}
 
@@ -168,6 +212,7 @@ func RebuildDictionaryFiles(dir string, dict *DictionaryInfo) (*DictionaryFilesR
 	stagingActive = false
 	result := dictionaryFilesResultForDir(dir)
 	result.UserCount = staged.UserCount
+	result.SchemaCount = staged.SchemaCount
 	result.TableCount = staged.TableCount
 	result.ColumnCount = staged.ColumnCount
 	result.ViewCount = staged.ViewCount
@@ -211,6 +256,13 @@ func LoadDictionaryFiles(dir string) (*DictionaryInfo, *DictionaryFilesResult, e
 	users, err := readDictionaryUsers(result.UsersPath)
 	if err != nil {
 		return nil, nil, err
+	}
+	schemas, err := readDictionarySchemas(result.SchemasPath)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, nil, err
+	}
+	if err != nil && os.IsNotExist(err) {
+		schemas = nil
 	}
 	tables, err := readDictionaryTables(result.TablesPath)
 	if err != nil {
@@ -279,7 +331,7 @@ func LoadDictionaryFiles(dir string) (*DictionaryInfo, *DictionaryFilesResult, e
 	if err != nil && os.IsNotExist(err) {
 		partitionKeys = nil
 	}
-	users, tables, columns, views, sequences, routines, triggers, synonyms, tabPrivileges = normalizeDictionaryFromFiles(users, tables, columns, views, sequences, routines, triggers, synonyms, tabPrivileges)
+	users, schemas, tables, columns, views, sequences, routines, triggers, synonyms, tabPrivileges = normalizeDictionaryFromFiles(users, schemas, tables, columns, views, sequences, routines, triggers, synonyms, tabPrivileges)
 	partitions, partitionKeys = normalizeDictionaryPartitionsFromFiles(tables, columns, partitions, partitionKeys)
 	dict := &DictionaryInfo{
 		SystemPath:          meta["system_path"],
@@ -297,6 +349,7 @@ func LoadDictionaryFiles(dir string) (*DictionaryInfo, *DictionaryFilesResult, e
 		HasCaseSensitive:    strings.TrimSpace(meta["case_sensitive"]) != "",
 		ObjectCount:         parseMetaInt(meta["object_count"]),
 		UserCount:           len(users),
+		SchemaCount:         len(schemas),
 		TableCount:          len(tables),
 		ColumnCount:         len(columns),
 		ViewCount:           len(views),
@@ -310,6 +363,7 @@ func LoadDictionaryFiles(dir string) (*DictionaryInfo, *DictionaryFilesResult, e
 		BootstrapMode:       meta["bootstrap_mode"],
 		BootstrapFallback:   parseBoolField(meta["bootstrap_fallback"]),
 		Users:               users,
+		Schemas:             schemas,
 		Tables:              tables,
 		Columns:             columns,
 		Views:               views,
@@ -322,6 +376,7 @@ func LoadDictionaryFiles(dir string) (*DictionaryInfo, *DictionaryFilesResult, e
 		PartitionKeys:       partitionKeys,
 	}
 	result.UserCount = len(users)
+	result.SchemaCount = len(schemas)
 	result.TableCount = len(tables)
 	result.ColumnCount = len(columns)
 	result.ViewCount = len(views)
@@ -340,6 +395,7 @@ func dictionaryFilesResultForDir(dir string) *DictionaryFilesResult {
 		Dir:               dir,
 		MetaPath:          filepath.Join(dir, "meta.tsv"),
 		UsersPath:         filepath.Join(dir, "users.tsv"),
+		SchemasPath:       filepath.Join(dir, "schemas.tsv"),
 		TablesPath:        filepath.Join(dir, "tables.tsv"),
 		ColumnsPath:       filepath.Join(dir, "columns.tsv"),
 		ViewsPath:         filepath.Join(dir, "views.tsv"),
@@ -353,7 +409,7 @@ func dictionaryFilesResultForDir(dir string) *DictionaryFilesResult {
 	}
 }
 
-func writeDictionaryMeta(path string, dict *DictionaryInfo) error {
+func writeDictionaryMeta(path string, dict *DictionaryInfo, schemaCount int) error {
 	caseSensitive := ""
 	if dict.HasCaseSensitive {
 		caseSensitive = "0"
@@ -362,7 +418,7 @@ func writeDictionaryMeta(path string, dict *DictionaryInfo) error {
 		}
 	}
 	rows := [][]string{
-		{"format_version", "1"},
+		{"format_version", "2"},
 		{"source", dict.Source},
 		{"system_path", dict.SystemPath},
 		{"control_path", dict.ControlPath},
@@ -378,6 +434,7 @@ func writeDictionaryMeta(path string, dict *DictionaryInfo) error {
 		{"bootstrap_fallback", formatBoolField(dict.BootstrapFallback)},
 		{"object_count", strconv.Itoa(dict.ObjectCount)},
 		{"user_count", strconv.Itoa(len(dict.Users))},
+		{"schema_count", strconv.Itoa(schemaCount)},
 		{"table_count", strconv.Itoa(len(dict.Tables))},
 		{"column_count", strconv.Itoa(len(dict.Columns))},
 		{"view_count", strconv.Itoa(len(dict.Views))},
@@ -398,6 +455,17 @@ func writeDictionaryUsers(path string, users []DictionaryUser) error {
 		rows = append(rows, []string{formatUint32Field(user.ID), user.Name})
 	}
 	return writeTSV(path, []string{"user_id", "user_name"}, rows)
+}
+
+func writeDictionarySchemas(path string, schemas []DictionarySchema) error {
+	rows := make([][]string, 0, len(schemas))
+	for _, schema := range schemas {
+		rows = append(rows, []string{
+			formatUint32Field(schema.ID), schema.Name,
+			formatUint32Field(schema.OwnerID), schema.Owner,
+		})
+	}
+	return writeTSV(path, []string{"schema_id", "schema_name", "owner_user_id", "owner_user_name"}, rows)
 }
 
 func writeDictionaryTables(path string, tables []DictionaryTable) error {
@@ -623,6 +691,24 @@ func readDictionaryUsers(path string) ([]DictionaryUser, error) {
 		})
 	}
 	return users, nil
+}
+
+func readDictionarySchemas(path string) ([]DictionarySchema, error) {
+	records, err := readTSV(path)
+	if err != nil {
+		return nil, err
+	}
+	var schemas []DictionarySchema
+	for _, rec := range records {
+		if len(rec) < 4 || rec[0] == "schema_id" {
+			continue
+		}
+		schemas = append(schemas, DictionarySchema{
+			ID: parseUint32Field(rec[0]), Name: rec[1],
+			OwnerID: parseUint32Field(rec[2]), Owner: rec[3],
+		})
+	}
+	return schemas, nil
 }
 
 func readDictionaryTables(path string) ([]DictionaryTable, error) {
@@ -969,7 +1055,7 @@ func readDictionaryPartitionKeys(path string) ([]DictionaryPartitionKey, error) 
 	return keys, nil
 }
 
-func normalizeDictionaryFromFiles(users []DictionaryUser, tables []DictionaryTable, columns []DictionaryColumn, views []DictionaryView, sequences []DictionarySequence, routines []DictionaryRoutine, triggers []DictionaryTrigger, synonyms []DictionarySynonym, privileges []DictionaryTabPrivilege) ([]DictionaryUser, []DictionaryTable, []DictionaryColumn, []DictionaryView, []DictionarySequence, []DictionaryRoutine, []DictionaryTrigger, []DictionarySynonym, []DictionaryTabPrivilege) {
+func normalizeDictionaryFromFiles(users []DictionaryUser, schemas []DictionarySchema, tables []DictionaryTable, columns []DictionaryColumn, views []DictionaryView, sequences []DictionarySequence, routines []DictionaryRoutine, triggers []DictionaryTrigger, synonyms []DictionarySynonym, privileges []DictionaryTabPrivilege) ([]DictionaryUser, []DictionarySchema, []DictionaryTable, []DictionaryColumn, []DictionaryView, []DictionarySequence, []DictionaryRoutine, []DictionaryTrigger, []DictionarySynonym, []DictionaryTabPrivilege) {
 	columnCounts := make(map[uint32]int)
 	for _, col := range columns {
 		columnCounts[col.TableID]++
@@ -980,12 +1066,26 @@ func normalizeDictionaryFromFiles(users []DictionaryUser, tables []DictionaryTab
 		}
 	}
 	userNames := make(map[string]bool)
+	userNamesByID := make(map[uint32]string)
 	for _, user := range users {
 		userNames[strings.ToUpper(user.Name)] = true
+		if user.ID != 0 {
+			userNamesByID[user.ID] = user.Name
+		}
+	}
+	schemaOwners := make(map[string]string)
+	for i := range schemas {
+		if schemas[i].Owner == "" {
+			schemas[i].Owner = userNamesByID[schemas[i].OwnerID]
+		}
+		if schemas[i].Owner == "" {
+			schemas[i].Owner = schemas[i].Name
+		}
+		schemaOwners[strings.ToUpper(schemas[i].Name)] = schemas[i].Owner
 	}
 	for _, table := range tables {
 		key := strings.ToUpper(table.Owner)
-		if key == "" || userNames[key] {
+		if key == "" || userNames[key] || schemaOwners[key] != "" {
 			continue
 		}
 		users = append(users, DictionaryUser{Name: table.Owner})
@@ -993,6 +1093,20 @@ func normalizeDictionaryFromFiles(users []DictionaryUser, tables []DictionaryTab
 	}
 	sort.Slice(users, func(i, j int) bool {
 		return users[i].Name < users[j].Name
+	})
+	if len(schemas) == 0 {
+		for _, user := range users {
+			schemas = append(schemas, DictionarySchema{ID: user.ID, Name: user.Name, OwnerID: user.ID, Owner: user.Name})
+		}
+	}
+	sort.Slice(schemas, func(i, j int) bool {
+		if schemas[i].Owner != schemas[j].Owner {
+			return schemas[i].Owner < schemas[j].Owner
+		}
+		if schemas[i].Name != schemas[j].Name {
+			return schemas[i].Name < schemas[j].Name
+		}
+		return schemas[i].ID < schemas[j].ID
 	})
 	sort.Slice(tables, func(i, j int) bool {
 		if tables[i].Owner == tables[j].Owner {
@@ -1018,7 +1132,7 @@ func normalizeDictionaryFromFiles(users []DictionaryUser, tables []DictionaryTab
 	sortDictionaryTriggers(triggers)
 	sortDictionarySynonyms(synonyms)
 	sortDictionaryTabPrivileges(privileges)
-	return users, tables, columns, views, sequences, routines, triggers, synonyms, privileges
+	return users, schemas, tables, columns, views, sequences, routines, triggers, synonyms, privileges
 }
 
 func normalizeDictionaryPartitionsFromFiles(tables []DictionaryTable, columns []DictionaryColumn, partitions []DictionaryPartition, keys []DictionaryPartitionKey) ([]DictionaryPartition, []DictionaryPartitionKey) {

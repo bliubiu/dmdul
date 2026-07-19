@@ -46,6 +46,7 @@ type DictionaryInfo struct {
 	HasCaseSensitive    bool
 	ObjectCount         int
 	UserCount           int
+	SchemaCount         int
 	TableCount          int
 	ColumnCount         int
 	ViewCount           int
@@ -60,6 +61,7 @@ type DictionaryInfo struct {
 	BootstrapFallback   bool
 	Diagnostics         []BootstrapDiagnostic
 	Users               []DictionaryUser
+	Schemas             []DictionarySchema
 	Tables              []DictionaryTable
 	Columns             []DictionaryColumn
 	Views               []DictionaryView
@@ -75,6 +77,17 @@ type DictionaryInfo struct {
 type DictionaryUser struct {
 	ID   uint32
 	Name string
+}
+
+// DictionarySchema preserves the distinction between a database user and a
+// schema. DM creates one default schema per user, but one user can own more
+// than one schema; OWNER and SCHEMAS logical exports therefore cannot be
+// implemented correctly from table owner names alone.
+type DictionarySchema struct {
+	ID      uint32
+	Name    string
+	OwnerID uint32
+	Owner   string
 }
 
 type DictionaryTable struct {
@@ -286,6 +299,11 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 			roleObjects[obj.ID] = obj
 		}
 	}
+	schemaList := dictionarySchemasFromObjects(objects, userObjects, ownerMatcher)
+	schemaOwners := make(map[string]string, len(schemaList))
+	for _, schema := range schemaList {
+		schemaOwners[strings.ToUpper(schema.Name)] = schema.Owner
+	}
 
 	columnsByTable := make(map[uint32]int)
 	var columnList []DictionaryColumn
@@ -472,8 +490,10 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 			RootPage:    rootPage,
 			AssistIDs:   assistIDs,
 		})
-		if _, ok := userNamesByName[strings.ToUpper(table.Owner)]; !ok {
-			userNamesByName[strings.ToUpper(table.Owner)] = DictionaryUser{Name: table.Owner}
+		if _, knownSchema := schemaOwners[strings.ToUpper(table.Owner)]; !knownSchema {
+			if _, ok := userNamesByName[strings.ToUpper(table.Owner)]; !ok {
+				userNamesByName[strings.ToUpper(table.Owner)] = DictionaryUser{Name: table.Owner}
+			}
 		}
 	}
 	segments := inferDictionaryTableSegments(opts.ControlPath, opts.ControlDULPath, filepath.Dir(opts.SystemPath), pageSize, extentSize, tables, indexObjects, indexes, partitionsByTable, tableList)
@@ -543,6 +563,7 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 		HasCaseSensitive:    hasCaseSensitive,
 		ObjectCount:         len(objects),
 		UserCount:           len(userList),
+		SchemaCount:         len(schemaList),
 		TableCount:          len(tableList),
 		ColumnCount:         columnCount,
 		ViewCount:           len(viewList),
@@ -557,6 +578,7 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 		BootstrapFallback:   bootstrapFallback,
 		Diagnostics:         append([]BootstrapDiagnostic(nil), catalog.diagnostics...),
 		Users:               userList,
+		Schemas:             schemaList,
 		Tables:              tableList,
 		Columns:             columnList,
 		Views:               viewList,
@@ -568,6 +590,35 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 		Partitions:          partitionList,
 		PartitionKeys:       partitionKeyList,
 	}, nil
+}
+
+func dictionarySchemasFromObjects(objects map[uint32]dictionaryObject, users map[uint32]dictionaryObject, matcher ownerMatcher) []DictionarySchema {
+	result := make([]DictionarySchema, 0)
+	for _, obj := range objects {
+		if obj.Type != "SCH" || obj.Valid == "N" || !isSafeShortText(obj.Name) || obj.ParentID <= 0 {
+			continue
+		}
+		owner, ok := users[uint32(obj.ParentID)]
+		if !ok || !isSafeShortText(owner.Name) {
+			continue
+		}
+		if !matcher.allowed(obj.Name) && !matcher.allowed(owner.Name) {
+			continue
+		}
+		result = append(result, DictionarySchema{
+			ID: obj.ID, Name: obj.Name, OwnerID: owner.ID, Owner: owner.Name,
+		})
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Owner != result[j].Owner {
+			return result[i].Owner < result[j].Owner
+		}
+		if result[i].Name != result[j].Name {
+			return result[i].Name < result[j].Name
+		}
+		return result[i].ID < result[j].ID
+	})
+	return result
 }
 
 func dictionaryTableStorageSnapshot(tableID uint32, tableStorage map[uint32]indexDef, assistByParentID map[uint32][]indexDef) (uint32, int16, uint32, []uint32) {

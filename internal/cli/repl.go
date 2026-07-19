@@ -144,15 +144,19 @@ func printInteractiveHelp(stdout io.Writer) {
 	fmt.Fprintln(stdout, "  list user;")
 	fmt.Fprintln(stdout, "      List recovered users/owners and dictionary cache status.")
 	fmt.Fprintln(stdout, "  list table <owner>;")
-	fmt.Fprintln(stdout, "      List tables owned by one user.")
+	fmt.Fprintln(stdout, "      List tables in one recovered schema.")
+	fmt.Fprintln(stdout, "  list schema [owner];")
+	fmt.Fprintln(stdout, "      List recovered schemas and their owning users.")
 	fmt.Fprintln(stdout, "  unload table <owner.table_name>;")
-	fmt.Fprintln(stdout, "      Export one table to <owner>_<table>_ddl.sql and <owner>_<table>_data.{sql|csv|dmp}.")
+	fmt.Fprintln(stdout, "      Export one table; DMP mode writes one native TABLES file with metadata and data.")
 	fmt.Fprintln(stdout, "  unload object <owner|all>;")
 	fmt.Fprintln(stdout, "      Export recovered dictionary DDL for one owner or the whole database.")
 	fmt.Fprintln(stdout, "  unload user <owner>;")
-	fmt.Fprintln(stdout, "      Export each owned table to its own DDL and SQL/CSV/DMP data files.")
+	fmt.Fprintln(stdout, "      Export each owned table; DMP mode writes one native OWNER file.")
+	fmt.Fprintln(stdout, "  unload schema <schema>[,<schema>...];")
+	fmt.Fprintln(stdout, "      DMP mode: export one or more schemas to one native SCHEMAS file.")
 	fmt.Fprintln(stdout, "  unload database;")
-	fmt.Fprintln(stdout, "      Export all recovered users and tables to DDL plus SQL or per-table CSV/DMP data files.")
+	fmt.Fprintln(stdout, "      Export all recovered objects; DMP mode writes one native FULL file.")
 	fmt.Fprintln(stdout, "  recover table <owner.table_name>;")
 	fmt.Fprintln(stdout, "      Scan residual pages by storage/assist id for TRUNCATE/DROP table recovery.")
 	fmt.Fprintln(stdout, "  set system <SYSTEM.DBF path>;")
@@ -252,7 +256,7 @@ func (s *interactiveSession) executeShow(args []string, stdout io.Writer) error 
 
 func (s *interactiveSession) executeList(args []string, stdout io.Writer) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: list user | list table <owner>")
+		return fmt.Errorf("usage: list user | list schema [owner] | list table <owner>")
 	}
 	if err := s.ensureDictionaryLoaded(); err != nil {
 		return err
@@ -265,8 +269,14 @@ func (s *interactiveSession) executeList(args []string, stdout io.Writer) error 
 			return fmt.Errorf("usage: list table <owner>")
 		}
 		s.printTables(stdout, args[1])
+	case "schema", "schemas":
+		owner := ""
+		if len(args) > 1 {
+			owner = args[1]
+		}
+		s.printSchemas(stdout, owner)
 	default:
-		return fmt.Errorf("usage: list user | list table <owner>")
+		return fmt.Errorf("usage: list user | list schema [owner] | list table <owner>")
 	}
 	return nil
 }
@@ -289,7 +299,7 @@ func (s *interactiveSession) executeLoad(args []string, stdout io.Writer) error 
 
 func (s *interactiveSession) executeUnload(args []string, stdout io.Writer) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: unload table <owner.table_name> | unload object <owner|all> | unload user <owner> | unload database")
+		return fmt.Errorf("usage: unload table <owner.table_name> | unload object <owner|all> | unload user <owner> | unload schema <schema> | unload database")
 	}
 	if err := s.ensureDictionaryLoaded(); err != nil {
 		return err
@@ -310,10 +320,15 @@ func (s *interactiveSession) executeUnload(args []string, stdout io.Writer) erro
 			return fmt.Errorf("usage: unload user <owner>")
 		}
 		return s.unloadUser(args[1:], stdout)
+	case "schema", "schemas":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: unload schema <schema>[,<schema>...]")
+		}
+		return s.unloadSchema(args[1:], stdout)
 	case "database", "db":
 		return s.unloadDatabase(args[1:], stdout)
 	default:
-		return fmt.Errorf("usage: unload table <owner.table_name> | unload object <owner|all> | unload user <owner> | unload database")
+		return fmt.Errorf("usage: unload table <owner.table_name> | unload object <owner|all> | unload user <owner> | unload schema <schema> | unload database")
 	}
 }
 
@@ -401,8 +416,8 @@ func (s *interactiveSession) bootstrap(stdout io.Writer) error {
 	if dictionaryBackupDir != "" {
 		s.emitBootstrapLine(stdout, fmt.Sprintf("[BOOTSTRAP] phase=output name=dmdul_dict-backup status=OK path=%q", dictionaryBackupDir))
 	}
-	s.emitBootstrapLine(stdout, fmt.Sprintf("[BOOTSTRAP] phase=output name=dmdul_dict status=OK users=%d tables=%d columns=%d views=%d sequences=%d routines=%d triggers=%d synonyms=%d tab_privs=%d partitions=%d partition_keys=%d path=%q",
-		dictFiles.UserCount, dictFiles.TableCount, dictFiles.ColumnCount, dictFiles.ViewCount, dictFiles.SequenceCount,
+	s.emitBootstrapLine(stdout, fmt.Sprintf("[BOOTSTRAP] phase=output name=dmdul_dict status=OK users=%d schemas=%d tables=%d columns=%d views=%d sequences=%d routines=%d triggers=%d synonyms=%d tab_privs=%d partitions=%d partition_keys=%d path=%q",
+		dictFiles.UserCount, dictFiles.SchemaCount, dictFiles.TableCount, dictFiles.ColumnCount, dictFiles.ViewCount, dictFiles.SequenceCount,
 		dictFiles.RoutineCount, dictFiles.TriggerCount, dictFiles.SynonymCount, dictFiles.TabPrivilegeCount,
 		dictFiles.PartitionCount, dictFiles.PartitionKeyCount, dictFiles.Dir))
 	s.emitBootstrapLine(stdout, fmt.Sprintf("[BOOTSTRAP] phase=complete status=%s mode=%s objects=%d elapsed_ms=%d",
@@ -414,8 +429,8 @@ func (s *interactiveSession) bootstrap(stdout io.Writer) error {
 		fmt.Fprintf(stdout, "control file: %s\n", dict.ControlPath)
 	}
 	fmt.Fprintf(stdout, "control.dul: %s (data files: %d)\n", controlDULPath, len(dataFiles))
-	fmt.Fprintf(stdout, "dictionary dir: %s (users=%d tables=%d columns=%d views=%d sequences=%d routines=%d triggers=%d synonyms=%d tab_privs=%d partitions=%d partition_keys=%d)\n",
-		dictFiles.Dir, dictFiles.UserCount, dictFiles.TableCount, dictFiles.ColumnCount, dictFiles.ViewCount, dictFiles.SequenceCount, dictFiles.RoutineCount, dictFiles.TriggerCount, dictFiles.SynonymCount, dictFiles.TabPrivilegeCount, dictFiles.PartitionCount, dictFiles.PartitionKeyCount)
+	fmt.Fprintf(stdout, "dictionary dir: %s (users=%d schemas=%d tables=%d columns=%d views=%d sequences=%d routines=%d triggers=%d synonyms=%d tab_privs=%d partitions=%d partition_keys=%d)\n",
+		dictFiles.Dir, dictFiles.UserCount, dictFiles.SchemaCount, dictFiles.TableCount, dictFiles.ColumnCount, dictFiles.ViewCount, dictFiles.SequenceCount, dictFiles.RoutineCount, dictFiles.TriggerCount, dictFiles.SynonymCount, dictFiles.TabPrivilegeCount, dictFiles.PartitionCount, dictFiles.PartitionKeyCount)
 	if dictionaryBackupDir != "" {
 		fmt.Fprintf(stdout, "previous dictionary backup: %s\n", dictionaryBackupDir)
 	}
@@ -568,12 +583,13 @@ func (s *interactiveSession) printParameters(stdout io.Writer) {
 func (s *interactiveSession) printUsers(stdout io.Writer) {
 	s.printDictionarySummary(stdout)
 	counts := dictionaryUserObjectCounts(s.dictionary)
-	fmt.Fprintf(stdout, "%-22s %8s %8s %10s %10s %9s %10s %11s %9s\n",
-		"user", "tables", "views", "synonyms", "sequences", "triggers", "functions", "procedures", "packages")
+	fmt.Fprintf(stdout, "%-22s %8s %8s %8s %10s %10s %9s %10s %11s %9s\n",
+		"user", "schemas", "tables", "views", "synonyms", "sequences", "triggers", "functions", "procedures", "packages")
 	for _, user := range s.dictionary.Users {
 		count := counts[strings.ToUpper(user.Name)]
-		fmt.Fprintf(stdout, "%-22s %8d %8d %10d %10d %9d %10d %11d %9d\n",
+		fmt.Fprintf(stdout, "%-22s %8d %8d %8d %10d %10d %9d %10d %11d %9d\n",
 			user.Name,
+			count.Schemas,
 			count.Tables,
 			count.Views,
 			count.Synonyms,
@@ -587,6 +603,7 @@ func (s *interactiveSession) printUsers(stdout io.Writer) {
 }
 
 type userObjectCounts struct {
+	Schemas    int
 	Tables     int
 	Views      int
 	Synonyms   int
@@ -599,10 +616,23 @@ type userObjectCounts struct {
 
 func dictionaryUserObjectCounts(dict *dm.DictionaryInfo) map[string]userObjectCounts {
 	result := make(map[string]userObjectCounts)
+	schemaOwners := make(map[string]string, len(dict.Schemas))
+	for _, schema := range dict.Schemas {
+		schemaOwners[strings.ToUpper(strings.TrimSpace(schema.Name))] = strings.ToUpper(strings.TrimSpace(schema.Owner))
+		owner := strings.ToUpper(strings.TrimSpace(schema.Owner))
+		if owner != "" {
+			count := result[owner]
+			count.Schemas++
+			result[owner] = count
+		}
+	}
 	increment := func(owner string, apply func(*userObjectCounts)) {
 		key := strings.ToUpper(strings.TrimSpace(owner))
 		if key == "" {
 			return
+		}
+		if user := schemaOwners[key]; user != "" {
+			key = user
 		}
 		count := result[key]
 		apply(&count)
@@ -628,6 +658,9 @@ func dictionaryUserObjectCounts(dict *dm.DictionaryInfo) map[string]userObjectCo
 		owner := strings.ToUpper(strings.TrimSpace(routine.Owner))
 		if owner == "" {
 			continue
+		}
+		if user := schemaOwners[owner]; user != "" {
+			owner = user
 		}
 		switch strings.Join(strings.Fields(strings.ToUpper(strings.TrimSpace(routine.ObjectType))), " ") {
 		case "FUNCTION":
@@ -662,8 +695,8 @@ func (s *interactiveSession) printDictionarySummary(stdout io.Writer) {
 	if s.dictionary.BootstrapMode != "" {
 		fmt.Fprintf(stdout, "bootstrap mode: %s (fallback=%t)\n", s.dictionary.BootstrapMode, s.dictionary.BootstrapFallback)
 	}
-	fmt.Fprintf(stdout, "dictionary rows: users=%d tables=%d columns=%d views=%d sequences=%d routines=%d triggers=%d synonyms=%d tab_privs=%d partitions=%d partition_keys=%d objects=%d\n\n",
-		len(s.dictionary.Users), len(s.dictionary.Tables), len(s.dictionary.Columns), len(s.dictionary.Views), len(s.dictionary.Sequences), len(s.dictionary.Routines), len(s.dictionary.Triggers), len(s.dictionary.Synonyms), len(s.dictionary.TabPrivileges), len(s.dictionary.Partitions), len(s.dictionary.PartitionKeys), s.dictionary.ObjectCount)
+	fmt.Fprintf(stdout, "dictionary rows: users=%d schemas=%d tables=%d columns=%d views=%d sequences=%d routines=%d triggers=%d synonyms=%d tab_privs=%d partitions=%d partition_keys=%d objects=%d\n\n",
+		len(s.dictionary.Users), len(s.dictionary.Schemas), len(s.dictionary.Tables), len(s.dictionary.Columns), len(s.dictionary.Views), len(s.dictionary.Sequences), len(s.dictionary.Routines), len(s.dictionary.Triggers), len(s.dictionary.Synonyms), len(s.dictionary.TabPrivileges), len(s.dictionary.Partitions), len(s.dictionary.PartitionKeys), s.dictionary.ObjectCount)
 }
 
 func (s *interactiveSession) printTables(stdout io.Writer, owner string) {
@@ -697,7 +730,30 @@ func (s *interactiveSession) printTables(stdout io.Writer, owner string) {
 	fmt.Fprintf(stdout, "%d table(s)\n", len(rows))
 }
 
+func (s *interactiveSession) printSchemas(stdout io.Writer, owner string) {
+	owner = normalizeIdentifierInput(owner)
+	fmt.Fprintf(stdout, "%-28s %-28s %-10s\n", "schema", "owner", "tables")
+	count := 0
+	for _, schema := range s.dictionary.Schemas {
+		if owner != "" && !strings.EqualFold(schema.Owner, owner) {
+			continue
+		}
+		tables := 0
+		for _, table := range s.dictionary.Tables {
+			if strings.EqualFold(table.Owner, schema.Name) {
+				tables++
+			}
+		}
+		fmt.Fprintf(stdout, "%-28s %-28s %-10d\n", truncateForTable(schema.Name, 28), truncateForTable(schema.Owner, 28), tables)
+		count++
+	}
+	fmt.Fprintf(stdout, "%d schema(s)\n", count)
+}
+
 func (s *interactiveSession) unloadTable(args []string, stdout io.Writer) error {
+	if strings.EqualFold(s.dataFormat, "dmp") {
+		return s.unloadDMPTable(args, stdout)
+	}
 	tableToken := args[0]
 	owner, tableName, ok := parseOwnerTableToken(tableToken)
 	if !ok {
@@ -875,6 +931,9 @@ func (s *interactiveSession) unloadObject(args []string, stdout io.Writer) error
 }
 
 func (s *interactiveSession) unloadUser(args []string, stdout io.Writer) error {
+	if strings.EqualFold(s.dataFormat, "dmp") {
+		return s.unloadDMPUser(args, stdout)
+	}
 	owner := normalizeIdentifierInput(args[0])
 	if strings.EqualFold(owner, "all") || owner == "*" || strings.EqualFold(owner, "database") {
 		return fmt.Errorf("unload user all has been removed; use unload database")
@@ -957,6 +1016,15 @@ func (s *interactiveSession) unloadUser(args []string, stdout io.Writer) error {
 }
 
 func (s *interactiveSession) unloadDatabase(args []string, stdout io.Writer) error {
+	if strings.EqualFold(s.dataFormat, "dmp") {
+		prefix := "DATABASE"
+		if customPrefix, ok := optionalToPrefix(args); ok {
+			prefix = sanitizedFilePrefix(customPrefix)
+		}
+		return s.unloadLogicalDMP(logicalDMPUnloadRequest{
+			mode: dm.DMPModeFull, ownerFilter: "all", tableFilter: "all", prefix: prefix,
+		}, stdout)
+	}
 	prefix := "DATABASE"
 	if customPrefix, ok := optionalToPrefix(args); ok {
 		prefix = sanitizedFilePrefix(customPrefix)
@@ -1059,6 +1127,274 @@ func (s *interactiveSession) unloadDatabaseSplitData(prefix string, format strin
 		}
 	}
 	return data, nil
+}
+
+type logicalDMPUnloadRequest struct {
+	mode        dm.DMPExportMode
+	ownerFilter string
+	tableFilter string
+	prefix      string
+	tablesOnly  bool
+}
+
+func (s *interactiveSession) unloadDMPTable(args []string, stdout io.Writer) error {
+	tokens := splitIdentifierList(args[0])
+	if len(tokens) == 0 {
+		return fmt.Errorf("usage: unload table <owner.table_name>[,<owner.table_name>...]")
+	}
+	owners := make([]string, 0, len(tokens))
+	filters := make([]string, 0, len(tokens))
+	seenTables := make(map[string]bool)
+	var selected []dm.DictionaryTable
+	for _, token := range tokens {
+		owner, tableName, ok := parseOwnerTableToken(token)
+		if !ok {
+			return fmt.Errorf("invalid table name %q; use owner.table_name", token)
+		}
+		table, ok := s.findTable(owner, tableName)
+		if !ok {
+			return fmt.Errorf("table %s not found in dictionary", token)
+		}
+		key := strings.ToUpper(table.Owner) + "\x00" + strings.ToUpper(table.Name)
+		if seenTables[key] {
+			continue
+		}
+		seenTables[key] = true
+		selected = append(selected, table)
+		owners = appendUniqueFold(owners, table.Owner)
+		filters = append(filters, quotedFilterIdentifier(table.Owner)+"."+quotedFilterIdentifier(table.Name))
+	}
+	prefix := "TABLES"
+	if len(selected) == 1 {
+		prefix = sanitizedFilePrefix(selected[0].Owner + "_" + selected[0].Name)
+	}
+	if customPrefix, ok := optionalToPrefix(args[1:]); ok {
+		prefix = sanitizedFilePrefix(customPrefix)
+	}
+	return s.unloadLogicalDMP(logicalDMPUnloadRequest{
+		mode: dm.DMPModeTables, ownerFilter: strings.Join(owners, ","),
+		tableFilter: strings.Join(filters, ","), prefix: prefix, tablesOnly: true,
+	}, stdout)
+}
+
+func (s *interactiveSession) unloadDMPUser(args []string, stdout io.Writer) error {
+	users := splitIdentifierList(args[0])
+	if len(users) == 0 {
+		return fmt.Errorf("usage: unload user <owner>[,<owner>...]")
+	}
+	var normalizedUsers []string
+	var schemaFilters []string
+	for _, value := range users {
+		owner := normalizeIdentifierInput(value)
+		if strings.EqualFold(owner, "all") || owner == "*" || strings.EqualFold(owner, "database") {
+			return fmt.Errorf("unload user all has been removed; use unload database")
+		}
+		if !s.hasOwner(owner) {
+			return fmt.Errorf("user %s not found in dictionary", value)
+		}
+		normalizedUsers = appendUniqueFold(normalizedUsers, owner)
+		schemaFilters = appendUniqueFold(schemaFilters, owner)
+		for _, schema := range s.dictionary.Schemas {
+			if strings.EqualFold(schema.Owner, owner) {
+				schemaFilters = appendUniqueFold(schemaFilters, schema.Name)
+			}
+		}
+	}
+	prefix := sanitizedFilePrefix(strings.Join(normalizedUsers, "_"))
+	if len(normalizedUsers) > 1 {
+		prefix = sanitizedFilePrefix("OWNER_" + strings.Join(normalizedUsers, "_"))
+	}
+	if customPrefix, ok := optionalToPrefix(args[1:]); ok {
+		prefix = sanitizedFilePrefix(customPrefix)
+	}
+	return s.unloadLogicalDMP(logicalDMPUnloadRequest{
+		mode: dm.DMPModeOwner, ownerFilter: strings.Join(schemaFilters, ","),
+		tableFilter: "all", prefix: prefix,
+	}, stdout)
+}
+
+func (s *interactiveSession) unloadSchema(args []string, stdout io.Writer) error {
+	if !strings.EqualFold(s.dataFormat, "dmp") {
+		return fmt.Errorf("unload schema currently requires: set data_format dmp")
+	}
+	tokens := splitIdentifierList(args[0])
+	if len(tokens) == 0 {
+		return fmt.Errorf("usage: unload schema <schema>[,<schema>...]")
+	}
+	var schemas []string
+	for _, value := range tokens {
+		schema := normalizeIdentifierInput(value)
+		if !s.hasSchema(schema) {
+			return fmt.Errorf("schema %s not found in dictionary", value)
+		}
+		schemas = appendUniqueFold(schemas, schema)
+	}
+	prefix := sanitizedFilePrefix(strings.Join(schemas, "_"))
+	if len(schemas) > 1 {
+		prefix = sanitizedFilePrefix("SCHEMAS_" + strings.Join(schemas, "_"))
+	}
+	if customPrefix, ok := optionalToPrefix(args[1:]); ok {
+		prefix = sanitizedFilePrefix(customPrefix)
+	}
+	return s.unloadLogicalDMP(logicalDMPUnloadRequest{
+		mode: dm.DMPModeSchemas, ownerFilter: strings.Join(schemas, ","),
+		tableFilter: "all", prefix: prefix,
+	}, stdout)
+}
+
+func (s *interactiveSession) unloadLogicalDMP(request logicalDMPUnloadRequest, stdout io.Writer) error {
+	if err := s.ensureOutputDir(); err != nil {
+		return err
+	}
+	ddlPath := s.outputPath(request.prefix + "_ddl.sql")
+	dmpPath := s.outputPath(request.prefix + ".dmp")
+	ddl, err := dm.ExportDDL(dm.DDLExportOptions{
+		SystemPath:     s.systemPath,
+		ControlPath:    s.controlPath,
+		ControlDULPath: s.effectiveControlDULPath(),
+		OutputPath:     ddlPath,
+		OwnerFilter:    request.ownerFilter,
+		TableFilter:    request.tableFilter,
+		Charset:        s.charset,
+		TablesOnly:     request.tablesOnly,
+		DMPMode:        request.mode,
+		Dictionary:     s.dictionary,
+	})
+	if err != nil {
+		return err
+	}
+	if ddl.DMPMetadata == nil {
+		return fmt.Errorf("logical dmp metadata was not generated")
+	}
+
+	spoolDir, err := os.MkdirTemp(s.effectiveOutputDir(), ".dmdul-dmp-spool-")
+	if err != nil {
+		return fmt.Errorf("create dmp spool directory: %w", err)
+	}
+	defer os.RemoveAll(spoolDir)
+	data, err := dm.ExportData(dm.DataExportOptions{
+		SystemPath:     s.systemPath,
+		ControlPath:    s.controlPath,
+		ControlDULPath: s.effectiveControlDULPath(),
+		DataDir:        s.effectiveDataDir(),
+		TableOutputPath: func(_ string, _ string, tableID uint32) string {
+			return filepath.Join(spoolDir, fmt.Sprintf("%d.dmp", tableID))
+		},
+		OwnerFilter:      request.ownerFilter,
+		TableFilter:      request.tableFilter,
+		ExcludeTables:    "",
+		Charset:          s.charset,
+		OutputFormat:     "dmp",
+		DMPCaseSensitive: s.dmpCaseSensitiveValue(),
+		Dictionary:       s.dictionary,
+	})
+	if err != nil {
+		return err
+	}
+	spools := make(map[uint32]string, len(data.TableOutputs))
+	for _, output := range data.TableOutputs {
+		spools[output.TableID] = output.OutputPath
+	}
+	info, err := dm.WriteLogicalDMP(dm.DMPLogicalOptions{
+		OutputPath: dmpPath, Catalog: ddl.DMPMetadata, TableDataPaths: spools,
+		Charset: s.effectiveDMPCharset(), CaseSensitive: s.dmpCaseSensitiveValue(),
+		ExtentSize: ddl.ExtentSize, PageSize: ddl.PageSize,
+	})
+	if err != nil {
+		return err
+	}
+	metadataCounts := ddl.DMPMetadata.Counts()
+	fmt.Fprintf(stdout, "ddl output: %s\n", ddl.OutputPath)
+	fmt.Fprintf(stdout, "dmp output: %s\n", info.Path)
+	fmt.Fprintf(stdout, "dmp mode: %s\n", info.Mode)
+	fmt.Fprintf(stdout, "schemas exported: %d\n", len(info.Schemas))
+	fmt.Fprintf(stdout, "objects exported: %d\n", info.ObjectCount)
+	fmt.Fprintf(stdout, "tables exported: %d\n", len(info.Tables))
+	fmt.Fprintf(stdout, "users exported: %d\n", metadataCounts.Users)
+	fmt.Fprintf(stdout, "roles exported: %d\n", metadataCounts.Roles)
+	fmt.Fprintf(stdout, "role grants exported: %d\n", metadataCounts.RoleGrants)
+	fmt.Fprintf(stdout, "indexes exported: %d\n", metadataCounts.Indexes)
+	fmt.Fprintf(stdout, "constraints exported: %d\n", metadataCounts.Constraints)
+	fmt.Fprintf(stdout, "views exported: %d\n", metadataCounts.Views)
+	fmt.Fprintf(stdout, "sequences exported: %d\n", metadataCounts.Sequences)
+	fmt.Fprintf(stdout, "routines exported: %d\n", metadataCounts.Routines)
+	fmt.Fprintf(stdout, "triggers exported: %d\n", metadataCounts.Triggers)
+	fmt.Fprintf(stdout, "synonyms exported: %d\n", metadataCounts.Synonyms)
+	fmt.Fprintf(stdout, "tab privileges exported: %d\n", metadataCounts.Privileges)
+	fmt.Fprintf(stdout, "rows exported: %d\n", data.RowsExported)
+	fmt.Fprintf(stdout, "rows failed: %d\n", data.RowsFailed)
+	s.printDataExportDiagnostics(stdout, data)
+	printDataExportWarnings(stdout, data)
+	s.log(fmt.Sprintf("[DMP] mode=%s output=%q schemas=%d objects=%d tables=%d rows=%d", info.Mode, info.Path, len(info.Schemas), info.ObjectCount, len(info.Tables), data.RowsExported))
+	return nil
+}
+
+func (s *interactiveSession) effectiveDMPCharset() string {
+	value := strings.TrimSpace(s.charset)
+	if value != "" && !strings.EqualFold(value, "auto") {
+		return value
+	}
+	if s.dictionary != nil {
+		if detected, ok := charsetParameterFromDictionary(s.dictionary.Charset); ok {
+			return detected
+		}
+	}
+	return "utf-8"
+}
+
+func (s *interactiveSession) hasSchema(name string) bool {
+	for _, schema := range s.dictionary.Schemas {
+		if strings.EqualFold(schema.Name, name) {
+			return true
+		}
+	}
+	for _, table := range s.dictionary.Tables {
+		if strings.EqualFold(table.Owner, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func appendUniqueFold(values []string, value string) []string {
+	for _, existing := range values {
+		if strings.EqualFold(existing, value) {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
+func splitIdentifierList(value string) []string {
+	var result []string
+	var current strings.Builder
+	inQuote := false
+	for _, r := range value {
+		switch r {
+		case '"':
+			inQuote = !inQuote
+			current.WriteRune(r)
+		case ',':
+			if inQuote {
+				current.WriteRune(r)
+				continue
+			}
+			if token := strings.TrimSpace(current.String()); token != "" {
+				result = append(result, token)
+			}
+			current.Reset()
+		default:
+			current.WriteRune(r)
+		}
+	}
+	if token := strings.TrimSpace(current.String()); token != "" {
+		result = append(result, token)
+	}
+	return result
+}
+
+func quotedFilterIdentifier(value string) string {
+	return `"` + strings.ReplaceAll(value, `"`, `""`) + `"`
 }
 
 func dataOutputExtension(format string) string {
@@ -1223,8 +1559,8 @@ func (s *interactiveSession) loadDictionaryFilesMode(stdout io.Writer, validateC
 	debug.FreeOSMemory()
 	if stdout != io.Discard {
 		fmt.Fprintf(stdout, "dictionary loaded: %s\n", files.Dir)
-		fmt.Fprintf(stdout, "users=%d tables=%d columns=%d views=%d sequences=%d routines=%d triggers=%d synonyms=%d tab_privs=%d partitions=%d partition_keys=%d\n",
-			files.UserCount, files.TableCount, files.ColumnCount, files.ViewCount, files.SequenceCount, files.RoutineCount, files.TriggerCount, files.SynonymCount, files.TabPrivilegeCount, files.PartitionCount, files.PartitionKeyCount)
+		fmt.Fprintf(stdout, "users=%d schemas=%d tables=%d columns=%d views=%d sequences=%d routines=%d triggers=%d synonyms=%d tab_privs=%d partitions=%d partition_keys=%d\n",
+			files.UserCount, files.SchemaCount, files.TableCount, files.ColumnCount, files.ViewCount, files.SequenceCount, files.RoutineCount, files.TriggerCount, files.SynonymCount, files.TabPrivilegeCount, files.PartitionCount, files.PartitionKeyCount)
 	}
 	return nil
 }

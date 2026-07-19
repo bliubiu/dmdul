@@ -397,12 +397,12 @@ func TestInteractiveListUserShowsObjectCounts(t *testing.T) {
 		t.Fatalf("RunInteractive returned error: %v", err)
 	}
 	output := stdout.String()
-	for _, want := range []string{"tables", "views", "synonyms", "sequences", "triggers", "functions", "procedures", "packages"} {
+	for _, want := range []string{"schemas", "tables", "views", "synonyms", "sequences", "triggers", "functions", "procedures", "packages"} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("list user output should contain %q, got %q", want, output)
 		}
 	}
-	if !strings.Contains(output, "APP                           1        1          1          1         1          1           1         1") {
+	if !strings.Contains(output, "APP                           1        1        1          1          1         1          1           1         1") {
 		t.Fatalf("list user should show per-owner object counts, got %q", output)
 	}
 }
@@ -680,22 +680,22 @@ func TestInteractiveUnloadTableDMPExportsLoadableTableFile(t *testing.T) {
 			t.Fatalf("RunInteractive returned error: %v", err)
 		}
 		output := stdout.String()
-		for _, want := range []string{"APP_WITH_ROWS_ddl.sql", "APP_WITH_ROWS_data.dmp", "rows exported: 1"} {
+		for _, want := range []string{"APP_WITH_ROWS_ddl.sql", "APP_WITH_ROWS.dmp", "dmp mode: TABLES", "objects exported:", "rows exported: 1"} {
 			if !strings.Contains(output, want) {
 				t.Fatalf("interactive output should contain %q, got %q", want, output)
 			}
 		}
-		info, err := dm.InspectDMP(filepath.Join(outDir, "APP_WITH_ROWS_data.dmp"))
+		info, err := dm.InspectDMP(filepath.Join(outDir, "APP_WITH_ROWS.dmp"))
 		if err != nil {
 			t.Fatalf("InspectDMP failed: %v", err)
 		}
-		if info.CaseSensitive || info.Charset != "UTF-8" || info.PageSize != 8192 || info.ExtentSize != 16 || len(info.Tables) != 1 || info.Tables[0].ObjectID != 1001 || info.Tables[0].RowCount != 1 {
+		if info.Mode != dm.DMPModeTables || info.ObjectCount == 0 || info.CaseSensitive || info.Charset != "UTF-8" || info.PageSize != 8192 || info.ExtentSize != 16 || len(info.Tables) != 1 || info.Tables[0].ObjectID != 1001 || info.Tables[0].RowCount != 1 {
 			t.Fatalf("unexpected table dmp info %+v", info)
 		}
 	})
 }
 
-func TestInteractiveUnloadUserDMPExportsPerTableAndSkipsEmptyData(t *testing.T) {
+func TestInteractiveUnloadUserDMPExportsOneOwnerFileIncludingEmptyTableMetadata(t *testing.T) {
 	cwd, _, outDir := setupUnloadDatabaseFixture(t)
 	runInDir(t, cwd, func() {
 		var stdout bytes.Buffer
@@ -705,20 +705,44 @@ func TestInteractiveUnloadUserDMPExportsPerTableAndSkipsEmptyData(t *testing.T) 
 			t.Fatalf("RunInteractive returned error: %v", err)
 		}
 		output := stdout.String()
-		for _, want := range []string{"APP_WITH_ROWS_data.dmp", "data output: skipped (no rows)", "data files exported: 1", "rows exported: 1"} {
+		for _, want := range []string{"APP.dmp", "dmp mode: OWNER", "tables exported: 2", "rows exported: 1"} {
 			if !strings.Contains(output, want) {
 				t.Fatalf("interactive output should contain %q, got %q", want, output)
 			}
 		}
-		info, err := dm.InspectDMP(filepath.Join(outDir, "APP_WITH_ROWS_data.dmp"))
+		info, err := dm.InspectDMP(filepath.Join(outDir, "APP.dmp"))
 		if err != nil {
 			t.Fatalf("InspectDMP failed: %v", err)
 		}
-		if len(info.Tables) != 1 || info.Tables[0].Name != "WITH_ROWS" || info.Tables[0].RowCount != 1 {
+		if info.Mode != dm.DMPModeOwner || info.ObjectCount == 0 || len(info.Schemas) != 2 || info.Schemas[0].Name != "APP" || info.Schemas[1].Name != "APP_EXTRA" || len(info.Tables) != 2 || info.Tables[0].Name != "EMPTY_TABLE" || info.Tables[0].RowCount != 0 || info.Tables[1].Name != "WITH_ROWS" || info.Tables[1].RowCount != 1 {
 			t.Fatalf("unexpected user dmp info %+v", info.Tables)
 		}
-		if _, err := os.Stat(filepath.Join(outDir, "APP_EMPTY_TABLE_data.dmp")); !os.IsNotExist(err) {
-			t.Fatalf("empty table DMP should not exist, stat err=%v", err)
+		if _, err := os.Stat(filepath.Join(outDir, "APP_WITH_ROWS_data.dmp")); !os.IsNotExist(err) {
+			t.Fatalf("owner export must not leave per-table DMP files, stat err=%v", err)
+		}
+	})
+}
+
+func TestInteractiveUnloadSchemasDMPExportsSelectedSchemasInOneFile(t *testing.T) {
+	cwd, _, outDir := setupUnloadDatabaseFixture(t)
+	runInDir(t, cwd, func() {
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+		input := "set output_dir " + outDir + ";\nset data_format dmp;\nunload schema APP,APP_EXTRA to schema_bundle;\nexit;\n"
+		if err := RunInteractive(strings.NewReader(input), &stdout, &stderr); err != nil {
+			t.Fatalf("RunInteractive returned error: %v", err)
+		}
+		for _, want := range []string{"schema_bundle_ddl.sql", "schema_bundle.dmp", "dmp mode: SCHEMAS", "schemas exported: 2", "tables exported: 2", "rows exported: 1"} {
+			if !strings.Contains(stdout.String(), want) {
+				t.Fatalf("interactive output should contain %q, got %q", want, stdout.String())
+			}
+		}
+		info, err := dm.InspectDMP(filepath.Join(outDir, "schema_bundle.dmp"))
+		if err != nil {
+			t.Fatalf("InspectDMP failed: %v", err)
+		}
+		if info.Mode != dm.DMPModeSchemas || len(info.Schemas) != 2 || info.Schemas[0].Name != "APP" || info.Schemas[1].Name != "APP_EXTRA" || len(info.Tables) != 2 {
+			t.Fatalf("unexpected schemas dmp info %+v", info)
 		}
 	})
 }
@@ -800,7 +824,7 @@ func TestInteractiveUnloadDatabaseCSVExportsPerTableAndSkipsEmptyTables(t *testi
 	})
 }
 
-func TestInteractiveUnloadDatabaseDMPExportsPerTableAndSkipsEmptyTables(t *testing.T) {
+func TestInteractiveUnloadDatabaseDMPExportsOneFullFileIncludingEmptyTables(t *testing.T) {
 	cwd, _, outDir := setupUnloadDatabaseFixture(t)
 	runInDir(t, cwd, func() {
 		var stdout bytes.Buffer
@@ -812,25 +836,24 @@ func TestInteractiveUnloadDatabaseDMPExportsPerTableAndSkipsEmptyTables(t *testi
 		output := stdout.String()
 		for _, want := range []string{
 			"DATABASE_ddl.sql",
-			"dmp output:",
-			"DATABASE_APP_WITH_ROWS_data.dmp",
-			"dmp skipped: APP.EMPTY_TABLE (no rows)",
-			"dmp files exported: 1",
+			"dmp output:", "DATABASE.dmp",
+			"dmp mode: FULL",
+			"tables exported: 2",
 			"rows exported: 1",
 		} {
 			if !strings.Contains(output, want) {
 				t.Fatalf("interactive output should contain %q, got %q", want, output)
 			}
 		}
-		info, err := dm.InspectDMP(filepath.Join(outDir, "DATABASE_APP_WITH_ROWS_data.dmp"))
+		info, err := dm.InspectDMP(filepath.Join(outDir, "DATABASE.dmp"))
 		if err != nil {
 			t.Fatalf("InspectDMP failed: %v", err)
 		}
-		if len(info.Tables) != 1 || info.Tables[0].RowCount != 1 || !info.PayloadMD5Valid || !info.HeaderChecksumValid {
+		if info.Mode != dm.DMPModeFull || info.ObjectCount == 0 || len(info.Tables) != 2 || info.Tables[0].RowCount != 0 || info.Tables[1].RowCount != 1 || !info.PayloadMD5Valid || !info.HeaderChecksumValid {
 			t.Fatalf("unexpected database dmp info %+v", info)
 		}
-		if _, err := os.Stat(filepath.Join(outDir, "DATABASE_APP_EMPTY_TABLE_data.dmp")); !os.IsNotExist(err) {
-			t.Fatalf("empty table DMP should not exist, stat err=%v", err)
+		if _, err := os.Stat(filepath.Join(outDir, "DATABASE_APP_WITH_ROWS_data.dmp")); !os.IsNotExist(err) {
+			t.Fatalf("full export must not leave per-table DMP files, stat err=%v", err)
 		}
 	})
 }
@@ -979,6 +1002,11 @@ func setupUnloadDatabaseFixture(t *testing.T) (string, string, string) {
 		Users: []dm.DictionaryUser{
 			{ID: 10, Name: "APP"},
 			{ID: 11, Name: "NO_TABLE"},
+		},
+		Schemas: []dm.DictionarySchema{
+			{ID: 20, Name: "APP", OwnerID: 10, Owner: "APP"},
+			{ID: 21, Name: "APP_EXTRA", OwnerID: 10, Owner: "APP"},
+			{ID: 22, Name: "NO_TABLE", OwnerID: 11, Owner: "NO_TABLE"},
 		},
 		Tables: []dm.DictionaryTable{
 			{ID: 1001, Owner: "APP", Name: "WITH_ROWS", ColumnCount: 1, Tablespace: "MAIN", GroupID: 4, Storage: "CLUSTERBTR"},

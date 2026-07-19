@@ -88,6 +88,7 @@ DMDUL> bootstrap;
 ```text
 meta.tsv
 users.tsv
+schemas.tsv
 tables.tsv
 columns.tsv
 partitions.tsv
@@ -115,8 +116,12 @@ UTF-8 BOM 的 TSV 文件也可以正常读取。
 字段，对应在线 `DBA_SEGMENTS` 的段信息。补齐这些字段后，数据抽取会按段页范围过滤候选页，
 能减少同名表或相似行格式造成的误匹配。
 
-如果内存中还没有字典，执行 `list user`、`list table`、`unload table`、`unload object`、`unload user`、
-`unload database` 前也会尝试自动从 `dmdul_dict` 加载。
+`schemas.tsv` 保存模式及其所属用户。它使 DMP 的 OWNER 与 SCHEMAS 两种逻辑级别可以
+正确区分；旧字典没有该文件时，会按“一个用户对应一个同名默认模式”兼容加载。
+
+如果内存中还没有字典，执行 `list user`、`list schema`、`list table`、`unload table`、
+`unload object`、`unload user`、`unload schema`、`unload database` 前也会尝试自动从
+`dmdul_dict` 加载。
 
 因此推荐二选一：
 
@@ -125,7 +130,7 @@ UTF-8 BOM 的 TSV 文件也可以正常读取。
 2. **复用已审核字典**：`set data_dir` → `load dictionary` → 核对 `show parameter`、
    `list user` 和 `list table` → `unload`，不要再执行 bootstrap 覆盖人工修订版。
 
-## 查看用户和表
+## 查看用户、模式和表
 
 列出用户/owner：
 
@@ -133,7 +138,15 @@ UTF-8 BOM 的 TSV 文件也可以正常读取。
 DMDUL> list user;
 ```
 
-`list user` 会先显示当前字典来源、字典目录和字典行数统计，再列出用户/owner。
+`list user` 会先显示当前字典来源、字典目录和字典行数统计，再按用户汇总其模式、表、
+视图、同义词、序列、触发器、函数、过程和包数量。
+
+列出全部模式，或只列出某个用户拥有的模式：
+
+```text
+DMDUL> list schema;
+DMDUL> list schema HR_TEST;
+```
 
 列出某个用户下的表：
 
@@ -205,7 +218,7 @@ output/HR_TEST_EMP_INFO_ddl.sql
 output/HR_TEST_EMP_INFO_data.csv
 ```
 
-导出达梦纯数据 DMP：
+导出达梦原生逻辑 DMP：
 
 ```text
 DMDUL> set data_format dmp;
@@ -216,11 +229,19 @@ DMDUL> unload table HR_TEST.EMP_INFO;
 
 ```text
 output/HR_TEST_EMP_INFO_ddl.sql
-output/HR_TEST_EMP_INFO_data.dmp
+output/HR_TEST_EMP_INFO.dmp
 ```
 
 DMP 使用 `bootstrap` 识别出的数据库字符集，支持 UTF-8、GB18030 和 EUC-KR。
-数据文件可在先执行 DDL 后，通过 `dimp DATA_ONLY=Y FAST_LOAD=Y` 按表装载。
+文件同时保存表定义、索引、约束、注释、触发器、授权和数据，可以直接通过 `dimp`
+恢复。`_ddl.sql` 是审计和人工修订副本，正常导入前不需要先执行，避免对象已存在冲突。
+
+```text
+dimp SYSDBA/password FILE=HR_TEST_EMP_INFO.dmp SHOW=Y NOLOGFILE=Y
+dimp SYSDBA/password FILE=HR_TEST_EMP_INFO.dmp CTRL_INFO=4 NOLOGFILE=Y
+dimp SYSDBA/password FILE=HR_TEST_EMP_INFO.dmp FAST_LOAD=Y
+```
+
 JSON/JSONB 表是例外，必须使用 `FAST_LOAD=N`；当前测试中官方 `dexp` 文件也会在
 `FAST_LOAD=Y` 后产生不可查询的 JSONB 内容。
 DM 当前 DMP 行格式不能保存 `TIME` 的小数秒；遇到非零小数秒时 DMDUL 会打印明确告警。
@@ -296,9 +317,17 @@ output/HR_TEST_EMP_INFO_data.csv
 output/HR_TEST_T_LOG_HEAP_ddl.sql
 ```
 
-如果 `data_format=dmp`，同样按表生成 `<prefix>_<table>_data.dmp`，空表不生成 DMP。
-超大 LOB 从当前活动行的 locator 出发逐页流式写入，不会先把整个 LOB 读入内存；
-超过 4 GiB 的整表数据通过多个 DMP phase 持续输出。
+如果 `data_format=dmp`，`unload user HR_TEST;` 对应官方 OWNER 级别，生成：
+
+```text
+output/HR_TEST_ddl.sql
+output/HR_TEST.dmp
+```
+
+一个 DMP 包含该用户、其拥有的全部模式、当前可恢复的模式对象、表对象和数据；空表也会
+保留建表元数据。可用逗号同时选择多个用户，例如 `unload user U1,U2;`。超大 LOB 从当前
+活动行的 locator 出发逐页流式写入，不会先把整个 LOB 读入内存；超过 4 GiB 的整表数据
+通过多个 DMP phase 持续输出。
 
 整个用户只读取一次 SYSTEM.DBF 字典，并为所有选中表统一生成 page plan。计划完整时仅直接读取
 计划页并按表分流写入；需要回退时，同一 group 数据文件也只扫描一次，不会因表数量增加而
@@ -310,9 +339,23 @@ output/HR_TEST_T_LOG_HEAP_ddl.sql
 DMDUL> unload user HR_TEST to hr_test_all;
 ```
 
-此时文件前缀会变为 `hr_test_all_<table_name>`。
+SQL/CSV 格式下文件前缀会变为 `hr_test_all_<table_name>`；DMP 格式下生成
+`hr_test_all_ddl.sql` 和 `hr_test_all.dmp`。
 
 `unload user all;` 已移除。整库导出统一使用 `unload database;`，避免两个命令表达同一操作。
+
+## 恢复一个或多个模式
+
+模式级对应官方 SCHEMAS 逻辑级别，当前仅用于 DMP：
+
+```text
+DMDUL> set data_format dmp;
+DMDUL> unload schema HR_TEST;
+DMDUL> unload schema HR_TEST,ARCHIVE to business_schemas;
+```
+
+默认生成一个 `<prefix>_ddl.sql` 和一个 `<prefix>.dmp`。SCHEMAS 只包含明确选择的模式；
+OWNER 则包含选中用户及该用户拥有的全部模式，两者不是同义命令。
 
 ## 恢复整库
 
@@ -339,15 +382,27 @@ output/DATABASE_HR_TEST_EMP_INFO_data.csv
 output/DATABASE_SYSDBA_T_data.csv
 ```
 
-如果 `data_format=dmp`，会生成一个全库 DDL 文件，并按 owner/table 分别生成纯数据 DMP：
+如果 `data_format=dmp`，对应官方 FULL 级别，生成一个同时包含全部可恢复元数据和数据的
+全库逻辑 DMP：
 
 ```text
 output/DATABASE_ddl.sql
-output/DATABASE_HR_TEST_EMP_INFO_data.dmp
-output/DATABASE_SYSDBA_T_data.dmp
+output/DATABASE.dmp
 ```
 
-每表一个 DMP 便于失败后逐表重试和并行执行 `dimp FAST_LOAD=Y`；没有数据的表不会生成空 DMP。
+空用户和空表也会保留必要元数据。若需要逐表重试，应使用 TABLES 级命令分别生成文件。
+
+## DMP 四种逻辑级别
+
+| 级别 | DMDUL 命令 | 一个文件包含的范围 |
+| --- | --- | --- |
+| `TABLES` | `unload table S.T1,S.T2;` | 一个或多个完整表及表相关对象和数据 |
+| `OWNER` | `unload user U1,U2;` | 一个或多个用户、其拥有的全部模式及对象 |
+| `SCHEMAS` | `unload schema S1,S2;` | 明确选择的一个或多个模式及对象 |
+| `FULL` | `unload database;` | 全部可恢复用户、模式、对象和数据 |
+
+四种级别由命令互斥选择。当前 TABLES 以完整父表为最小单位，分区表数据由 DM 在导入时
+按分区键路由，暂不支持只导出一个叶子分区。
 
 也可以指定输出前缀：
 

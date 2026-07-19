@@ -27,6 +27,10 @@ func TestWriteAndLoadDictionaryFiles(t *testing.T) {
 		Users: []DictionaryUser{
 			{ID: 1, Name: "HR_TEST"},
 		},
+		Schemas: []DictionarySchema{
+			{ID: 10, Name: "HR_TEST", OwnerID: 1, Owner: "HR_TEST"},
+			{ID: 11, Name: "HR_ARCHIVE", OwnerID: 1, Owner: "HR_TEST"},
+		},
 		Tables: []DictionaryTable{
 			{ID: 1035, Owner: "HR_TEST", Name: "EMP_INFO", ColumnCount: 2, Tablespace: "MAIN", GroupID: 4, HeaderFile: 0, HeaderBlock: 16, Bytes: 131072, Blocks: 16, Extents: 1, Storage: "CLUSTERBTR", Partitioned: true, StorageID: 33555530, RootFile: 0, RootPage: 16, AssistIDs: []uint32{33555530, 33555531}},
 		},
@@ -65,7 +69,7 @@ func TestWriteAndLoadDictionaryFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WriteDictionaryFiles returned error: %v", err)
 	}
-	if written.UserCount != 1 || written.TableCount != 1 || written.ColumnCount != 2 || written.ViewCount != 1 || written.SequenceCount != 1 || written.RoutineCount != 1 || written.TriggerCount != 1 || written.SynonymCount != 1 || written.TabPrivilegeCount != 2 || written.PartitionCount != 1 || written.PartitionKeyCount != 1 {
+	if written.UserCount != 1 || written.SchemaCount != 2 || written.TableCount != 1 || written.ColumnCount != 2 || written.ViewCount != 1 || written.SequenceCount != 1 || written.RoutineCount != 1 || written.TriggerCount != 1 || written.SynonymCount != 1 || written.TabPrivilegeCount != 2 || written.PartitionCount != 1 || written.PartitionKeyCount != 1 {
 		t.Fatalf("unexpected written counts: %+v", written)
 	}
 
@@ -73,7 +77,7 @@ func TestWriteAndLoadDictionaryFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadDictionaryFiles returned error: %v", err)
 	}
-	if files.Dir != dir || files.ColumnCount != 2 || files.ViewCount != 1 || files.SequenceCount != 1 || files.RoutineCount != 1 || files.TriggerCount != 1 || files.SynonymCount != 1 || files.TabPrivilegeCount != 2 || files.PartitionCount != 1 || files.PartitionKeyCount != 1 {
+	if files.Dir != dir || files.SchemaCount != 2 || files.ColumnCount != 2 || files.ViewCount != 1 || files.SequenceCount != 1 || files.RoutineCount != 1 || files.TriggerCount != 1 || files.SynonymCount != 1 || files.TabPrivilegeCount != 2 || files.PartitionCount != 1 || files.PartitionKeyCount != 1 {
 		t.Fatalf("unexpected loaded files result: %+v", files)
 	}
 	if loaded.Source != "dictionary files" || loaded.DictionaryDir != dir {
@@ -81,6 +85,9 @@ func TestWriteAndLoadDictionaryFiles(t *testing.T) {
 	}
 	if loaded.PageSize != 8192 || loaded.TableCount != 1 || loaded.ColumnCount != 2 {
 		t.Fatalf("unexpected loaded dictionary counts: %+v", loaded)
+	}
+	if len(loaded.Schemas) != 2 || loaded.Schemas[0].Name != "HR_ARCHIVE" || loaded.Schemas[0].Owner != "HR_TEST" || loaded.Schemas[1].Name != "HR_TEST" {
+		t.Fatalf("schema ownership was not preserved: %+v", loaded.Schemas)
 	}
 	if loaded.BootstrapMode != "standard-two-stage" || !loaded.BootstrapFallback {
 		t.Fatalf("bootstrap metadata was not preserved: mode=%q fallback=%v", loaded.BootstrapMode, loaded.BootstrapFallback)
@@ -188,8 +195,11 @@ func TestLoadDictionaryFilesAcceptsUTF8BOMHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadDictionaryFiles returned error: %v", err)
 	}
-	if result.UserCount != 1 || result.TableCount != 1 || result.ColumnCount != 1 {
+	if result.UserCount != 1 || result.SchemaCount != 1 || result.TableCount != 1 || result.ColumnCount != 1 {
 		t.Fatalf("unexpected result counts: %+v", result)
+	}
+	if len(loaded.Schemas) != 1 || loaded.Schemas[0].Name != "HR_TEST" || loaded.Schemas[0].Owner != "HR_TEST" {
+		t.Fatalf("legacy dictionary should synthesize the default schema: %+v", loaded.Schemas)
 	}
 	if loaded.PageSize != 8192 || loaded.Users[0].Name != "HR_TEST" || loaded.Tables[0].Name != "EMP_INFO" || loaded.Columns[0].Name != "EMP_ID" {
 		t.Fatalf("unexpected loaded dictionary: %+v", loaded)

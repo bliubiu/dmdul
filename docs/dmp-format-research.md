@@ -5,7 +5,9 @@
 
 ## 1. 研究目标
 
-`dmdul` 当前能够把离线恢复的数据写成逐行 `INSERT INTO` SQL，但大数据量下 SQL 解析、网络传输、事务提交和索引维护成本较高。
+`dmdul` 能够把离线恢复的数据写成逐行 `INSERT INTO` SQL，但大数据量下 SQL 解析、
+网络传输、事务提交和索引维护成本较高。本研究先验证最小纯数据 DMP，随后继续解码
+原生对象记录和多模式 footer，最终形成当前单文件逻辑 DMP 实现。
 
 本实验研究能否把离线解析出的行直接写成 DM8 DMP 文件，再通过官方 `dimp` 的快速装载路径导入：
 
@@ -56,10 +58,11 @@ extent size: 16 pages
 - `FILE_VERSION=9/15/20/26`；
 - `COMPRESS=Y COMPRESS_LEVEL=1/9`；
 - 精简约束、索引、授权和触发器；
-- TABLES、SCHEMAS、OWNER 三种导出模式。
+- FULL、TABLES、SCHEMAS、OWNER 四种导出模式。
 
-另外用 Go 写入器生成了 GB18030、EUC-KR、分区表和 32 MiB LOB 纯数据 DMP，
-并分别使用普通 `dimp` 和 `FAST_LOAD=Y` 回灌。
+第一阶段用 Go 写入器生成了 GB18030、EUC-KR、分区表和 32 MiB LOB 纯数据 DMP；
+第二阶段生成了包含用户、模式、表和相关对象记录的 FULL/OWNER/SCHEMAS/TABLES DMP，
+并分别使用官方 `dimp SHOW=Y`、校验模式和实际导入验证。
 
 ## 3. 总体布局
 
@@ -279,7 +282,40 @@ repeat table:
 应累计每个数据 phase 的非 `0xFFFFFFFF` 行数，不能只读取 phase-2。压缩基础类型表和
 超大 LOB 都可能在 phase-3 以后才完成最后一批行。
 
-多 schema 和跨文件 footer 尚未完成验证。
+多 schema footer 已完成验证。第二个及后续 schema 前写入小端 `u32 0x85F20CD5`，
+随后继续写该 schema 的 `reserved + schema_record_offset + schema_name + owner_name` 和表索引。
+FULL、OWNER 和 SCHEMAS 模式均可包含多个 schema。跨文件 footer 仍未研究。
+
+### 7.1 已确认的对象记录
+
+对象记录位于 schema 记录或表 phase-1 中。以下类型已经通过官方 `dexp` 差分和
+`dimp SHOW=Y` 验证：
+
+| 类型 | 对象 |
+| ---: | --- |
+| 1 | schema 标记 |
+| 3 | index |
+| 4 | trigger |
+| 5 | function / procedure |
+| 6 | view |
+| 7 | sequence |
+| 8 | synonym |
+| 9 | user |
+| 10 | role |
+| 11 | system privilege |
+| 12 | custom role grant |
+| 13 | table |
+| 14 | row/column-count marker |
+| 15 / 30 | constraint / unique constraint |
+| 16 | view、sequence、routine、package 等模式对象授权 |
+| 18 / 23 | package / package body |
+| 20 | table grant |
+| 31 / 32 | table comment / column comment |
+| 37 | built-in role grant |
+
+类型 16 与类型 20 不是普通的 `name + SQL` 记录，而是结构化保存 grantor、grantee、
+privilege、object owner、object name、grantable；类型 16 还带 `VIEW / SEQ / PROC / PKG`
+对象类型。头部 `0xA4A` 记录这些 DDL/授权对象记录总数，不计 schema 标记和行标记。
 
 ## 8. 压缩
 
@@ -315,6 +351,14 @@ byte zlib_stream[compressed_length]
 10. 正式 `unload table` 从 oldpro 离线 DBF 生成 `T_LOB_TEST` 与 `T_ORDER_RANGE`
     DMP；官方 `dimp DATA_ONLY=Y FAST_LOAD=Y REMAP_SCHEMA` 无告警导入 10/10 行。
     LOB 汇总为 CLOB 326 字符、BLOB 141 字节；RANGE 四个分区行数为 3/2/2/3。
+11. dmdul 生成 TABLES 逻辑 DMP；`SHOW=Y` 识别 1 张表、1 行、3 个索引、2 个约束、
+    表注释和 3 个字段注释，使用 `REMAP_SCHEMA` 实际导入后对象和数据均正确。
+12. dmdul 生成 OWNER 逻辑 DMP；实际导入后恢复 3 张表、4 行 EMP_INFO、4 个 routine
+    和 11 个 synonym，无导入告警。
+13. SCHEMAS 模式完成单模式、多非空模式以及“空模式 + 非空模式”三组验证，均可由
+    `dimp SHOW=Y` 正确识别。
+14. FULL 模式完成 6 个 schema、28 张表及索引、触发器、视图、序列、routine、包/包体、
+    同义词、约束、注释、系统权限、角色授权和对象授权的 `SHOW=Y` 验证。
 
 ### 9.1 字符集边界
 
@@ -338,9 +382,8 @@ dimp USER/PASSWORD FILE=table_data.dmp SHOW=Y NOLOGFILE=Y
 # 只校验 payload MD5，不执行导入
 dimp USER/PASSWORD FILE=table_data.dmp CTRL_INFO=4 NOLOGFILE=Y
 
-# 目标表已由 DDL 创建后快速装载
-dimp USER/PASSWORD FILE=table_data.dmp \
-  DATA_ONLY=Y TABLE_EXISTS_ACTION=APPEND FAST_LOAD=Y CTRL_INFO=2
+# 当前逻辑 DMP：一次导入对象元数据和数据
+dimp USER/PASSWORD FILE=logical_export.dmp FAST_LOAD=Y CTRL_INFO=2
 ```
 
 ## 10. dmdul 中的阶段性实现
@@ -349,6 +392,8 @@ dimp USER/PASSWORD FILE=table_data.dmp \
 
 - `internal/dm/dmp.go`
 - `internal/dm/data_dmp.go`
+- `internal/dm/dmp_metadata.go`
+- `internal/dm/dmp_logical.go`
 - `internal/dm/dmp_test.go`
 
 已实现：
@@ -356,53 +401,65 @@ dimp USER/PASSWORD FILE=table_data.dmp \
 - 4KB 头解析；
 - 逻辑版本、模式、压缩、行格式标志和对象数识别；
 - payload MD5、头 XOR、footer magic 校验；
-- 单 schema footer/table/phase/行数解析；
+- 多 schema footer/table/phase/行数解析；
 - UTF-8、GB18030、EUC-KR 双头字段识别与写入；
 - 按文件字符集编解码 schema/table 名；
 - 多 phase 行数累计和 `0xFFFFFFFF` 续传识别；
-- 未压缩、表级、纯数据 DMP 的流式写入；
+- 未压缩表数据 phase 的流式写入；
 - NULL、短字段、64 位长度长字段和 Reader 流式字段写入；
 - 8 MiB 多 phase 自动切分，支持超大行和 LOB 跨 phase 续传；
 - 写完后回填各 phase 长度、行数、footer、MD5 和头校验；
-- `set data_format dmp` 已接入表级、用户级和整库级 `unload`；
-- 用户级和整库级按表生成 DMP，空表不生成空文件；
+- `set data_format dmp` 已接入 TABLES、OWNER、SCHEMAS、FULL 四种逻辑级别；
+- 每次卸载生成一个原生逻辑 DMP，空表保留表定义；
+- 用户、角色、表、索引、约束、注释、视图、序列、routine、包/包体、触发器、
+  同义词和对象授权记录写入 DMP；
+- `schemas.tsv` 持久化模式及所属用户，OWNER 可包含用户拥有的多个模式；
 - 从活动行 locator 出发流式读取 `0x20` LOB 页链；
 - DMP 写入器可暂停和继续，限制整库导出时同时打开的文件数；
 - 基础类型按已验证矩阵编码，TIME 小数秒丢失会输出显式告警；
 - 长字段长度和文件偏移使用 64 位，超过 4 GiB 的整表通过多 phase 输出。
 
-没有新增交互式 DMP 检查命令。DMP 定位为“SQL DDL + 每表一个纯数据 DMP”，
+没有新增交互式 DMP 检查命令；验证使用官方 `dimp SHOW=Y` 和 `CTRL_INFO=4`。
 默认 `data_format` 仍为 `sql`。
 
 ## 11. 正式导出方式
 
-当前采用“SQL DDL + 每表一个纯数据 DMP”：
+当前采用“审计 SQL DDL + 单个原生逻辑 DMP”：
 
 ```text
 HR_TEST_EMP_INFO_ddl.sql
-HR_TEST_EMP_INFO_data.dmp
+HR_TEST_EMP_INFO.dmp
 ```
 
-恢复顺序：
+四种级别与交互命令一一对应：
 
-1. 执行 DDL，创建用户、表、约束和必要对象；
-2. 对普通表执行 `dimp DATA_ONLY=Y FAST_LOAD=Y`；JSON/JSONB 表使用 `FAST_LOAD=N`；
-3. 数据装载完成后创建或重建二级索引、外键和触发器；
-4. 做行数、MD5 和抽样内容校验。
+| 模式 | 命令 | 默认 DMP |
+| --- | --- | --- |
+| TABLES | `unload table S.T1,S.T2;` | 单表为 `S_T1.dmp`，多表为 `TABLES.dmp` |
+| OWNER | `unload user U1,U2;` | `U1.dmp` 或 `OWNER_U1_U2.dmp` |
+| SCHEMAS | `unload schema S1,S2;` | `S1.dmp` 或 `SCHEMAS_S1_S2.dmp` |
+| FULL | `unload database;` | `DATABASE.dmp` |
 
-这样既避开逐行 `INSERT INTO`，也不必在第一版就生成用户、视图、包、权限等全部 DMP 对象记录。
+建议恢复顺序：
+
+1. 使用 `dimp SHOW=Y` 检查模式、对象和预计行数；
+2. 使用 `CTRL_INFO=4` 校验 payload MD5；
+3. 在隔离用户或隔离实例直接导入逻辑 DMP；JSON/JSONB 使用 `FAST_LOAD=N`；
+4. 核对对象数量、约束状态、行数、LOB 长度和抽样内容；
+5. 只有需要人工修订或 DMP 对象类型未覆盖时，才改用配套 `_ddl.sql` 分步恢复。
 
 仍需继续研究和验证：
 
 - 补齐自定义类型和集合类型编码矩阵；
 - 原生多文件 footer、压缩和加密 DMP；
+- TABLES 模式单独选择叶子分区；当前只导出完整父表并由 DM 路由分区行；
 - 单个 21 字节 locator 的长度字段是 32 位；超过该范围的其他 LOB locator 形态尚未确认；
 - 迁移行、链式行和部分恢复行的列值策略；
 - 不同 DM8 构建版本及 `FILE_VERSION` 兼容性测试；
 - 导入失败时的错误定位和逐表重试清单。
 
-建议先在隔离测试库执行 `dimp CTRL_INFO=4` 校验，再使用 `DATA_ONLY=Y FAST_LOAD=Y`
-装载；JSON/JSONB 使用 `FAST_LOAD=N`。跨字符集恢复必须按目标字符集重新生成 DMP，
+建议先在隔离测试库执行 `dimp SHOW=Y` 和 `CTRL_INFO=4`，再导入完整逻辑文件；
+JSON/JSONB 使用 `FAST_LOAD=N`。跨字符集恢复必须按目标字符集重新生成 DMP，
 不能只修改文件头标记。
 `case_sensitive=auto` 从 `SYSTEM.DBF` 第 4 页偏移 `0x2C` 读取建库标志，并写入
 DMP 头 `0x435`。该对应关系已通过 6 个已有实例及一组“同字符集、仅

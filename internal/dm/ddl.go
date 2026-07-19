@@ -77,6 +77,7 @@ type DDLExportOptions struct {
 	TableFilter     string
 	Charset         string
 	TablesOnly      bool
+	DMPMode         DMPExportMode
 	Dictionary      *DictionaryInfo
 }
 
@@ -113,6 +114,7 @@ type DDLExportResult struct {
 	SynonymCount       int
 	TabPrivilegeCount  int
 	TableOutputs       []DDLTableOutput
+	DMPMetadata        *DMPMetadataCatalog
 }
 
 type ddlLocation struct {
@@ -513,6 +515,21 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 		tabPrivileges = filterDDLPrivilegesToTables(tabPrivileges, tables, ownerMatcher, tableMatcher)
 	}
 
+	var dmpMetadata *DMPMetadataCatalog
+	if opts.DMPMode != 0 {
+		dmpMetadata, err = buildDMPMetadataCatalog(
+			opts.DMPMode, opts.Dictionary, objects, users, roles, roleGrants,
+			tables, columnsByTable, columnsByTableColID, indexObjects, indexes,
+			tableStorage, partitionsByTable, partitionKeysByTable,
+			constraintObjects, constraints, tableComments, columnComments,
+			views, sequences, routines, triggers, synonyms, tabPrivileges,
+			ownerMatcher, tableMatcher, tablespaces,
+		)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	var tableOutputs []DDLTableOutput
 	if opts.TableOutputPath != nil {
 		pathOwners := make(map[string]uint32)
@@ -582,6 +599,7 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 		SynonymCount:       len(synonyms),
 		TabPrivilegeCount:  len(tabPrivileges),
 		TableOutputs:       tableOutputs,
+		DMPMetadata:        dmpMetadata,
 	}, nil
 }
 

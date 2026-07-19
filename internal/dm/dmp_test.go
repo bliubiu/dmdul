@@ -448,3 +448,139 @@ func TestDMPDataWriterUsesUint64ForFieldsOver4GiB(t *testing.T) {
 		t.Fatalf("Abort failed: %v", err)
 	}
 }
+
+func TestWriteLogicalDMPCombinesMetadataDataAndMultipleSchemas(t *testing.T) {
+	dir := t.TempDir()
+	spoolPath := filepath.Join(dir, "rows.spool.dmp")
+	spool, err := NewDMPDataWriter(DMPDataOptions{
+		OutputPath: spoolPath, Charset: "UTF-8", Schema: "APP", Table: "T_ROWS", TableID: 101, ColumnCount: 2,
+	})
+	if err != nil {
+		t.Fatalf("NewDMPDataWriter failed: %v", err)
+	}
+	if err := spool.WriteRow([]DMPField{DMPShortField([]byte{1}), DMPShortField([]byte("alpha"))}); err != nil {
+		t.Fatalf("WriteRow failed: %v", err)
+	}
+	if _, err := spool.Close(); err != nil {
+		t.Fatalf("close spool failed: %v", err)
+	}
+
+	outputPath := filepath.Join(dir, "owner.dmp")
+	info, err := WriteLogicalDMP(DMPLogicalOptions{
+		OutputPath: outputPath,
+		Catalog: &DMPMetadataCatalog{
+			Mode: DMPModeOwner,
+			GlobalRecords: []DMPMetadataRecord{
+				{RecordType: dmpRecordUser, Name: "APP", SQL: `CREATE USER "APP" IDENTIFIED BY "Dmdul_2026#Reset";`},
+			},
+			Schemas: []DMPSchemaMetadata{
+				{
+					Name: "APP", Owner: "APP",
+					Tables: []DMPTableMetadata{{
+						ID: 101, Schema: "APP", Owner: "APP", Name: "T_ROWS", ColumnCount: 2,
+						Records: []DMPMetadataRecord{{RecordType: dmpRecordTable, Name: "T_ROWS", SQL: `CREATE TABLE "APP"."T_ROWS" ("ID" INT, "NAME" VARCHAR(20));`}},
+					}},
+				},
+				{
+					Name: "APP_EXTRA", Owner: "APP",
+					Tables: []DMPTableMetadata{{
+						ID: 102, Schema: "APP_EXTRA", Owner: "APP", Name: "T_EMPTY", ColumnCount: 1,
+						Records: []DMPMetadataRecord{{RecordType: dmpRecordTable, Name: "T_EMPTY", SQL: `CREATE TABLE "APP_EXTRA"."T_EMPTY" ("ID" INT);`}},
+					}},
+				},
+			},
+		},
+		TableDataPaths: map[uint32]string{101: spoolPath},
+		Charset:        "UTF-8",
+	})
+	if err != nil {
+		t.Fatalf("WriteLogicalDMP failed: %v", err)
+	}
+	if info.Mode != DMPModeOwner || info.ObjectCount != 3 {
+		t.Fatalf("unexpected logical header mode=%s objects=%d", info.Mode, info.ObjectCount)
+	}
+	if !info.PayloadMD5Valid || !info.HeaderChecksumValid || !info.FooterMagicValid || info.FooterParseError != "" {
+		t.Fatalf("invalid logical dmp integrity: %+v", info)
+	}
+	if len(info.Schemas) != 2 || len(info.Tables) != 2 {
+		t.Fatalf("logical footer schemas=%d tables=%d", len(info.Schemas), len(info.Tables))
+	}
+	if info.Schemas[0].Name != "APP" || info.Schemas[0].Owner != "APP" || info.Schemas[1].Name != "APP_EXTRA" || info.Schemas[1].Owner != "APP" {
+		t.Fatalf("unexpected schema directory: %+v", info.Schemas)
+	}
+	if info.Tables[0].Name != "T_ROWS" || info.Tables[0].RowCount != 1 || len(info.Tables[0].PhaseOffsets) != 2 {
+		t.Fatalf("unexpected data table index: %+v", info.Tables[0])
+	}
+	if info.Tables[1].Name != "T_EMPTY" || info.Tables[1].RowCount != 0 || len(info.Tables[1].PhaseOffsets) != 1 {
+		t.Fatalf("unexpected empty table index: %+v", info.Tables[1])
+	}
+}
+
+func TestDMPGrantMetadataUsesNativeTableAndSchemaRecordLayouts(t *testing.T) {
+	tableGrant := dmpObjectGrantRecord(DictionaryTabPrivilege{
+		Grantee: "DST", Owner: "SRC", ObjectName: "T1", ObjectType: "TABLE", Privilege: "SELECT", Grantable: "N",
+	})
+	viewGrant := dmpObjectGrantRecord(DictionaryTabPrivilege{
+		Grantee: "DST", Owner: "SRC", ObjectName: "V1", ObjectType: "VIEW", Privilege: "SELECT", Grantable: "Y",
+	})
+	sequenceGrant := dmpObjectGrantRecord(DictionaryTabPrivilege{
+		Grantee: "DST", Owner: "SRC", ObjectName: "S1", ObjectType: "SEQUENCE", Privilege: "SELECT", Grantable: "N",
+	})
+	routineGrant := dmpObjectGrantRecord(DictionaryTabPrivilege{
+		Grantee: "DST", Owner: "SRC", ObjectName: "F1", ObjectType: "FUNCTION", Privilege: "EXECUTE", Grantable: "N",
+	})
+	packageGrant := dmpObjectGrantRecord(DictionaryTabPrivilege{
+		Grantee: "DST", Owner: "SRC", ObjectName: "PKG1", ObjectType: "PACKAGE", Privilege: "EXECUTE", Grantable: "N",
+	})
+	if tableGrant.RecordType != dmpRecordObjectGrant || tableGrant.Grant.ObjectType != "TABLE" {
+		t.Fatalf("unexpected table grant metadata %+v", tableGrant)
+	}
+	if viewGrant.RecordType != dmpRecordSchemaGrant || viewGrant.Grant.ObjectType != "VIEW" {
+		t.Fatalf("unexpected view grant metadata %+v", viewGrant)
+	}
+	if sequenceGrant.RecordType != dmpRecordSchemaGrant || sequenceGrant.Grant.ObjectType != "SEQ" {
+		t.Fatalf("unexpected sequence grant metadata %+v", sequenceGrant)
+	}
+	if routineGrant.RecordType != dmpRecordSchemaGrant || routineGrant.Grant.ObjectType != "PROC" {
+		t.Fatalf("unexpected routine grant metadata %+v", routineGrant)
+	}
+	if packageGrant.RecordType != dmpRecordSchemaGrant || packageGrant.Grant.ObjectType != "PKG" {
+		t.Fatalf("unexpected package grant metadata %+v", packageGrant)
+	}
+
+	path := filepath.Join(t.TempDir(), "grant-records.bin")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	charset, err := dmpCharsetFromName("UTF-8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDMPMetadataRecord(file, charset, tableGrant); err != nil {
+		t.Fatal(err)
+	}
+	tableEnd, err := file.Seek(0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDMPMetadataRecord(file, charset, viewGrant); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := binary.LittleEndian.Uint16(raw[0:2]); got != dmpRecordObjectGrant {
+		t.Fatalf("table grant record type=%d", got)
+	}
+	if got := binary.LittleEndian.Uint16(raw[int(tableEnd) : int(tableEnd)+2]); got != dmpRecordSchemaGrant {
+		t.Fatalf("schema grant record type=%d", got)
+	}
+	if !bytes.HasSuffix(raw, []byte{4, 0, 0, 0, 'V', 'I', 'E', 'W'}) {
+		t.Fatalf("schema grant is missing its native object-type suffix: %x", raw[int(tableEnd):])
+	}
+}
