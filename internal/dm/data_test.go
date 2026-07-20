@@ -2092,3 +2092,75 @@ func TestWriteRowCountsOversizedSQLStatements(t *testing.T) {
 		t.Fatalf("oversized tables = %v, want [APP.T_LOB]", tables)
 	}
 }
+
+func TestRowCoverageKeysSkippedForPlainDirectReadRows(t *testing.T) {
+	columns := []columnDef{
+		{ColID: 0, Name: "ID", DataType: "INT"},
+		{ColID: 1, Name: "V", DataType: "VARCHAR"},
+	}
+	values := map[uint16]dataValue{
+		0: {value: int32(1)},
+		1: {value: "x"},
+	}
+	full := dataRowRenderMetaForValues(columns, values, false)
+	if full.partial || len(full.coverageKeys) != 0 || full.prefixKey != "" {
+		t.Fatalf("untracked full row must carry no coverage keys: %+v", full)
+	}
+	tracked := dataRowRenderMetaForValues(columns, values, true)
+	if len(tracked.coverageKeys) != 2 || tracked.prefixKey == "" {
+		t.Fatalf("tracked full row must carry coverage keys: %+v", tracked)
+	}
+	partialValues := map[uint16]dataValue{0: {value: int32(1)}}
+	partial := dataRowRenderMetaForValues(columns, partialValues, false)
+	if !partial.partial || len(partial.coverageKeys) != 1 || partial.prefixKey == "" {
+		t.Fatalf("partial row must carry its own coverage keys even untracked: %+v", partial)
+	}
+}
+
+func TestStampRowCoverageTrackingMarksHistoricalTables(t *testing.T) {
+	plain := dataTableInfo{table: dictionaryObject{ID: 1, Owner: "A", Name: "PLAIN"}}
+	histPrimary := dataTableInfo{table: dictionaryObject{ID: 2, Owner: "A", Name: "HIST"}}
+	histAssist := histPrimary
+	histAssist.historicalRows = true
+	assistByID := map[uint32][]dataTableInfo{
+		100: {plain},
+		200: {histPrimary},
+		201: {histAssist},
+	}
+	units := map[uint32]dataTableInfo{1: plain, 2: histPrimary}
+	states := stampRowCoverageTracking(assistByID, units, false)
+	if assistByID[100][0].coverage != nil || states[1] != nil {
+		t.Fatalf("plain table must not track coverage")
+	}
+	if assistByID[200][0].coverage == nil || assistByID[201][0].coverage == nil {
+		t.Fatalf("historical table candidates must all track coverage")
+	}
+	if assistByID[200][0].coverage != assistByID[201][0].coverage {
+		t.Fatalf("historical table candidates must share one coverage state")
+	}
+	if units[2].coverage == nil || units[1].coverage != nil {
+		t.Fatalf("storage units must mirror table coverage: %+v", units)
+	}
+	states = stampRowCoverageTracking(assistByID, units, true)
+	if assistByID[100][0].coverage == nil || states[1] == nil {
+		t.Fatalf("recovery mode must track coverage for every table")
+	}
+}
+
+func TestTableCoverageStateOverflowStopsTracking(t *testing.T) {
+	state := &tableCoverageState{keys: make(map[string]bool, maxCoverageKeysPerTable)}
+	for i := 0; len(state.keys) < maxCoverageKeysPerTable-1; i++ {
+		state.keys[fmt.Sprintf("k%d", i)] = true
+	}
+	state.mark([]string{"final-key"})
+	if !state.overflow || state.keys != nil {
+		t.Fatalf("state must overflow and drop keys at the cap: overflow=%v keysNil=%v", state.overflow, state.keys == nil)
+	}
+	if state.active() {
+		t.Fatalf("overflowed state must not stay active")
+	}
+	state.mark([]string{"later"})
+	if state.covered("later") || state.covered("final-key") {
+		t.Fatalf("overflowed state must not report coverage")
+	}
+}

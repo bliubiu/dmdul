@@ -73,7 +73,7 @@ func renderDMPForDataRowWithMeta(info dataTableInfo, row []byte, decoder textDec
 		fields = append(fields, field)
 		timeFractionLoss = timeFractionLoss || losesFraction
 	}
-	return fields, dataStart, dataEnd, dataRowRenderMetaForValues(info.columns, values), timeFractionLoss, nil
+	return fields, dataStart, dataEnd, dataRowRenderMetaForValues(info.columns, values, info.coverage.active()), timeFractionLoss, nil
 }
 
 func dmpFieldForDataColumn(col columnDef, value any, charset dmpCharsetHeader) (DMPField, bool, error) {

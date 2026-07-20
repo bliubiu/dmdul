@@ -12,6 +12,36 @@ v主版本.次版本.修订版本
 
 ------
 
+## 未发布
+
+### Fixed
+
+- 修复千万行级大表卸载的内存失控：行覆盖键（column-prefix coverage key）此前对
+  每张表的每一行无条件生成 O(列数) 个前缀字符串，1000 万行 13 列实测堆峰值 47 GiB，
+  4 GiB 内存主机直接被 OOM 终止。三处修复：
+  - 表自身主 storage 不再被注册为 historical 候选（`shouldAllowHistoricalRows`
+    排除 self-storage），普通表完全跳过覆盖键生成；
+  - `0x02000000|table_id` 猜测辅助 id 仅在字典完全没有 storage 信息时才参与扫描；
+  - 覆盖键状态改为按表共享并引入 200 万键上限，超限自动停止生成并释放，
+    仅当确有 pending 短行时在 fallback reason 中提示人工核对。
+- 存储/段两级 fallback 扫描补齐页级去重：所有阶段共享 processed 页集合，
+  同一物理页全程只解析一次，行不会因 fallback 重访而重复导出。
+
+### Added
+
+- 新增 env 门控的手工性能剖析测试（`DMDUL_PROFILE_DIR`）与
+  `DMDUL_DEBUG_COVERAGE` 覆盖键诊断输出。
+
+### Validation
+
+- DM8 build 2025-01-17（4C/4GiB 主机）：MOCK.T_CUSTOMER_MOCK 1000 万行 2.13 GiB
+  表空间，SQL 卸载 228 秒（3.75 GiB / 精确 1000 万条 INSERT / 0 失败 / 223712 页
+  全部 page plan 直读），DMP 卸载 347 秒（1.78 GiB）；修复前同场景 OOM。
+  本地剖析堆峰值 47 GiB → 152 MiB。DULTEST 九表 53064 行回归含 ALTER 历史行
+  语义不变。
+
+------
+
 ## v0.5.6 - disql Compatibility Fixes
 
 ### Fixed

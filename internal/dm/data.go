@@ -165,6 +165,60 @@ type dataTableInfo struct {
 	recoveryGroupID uint32
 	segment         tableSegment
 	segmentKnown    bool
+	// coverage tracks per-row column-prefix keys, which deduplicate
+	// ALTER-history partial rows against full rows when the same logical row
+	// can be visited through more than one storage (historical assists,
+	// orphan recovery, recover mode). Plain direct-read exports visit each
+	// physical row exactly once (page-level dedup), so the pointer stays nil
+	// there — tracking would burn O(columns) strings per row, gigabytes on
+	// 10M-row tables. The state is shared by all candidates of one table and
+	// self-disables once maxCoverageKeysPerTable is reached.
+	coverage *tableCoverageState
+}
+
+// tableCoverageState bounds row-coverage memory for one table. Once the key
+// count reaches maxCoverageKeysPerTable the map is dropped and key generation
+// stops; pending partial rows are then emitted without full-row dedup and the
+// export reports it, instead of the process dying on multi-GB key maps.
+type tableCoverageState struct {
+	keys     map[string]bool
+	overflow bool
+}
+
+const maxCoverageKeysPerTable = 2_000_000
+
+func (s *tableCoverageState) active() bool {
+	return s != nil && !s.overflow
+}
+
+func (s *tableCoverageState) mark(keys []string) {
+	if s == nil || s.overflow || len(keys) == 0 {
+		return
+	}
+	if s.keys == nil {
+		s.keys = make(map[string]bool)
+	}
+	for _, key := range keys {
+		if key != "" {
+			s.keys[key] = true
+		}
+	}
+	if len(s.keys) >= maxCoverageKeysPerTable {
+		s.overflow = true
+		s.keys = nil
+	}
+}
+
+func (s *tableCoverageState) covered(keys ...string) bool {
+	if s == nil || s.keys == nil {
+		return false
+	}
+	for _, key := range keys {
+		if key != "" && s.keys[key] {
+			return true
+		}
+	}
+	return false
 }
 
 type tableSegment struct {
@@ -909,6 +963,7 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 		}
 	}
 
+	coverageStates := stampRowCoverageTracking(assistByID, storageUnits, opts.RecoveryMode)
 	directCandidates, plannedRefs, plannedUnits := buildDirectDataPageCandidates(assistByID)
 
 	result := &DataExportResult{
@@ -955,7 +1010,6 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 	}
 
 	stop := false
-	coveredRowPrefixes := make(map[uint32]map[string]bool)
 	var pendingPartialRows []pendingPartialDataRow
 	touchedFiles := make(map[dataFileKey]bool)
 	processedDirectPages := make(map[dataPageRef]bool)
@@ -1084,7 +1138,7 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 			if timeFractionLoss {
 				result.TimeFractionLoss++
 			}
-			markCoveredRowPrefixes(coveredRowPrefixes, info.table.ID, meta.coverageKeys)
+			coverageStates[info.table.ID].mark(meta.coverageKeys)
 			result.RowsExported++
 			if stats != nil {
 				stats.RowsExported++
@@ -1226,6 +1280,9 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 							matched = append(matched, candidate)
 						}
 					}
+					if len(matched) > 0 {
+						processedDirectPages[ref] = true
+					}
 					return processPage(file, pageNo, page, matched)
 				})
 				result.FallbackPagesScanned += pagesScanned
@@ -1261,9 +1318,10 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 			result.FallbackPagesScanned++
 			result.PagesScanned++
 			touchedFiles[ref.key] = true
-			if !pageHeaderMatchesRef(page, ref) {
+			if processedDirectPages[ref] || !pageHeaderMatchesRef(page, ref) {
 				continue
 			}
+			processedDirectPages[ref] = true
 			file := dataFileRefForKey(dataFiles, ref.key)
 			if err := processPage(file, ref.pageNo, page, segmentPages[ref]); err != nil {
 				if err == errStopPageScan {
@@ -1277,11 +1335,19 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 	result.DataFileCount = len(touchedFiles)
 	result.RecoverySources = finalizeDataRecoverySources(recoverySources)
 	sort.Strings(result.FallbackReasons)
+	coverageOverflowWarned := make(map[uint32]bool)
 	for _, pending := range pendingPartialRows {
-		if coveredRowPrefixes[pending.tableID][pending.meta.prefixKey] || coveredRowPrefixes[pending.tableID][pending.meta.weakPrefixKey] {
+		state := coverageStates[pending.tableID]
+		if state.covered(pending.meta.prefixKey, pending.meta.weakPrefixKey) {
 			continue
 		}
-		markCoveredRowPrefixes(coveredRowPrefixes, pending.tableID, pending.meta.coverageKeys)
+		if state != nil && state.overflow && !coverageOverflowWarned[pending.tableID] {
+			coverageOverflowWarned[pending.tableID] = true
+			if info, ok := selectedTables[pending.tableID]; ok {
+				addFallbackReason(fmt.Sprintf("%s.%s row coverage tracking exceeded %d keys; partial rows were emitted without full-row dedup, verify duplicates before import", info.table.Owner, info.table.Name, maxCoverageKeysPerTable))
+			}
+		}
+		state.mark(pending.meta.coverageKeys)
 		if pending.timeFractionLoss {
 			result.TimeFractionLoss++
 		}
@@ -1938,8 +2004,14 @@ func dataStorageIDForTable(dictionaryTables map[uint32]DictionaryTable, dataStor
 	return 0
 }
 
+// shouldAllowHistoricalRows reports whether an assist storage may carry
+// historical (pre-ALTER) row versions of the table. The table's own primary
+// storage never counts: its pages are deduplicated page-wise across the
+// direct, storage-scan and segment phases, so rows from it cannot be
+// revisited, and flagging it forces row-coverage tracking (O(rows) strings)
+// on every table.
 func shouldAllowHistoricalRows(info dataTableInfo, assistID uint32) bool {
-	return info.dataStorageID != 0 && assistID != 0
+	return info.dataStorageID != 0 && assistID != 0 && assistID != info.dataStorageID
 }
 
 func dictionaryDataAssistIDs(tables map[uint32]DictionaryTable, tableID uint32) []uint32 {
@@ -1960,7 +2032,12 @@ func dictionaryDataAssistIDs(tables map[uint32]DictionaryTable, tableID uint32) 
 	for _, id := range table.AssistIDs {
 		add(id)
 	}
-	add(tableDataAssistID(tableID))
+	// The 0x02000000|table_id guess can collide with unrelated live storages
+	// and forces coverage tracking on every table, so it only participates
+	// when the dictionary carries no real storage id at all.
+	if table.StorageID == 0 && len(table.AssistIDs) == 0 {
+		add(tableDataAssistID(tableID))
+	}
 	return result
 }
 
@@ -2452,7 +2529,7 @@ func renderInsertForDataRowWithMeta(info dataTableInfo, row []byte, decoder text
 		strings.Join(cols, ", "),
 		strings.Join(vals, ", "),
 	)
-	return sql, dataStart, dataEnd, dataRowRenderMetaForValues(info.columns, values), nil
+	return sql, dataStart, dataEnd, dataRowRenderMetaForValues(info.columns, values, info.coverage.active()), nil
 }
 
 func renderCSVForDataRow(info dataTableInfo, row []byte, decoder textDecoder) ([]string, int, int, error) {
@@ -2478,7 +2555,7 @@ func renderCSVForDataRowWithMeta(info dataTableInfo, row []byte, decoder textDec
 		}
 		record = append(record, csvValue)
 	}
-	return record, dataStart, dataEnd, dataRowRenderMetaForValues(info.columns, values), nil
+	return record, dataStart, dataEnd, dataRowRenderMetaForValues(info.columns, values, info.coverage.active()), nil
 }
 
 func csvHeaderForDataTable(info dataTableInfo) []string {
@@ -2489,7 +2566,7 @@ func csvHeaderForDataTable(info dataTableInfo) []string {
 	return header
 }
 
-func dataRowRenderMetaForValues(columns []columnDef, values map[uint16]dataValue) dataRowRenderMeta {
+func dataRowRenderMetaForValues(columns []columnDef, values map[uint16]dataValue, trackCoverage bool) dataRowRenderMeta {
 	ordered := append([]columnDef(nil), columns...)
 	sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].ColID < ordered[j].ColID })
 	var present []columnDef
@@ -2504,6 +2581,15 @@ func dataRowRenderMetaForValues(columns []columnDef, values map[uint16]dataValue
 	}
 	for _, col := range present {
 		meta.presentColIDs = append(meta.presentColIDs, col.ColID)
+	}
+	// Coverage keys exist to deduplicate rows that can be visited via more
+	// than one storage path. Partial (ALTER-history) rows always carry keys so
+	// pending partials can suppress duplicates among themselves; full rows
+	// carry them only when the table's storages make revisits possible.
+	// Skipping them on plain direct-read exports avoids O(columns) string
+	// allocations per row, which dominates memory on 10M-row tables.
+	if !trackCoverage && !meta.partial {
+		return meta
 	}
 	if len(present) > 0 {
 		meta.prefixKey = dataRowPrefixKey(present, values)
@@ -2540,20 +2626,46 @@ func dataValueSignature(value any) string {
 	}
 }
 
-func markCoveredRowPrefixes(covered map[uint32]map[string]bool, tableID uint32, keys []string) {
-	if len(keys) == 0 {
-		return
+// stampRowCoverageTracking enables row coverage keys only for tables whose
+// rows can be visited through more than one storage path. Everything is
+// tracked in recovery mode; otherwise only tables that gained historical or
+// orphan candidates need it, and their primary candidates must track too so
+// full rows can suppress duplicate ALTER-history partial rows.
+func stampRowCoverageTracking(assistByID map[uint32][]dataTableInfo, storageUnits map[uint32]dataTableInfo, recoveryMode bool) map[uint32]*tableCoverageState {
+	coverageDebug := os.Getenv("DMDUL_DEBUG_COVERAGE") != ""
+	states := make(map[uint32]*tableCoverageState)
+	ensure := func(tableID uint32) *tableCoverageState {
+		if states[tableID] == nil {
+			states[tableID] = &tableCoverageState{}
+		}
+		return states[tableID]
 	}
-	tableKeys := covered[tableID]
-	if tableKeys == nil {
-		tableKeys = make(map[string]bool)
-		covered[tableID] = tableKeys
-	}
-	for _, key := range keys {
-		if key != "" {
-			tableKeys[key] = true
+	for assistID, infos := range assistByID {
+		for _, info := range infos {
+			if recoveryMode || info.historicalRows || info.orphanRecovery || info.recoveryMode {
+				ensure(info.table.ID)
+				if coverageDebug {
+					fmt.Fprintf(os.Stderr, "[coverage-debug] table=%s.%s assist=%d hist=%v orphan=%v recov=%v dataStorageID=%d storageKnown=%v\n",
+						info.table.Owner, info.table.Name, assistID, info.historicalRows, info.orphanRecovery, info.recoveryMode, info.dataStorageID, info.storageKnown)
+				}
+			}
 		}
 	}
+	for assistID, infos := range assistByID {
+		for i := range infos {
+			if state := states[infos[i].table.ID]; state != nil {
+				infos[i].coverage = state
+			}
+		}
+		assistByID[assistID] = infos
+	}
+	for unitID, info := range storageUnits {
+		if state := states[info.table.ID]; state != nil {
+			info.coverage = state
+			storageUnits[unitID] = info
+		}
+	}
+	return states
 }
 
 func singleSelectedDataTable(tables map[uint32]dataTableInfo) (dataTableInfo, bool) {
