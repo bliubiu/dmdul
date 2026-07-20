@@ -1883,7 +1883,7 @@ func renderRoutines(out *strings.Builder, routines []DictionaryRoutine) {
 				quoteIdent(routine.Name))
 			continue
 		}
-		out.WriteString(ensureSQLTerminator(sql))
+		out.WriteString(ensurePLSQLBlockTerminator(sql))
 		out.WriteString("\n\n")
 	}
 }
@@ -1899,7 +1899,7 @@ func renderTriggers(out *strings.Builder, triggers []DictionaryTrigger) {
 			fmt.Fprintf(out, "-- WARNING: trigger text not recovered for %s.%s\n", quoteIdent(trigger.Owner), quoteIdent(trigger.Name))
 			continue
 		}
-		out.WriteString(ensureSQLTerminator(sql))
+		out.WriteString(ensurePLSQLBlockTerminator(sql))
 		out.WriteString("\n\n")
 	}
 }
@@ -1946,6 +1946,15 @@ func ensureSQLTerminator(sql string) string {
 		return sql
 	}
 	return sql + ";"
+}
+
+// ensurePLSQLBlockTerminator ends a PL/SQL object body (trigger, procedure,
+// function, package) with a "/" batch terminator on its own line. In disql the
+// trailing ";" belongs to the block body, so without "/" every statement that
+// follows is silently appended to the block buffer instead of being executed.
+// DMP metadata records are executed per record by dimp and must NOT carry "/".
+func ensurePLSQLBlockTerminator(sql string) string {
+	return ensureSQLTerminator(sql) + "\n/"
 }
 
 func cleanRecoveredSQLText(sql string) string {

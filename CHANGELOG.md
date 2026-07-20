@@ -12,6 +12,31 @@ v主版本.次版本.修订版本
 
 ------
 
+## 未发布
+
+### Fixed
+
+- 修复 DDL SQL 输出中触发器、过程、函数、包等 PL/SQL 块缺少 `/` 批终结符的问题。
+  此前生成的 `_ddl.sql` / `objects.sql` 在 disql 中执行时，PL/SQL 块之后的所有语句
+  会被静默吞入语句缓冲区（最终以 "input too long" 失败），导致后续建表和数据导入
+  级联失败。DMP 元数据记录由 dimp 逐条执行，不受影响也不添加 `/`。
+- 版本 fallback 字符串从 v0.5.4 更新为 v0.5.5。
+
+### Added
+
+- SQL 导出新增超长语句告警：单条 INSERT 超过 disql 160 KiB 输入缓冲
+  （实测 DM8 build 2025-01-17 上限为 163840 字节）时，导出结束时提示受影响表，
+  并建议使用 JDBC/ODBC 客户端导入或改用 `data_format dmp`。disql 会用
+  "input too long" 中止此类语句并静默丢行，多见于行外大 LOB 表。
+
+### Validation
+
+- 在 DM8 build 2025-01-17（192.168.17.37 快照）上完成回归：DULTEST 9 表
+  53064 行 SQL/DMP 双通道导出导回，MINUS 逐行比对一致（唯一差异为已告警的
+  TIME 小数秒清零）；修复后的 DDL 含触发器场景经 disql 全量导入零报错。
+
+------
+
 ## v0.5.5 - Logical Export Engine
 
 本版本把早期“SQL DDL + 每表纯数据 DMP”升级为与达梦逻辑导出语义对应的原生逻辑

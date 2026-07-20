@@ -83,6 +83,11 @@ type DataExportResult struct {
 	RecoverySources      []DataRecoverySource
 	OutputFormat         string
 	TimeFractionLoss     int
+	// OversizedSQLStatements counts generated SQL INSERT statements longer
+	// than disql's 160 KiB input buffer; disql aborts such statements with
+	// "input too long", silently losing the row on import.
+	OversizedSQLStatements int
+	OversizedSQLTables     []string
 }
 
 type DataTableOutput struct {
@@ -269,7 +274,16 @@ type dataOutputRouter struct {
 	tableOutputsByID map[uint32]DataTableOutput
 	dmpConfig        dataDMPOutputConfig
 	dmpWritersByID   map[uint32]*DMPDataWriter
+
+	oversizedSQLRows     int
+	oversizedSQLTableIDs map[uint32]string
 }
+
+// disqlMaxStatementBytes is disql's single-statement input buffer (160 KiB,
+// measured against DM8 build 2025-01-17: 163840-byte statements execute,
+// longer ones abort with "input too long"). SQL exports whose INSERT exceeds
+// this cannot be replayed through disql; DMP/dimp has no such limit.
+const disqlMaxStatementBytes = 160 << 10
 
 func newDataOutputRouter(opts DataExportOptions, outputFormat string, selectedTables map[uint32]dataTableInfo, dmpConfigs ...dataDMPOutputConfig) (*dataOutputRouter, error) {
 	router := &dataOutputRouter{
@@ -554,6 +568,13 @@ func (r *dataOutputRouter) writeRow(table dataTableInfo, line string, record []s
 		}
 		return nil
 	}
+	if len(line) > disqlMaxStatementBytes {
+		r.oversizedSQLRows++
+		if r.oversizedSQLTableIDs == nil {
+			r.oversizedSQLTableIDs = make(map[uint32]string)
+		}
+		r.oversizedSQLTableIDs[table.table.ID] = table.table.Owner + "." + table.table.Name
+	}
 	if _, err := fmt.Fprintln(target.writer, line); err != nil {
 		return fmt.Errorf("write sql row: %w", err)
 	}
@@ -572,6 +593,18 @@ func (r *dataOutputRouter) writeFailure(table dataTableInfo, message string) err
 		return fmt.Errorf("write failed-row comment: %w", err)
 	}
 	return nil
+}
+
+func sortedOversizedSQLTables(byID map[uint32]string) []string {
+	if len(byID) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(byID))
+	for _, name := range byID {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func (r *dataOutputRouter) tableOutputs() []DataTableOutput {
@@ -1274,6 +1307,8 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 		}
 	}
 	result.TableOutputs = output.tableOutputs()
+	result.OversizedSQLStatements = output.oversizedSQLRows
+	result.OversizedSQLTables = sortedOversizedSQLTables(output.oversizedSQLTableIDs)
 	if (outputFormat == "csv" || outputFormat == "dmp") && opts.TableOutputPath == nil && result.RowsExported == 0 {
 		result.OutputPath = ""
 	}

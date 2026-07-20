@@ -2067,3 +2067,28 @@ func putTestDMNullPageRef(page []byte, offset int) {
 		page[offset+i] = 0xFF
 	}
 }
+
+func TestWriteRowCountsOversizedSQLStatements(t *testing.T) {
+	dir := t.TempDir()
+	table := dataTableInfo{table: dictionaryObject{ID: 77, Owner: "APP", Name: "T_LOB"}}
+	router, err := newDataOutputRouter(DataExportOptions{OutputPath: filepath.Join(dir, "out.sql")}, "sql", map[uint32]dataTableInfo{77: table})
+	if err != nil {
+		t.Fatalf("newDataOutputRouter failed: %v", err)
+	}
+	defer router.close()
+	small := "INSERT INTO APP.T_LOB VALUES (1, 'x');"
+	big := "INSERT INTO APP.T_LOB VALUES (2, '" + strings.Repeat("a", disqlMaxStatementBytes) + "');"
+	if err := router.writeRow(table, small, nil); err != nil {
+		t.Fatalf("writeRow(small) failed: %v", err)
+	}
+	if err := router.writeRow(table, big, nil); err != nil {
+		t.Fatalf("writeRow(big) failed: %v", err)
+	}
+	if router.oversizedSQLRows != 1 {
+		t.Fatalf("oversizedSQLRows = %d, want 1", router.oversizedSQLRows)
+	}
+	tables := sortedOversizedSQLTables(router.oversizedSQLTableIDs)
+	if len(tables) != 1 || tables[0] != "APP.T_LOB" {
+		t.Fatalf("oversized tables = %v, want [APP.T_LOB]", tables)
+	}
+}

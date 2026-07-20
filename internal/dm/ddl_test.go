@@ -397,3 +397,22 @@ func putUint32LE(dst []byte, value uint32) {
 	dst[2] = byte(value >> 16)
 	dst[3] = byte(value >> 24)
 }
+
+func TestRenderTriggersAndRoutinesEmitPLSQLSlashTerminator(t *testing.T) {
+	var out strings.Builder
+	renderTriggers(&out, []DictionaryTrigger{{
+		Owner: "APP", Name: "TRG1", TableOwner: "APP", TableName: "T1",
+		SQL: "create or replace trigger APP.TRG1 before insert on APP.T1 for each row\nbegin\n  null;\nend;",
+	}})
+	renderRoutines(&out, []DictionaryRoutine{{
+		Owner: "APP", Name: "P1", ObjectType: "PROCEDURE",
+		SQL: "create or replace procedure APP.P1 as\nbegin\n  null;\nend;",
+	}})
+	got := out.String()
+	if !strings.Contains(got, "end;\n/\n") {
+		t.Fatalf("PL/SQL blocks must be followed by a '/' line for disql, got:\n%s", got)
+	}
+	if strings.Count(got, "\n/\n") != 2 {
+		t.Fatalf("expected 2 '/' terminators (trigger + procedure), got:\n%s", got)
+	}
+}

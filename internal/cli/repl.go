@@ -1420,6 +1420,10 @@ func printDataExportWarnings(stdout io.Writer, result *dm.DataExportResult) {
 	if result.TimeFractionLoss > 0 {
 		fmt.Fprintf(stdout, "warning: TIME fractional seconds are not representable in DM DMP and were cleared in %d row(s)\n", result.TimeFractionLoss)
 	}
+	if result.OversizedSQLStatements > 0 {
+		fmt.Fprintf(stdout, "warning: %d INSERT statement(s) exceed disql's 160 KiB input buffer (tables: %s); disql aborts them with \"input too long\", so import this SQL with a JDBC/ODBC client or re-export with data_format dmp\n",
+			result.OversizedSQLStatements, strings.Join(result.OversizedSQLTables, ", "))
+	}
 	for _, source := range result.RecoverySources {
 		if source.Heuristic {
 			fmt.Fprintln(stdout, "warning: orphan storage ownership is heuristic; verify recovery source evidence before import")
