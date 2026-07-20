@@ -1,0 +1,325 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1580 1120" font-family="'PingFang SC','Hiragino Sans GB','Microsoft YaHei','Noto Sans CJK SC',sans-serif">
+  <defs>
+    <marker id="arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
+    </marker>
+    <marker id="arrowOrange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#f97316"/>
+    </marker>
+    <marker id="arrowPurple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#8b5cf6"/>
+    </marker>
+    <marker id="arrowBlue2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2563eb"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1580" height="1120" fill="#ffffff"/>
+
+  <!-- Title -->
+  <text x="24" y="44" font-size="30" font-weight="700" fill="#111827">DM8 8K 数据页示意图（8192 Bytes）</text>
+  <text x="24" y="72" font-size="15" fill="#374151">基于 dmdul 研究与实验的结构化示意，不同版本细节可能略有差异</text>
+
+  <!-- Ruler -->
+  <text x="30" y="106" font-size="13.5" font-weight="600" fill="#2563eb">低地址（起始）</text>
+  <text x="1454" y="106" font-size="13.5" font-weight="600" fill="#2563eb">高地址（结束）</text>
+  <text x="790" y="104" font-size="15" font-weight="600" fill="#111827" text-anchor="middle">一个 8K 数据页（固定 8192 Bytes）</text>
+  <line x1="200" y1="118" x2="700" y2="118" stroke="#2563eb" stroke-width="1.8" marker-start="url(#arrowBlue2)"/>
+  <line x1="880" y1="118" x2="1380" y2="118" stroke="#2563eb" stroke-width="1.8" marker-end="url(#arrowBlue2)"/>
+  <g font-size="12.5" fill="#374151">
+    <text x="24" y="140">字节偏移 (Byte Offset)</text>
+    <text x="24" y="158">0</text>
+    <text x="300" y="146" text-anchor="middle">128</text>
+    <text x="520" y="146" text-anchor="middle">256</text>
+    <text x="790" y="146" text-anchor="middle">… …</text>
+    <text x="1120" y="146" text-anchor="middle">8064</text>
+    <text x="1318" y="146" text-anchor="middle">8128</text>
+    <text x="1530" y="146" text-anchor="middle">8192</text>
+  </g>
+
+  <!-- ===== Five zones ===== -->
+  <!-- Page header -->
+  <g>
+    <rect x="24" y="166" width="276" height="248" rx="10" fill="#f0fdf4" stroke="#16a34a" stroke-width="2"/>
+    <text x="162" y="192" font-size="16" font-weight="700" fill="#166534" text-anchor="middle">页头 / Page Header</text>
+    <text x="162" y="212" font-size="12" fill="#475569" text-anchor="middle">固定（示例：0~127）</text>
+    <g font-size="12" fill="#1f2937">
+      <text x="44" y="236">• 页类型（数据页）</text>
+      <text x="44" y="256">• page id（页号）</text>
+      <text x="44" y="276">• object id / segment id</text>
+      <text x="44" y="296">• 前页指针 (Prev Page)</text>
+      <text x="44" y="316">• 后页指针 (Next Page)</text>
+      <text x="44" y="336">• 空闲空间指针 (free_ptr)</text>
+      <text x="44" y="356">• 行数 (row_count)</text>
+      <text x="44" y="376">• 校验/状态/版本等</text>
+      <text x="44" y="396">• 其他控制信息</text>
+    </g>
+  </g>
+
+  <!-- Row data area -->
+  <g>
+    <rect x="300" y="166" width="360" height="248" rx="10" fill="#fffbeb" stroke="#f59e0b" stroke-width="2"/>
+    <text x="480" y="192" font-size="16" font-weight="700" fill="#92400e" text-anchor="middle">行记录区 / Row Data Area</text>
+    <text x="480" y="212" font-size="12" fill="#475569" text-anchor="middle">从低地址向高地址增长</text>
+    <g font-size="13" fill="#78350f" text-anchor="middle">
+      <rect x="320" y="238" width="56" height="72" rx="6" fill="#ffffff" stroke="#fbbf24" stroke-width="1.4"/>
+      <text x="348" y="270">记录</text><text x="348" y="290">1</text>
+      <rect x="388" y="238" width="56" height="72" rx="6" fill="#ffffff" stroke="#fbbf24" stroke-width="1.4"/>
+      <text x="416" y="270">记录</text><text x="416" y="290">2</text>
+      <rect x="456" y="238" width="56" height="72" rx="6" fill="#ffffff" stroke="#fbbf24" stroke-width="1.4"/>
+      <text x="484" y="270">记录</text><text x="484" y="290">3</text>
+      <text x="548" y="280">……</text>
+      <rect x="584" y="238" width="56" height="72" rx="6" fill="#ffffff" stroke="#fbbf24" stroke-width="1.4"/>
+      <text x="612" y="270">记录</text><text x="612" y="290">N</text>
+    </g>
+    <line x1="330" y1="356" x2="628" y2="356" stroke="#f97316" stroke-width="5" marker-end="url(#arrowOrange)"/>
+  </g>
+
+  <!-- Free space -->
+  <g>
+    <rect x="660" y="166" width="300" height="248" rx="10" fill="#eff6ff" stroke="#3b82f6" stroke-width="2"/>
+    <text x="810" y="192" font-size="16" font-weight="700" fill="#1e40af" text-anchor="middle">空闲区 / Free Space</text>
+    <text x="810" y="212" font-size="12" fill="#475569" text-anchor="middle">被行记录区与槽数组夹在中间</text>
+    <rect x="700" y="252" width="220" height="70" rx="8" fill="none" stroke="#3b82f6" stroke-width="1.4" stroke-dasharray="6 4"/>
+    <text x="810" y="282" font-size="13.5" fill="#1e40af" text-anchor="middle">可分配空间</text>
+    <text x="810" y="304" font-size="12.5" fill="#1e40af" text-anchor="middle">（用于插入新记录）</text>
+  </g>
+
+  <!-- Slot directory -->
+  <g>
+    <rect x="960" y="166" width="352" height="248" rx="10" fill="#faf5ff" stroke="#8b5cf6" stroke-width="2"/>
+    <text x="1136" y="190" font-size="16" font-weight="700" fill="#5b21b6" text-anchor="middle">行指示器数组（槽数组）</text>
+    <text x="1136" y="210" font-size="14" font-weight="600" fill="#6d28d9" text-anchor="middle">/ Slot Directory</text>
+    <text x="1136" y="228" font-size="12" fill="#475569" text-anchor="middle">从高地址向低地址增长</text>
+    <g font-size="12.5" fill="#5b21b6" text-anchor="middle">
+      <rect x="980" y="244" width="54" height="66" rx="6" fill="#ffffff" stroke="#c4b5fd" stroke-width="1.4"/>
+      <text x="1007" y="272">槽 1</text><text x="1007" y="292">偏移</text>
+      <rect x="1044" y="244" width="54" height="66" rx="6" fill="#ffffff" stroke="#c4b5fd" stroke-width="1.4"/>
+      <text x="1071" y="272">槽 2</text><text x="1071" y="292">偏移</text>
+      <rect x="1108" y="244" width="54" height="66" rx="6" fill="#ffffff" stroke="#c4b5fd" stroke-width="1.4"/>
+      <text x="1135" y="272">槽 3</text><text x="1135" y="292">偏移</text>
+      <text x="1188" y="282">……</text>
+      <rect x="1222" y="244" width="54" height="66" rx="6" fill="#ffffff" stroke="#c4b5fd" stroke-width="1.4"/>
+      <text x="1249" y="272">槽 M</text><text x="1249" y="292">偏移</text>
+    </g>
+    <line x1="1282" y1="356" x2="1000" y2="356" stroke="#8b5cf6" stroke-width="5" marker-end="url(#arrowPurple)"/>
+  </g>
+
+  <!-- Tail -->
+  <g>
+    <rect x="1312" y="166" width="244" height="248" rx="10" fill="#fef2f2" stroke="#ef4444" stroke-width="2"/>
+    <text x="1434" y="192" font-size="16" font-weight="700" fill="#b91c1c" text-anchor="middle">页尾 / Tail（Footer）</text>
+    <text x="1434" y="212" font-size="12" fill="#475569" text-anchor="middle">固定（示例：8128~8191）</text>
+    <g font-size="12" fill="#1f2937">
+      <text x="1332" y="242">• 校验码（如 CRC）</text>
+      <text x="1332" y="264">• 页状态/标志位</text>
+      <text x="1332" y="286">• LSN / 事务版本</text>
+      <text x="1332" y="308">• 保留/扩展字段</text>
+      <text x="1332" y="330">• 其他尾部元数据</text>
+    </g>
+  </g>
+
+  <!-- Growth captions -->
+  <g font-size="12.5" text-anchor="middle">
+    <text x="162" y="440" fill="#166534">起点：固定管理信息</text>
+    <text x="480" y="440" fill="#92400e">从低地址向高地址增长</text>
+    <text x="810" y="440" fill="#1e40af">可用空间（动态变化）</text>
+    <text x="1136" y="440" fill="#5b21b6">从高地址向低地址增长</text>
+    <text x="1434" y="440" fill="#b91c1c">结尾：固定元数据</text>
+  </g>
+
+  <!-- Legend -->
+  <g font-size="12" fill="#374151">
+    <rect x="260" y="456" width="16" height="12" fill="#f0fdf4" stroke="#16a34a"/><text x="282" y="466">页头（固定）</text>
+    <rect x="400" y="456" width="16" height="12" fill="#fffbeb" stroke="#f59e0b"/><text x="422" y="466">行记录区（可变，向右增长）</text>
+    <rect x="620" y="456" width="16" height="12" fill="#eff6ff" stroke="#3b82f6"/><text x="642" y="466">空闲区（可变）</text>
+    <rect x="790" y="456" width="16" height="12" fill="#faf5ff" stroke="#8b5cf6"/><text x="812" y="466">槽数组（可变，向左增长）</text>
+    <rect x="1010" y="456" width="16" height="12" fill="#fef2f2" stroke="#ef4444"/><text x="1032" y="466">页尾（固定）</text>
+  </g>
+
+  <!-- ===== Row record structure panel ===== -->
+  <g>
+    <rect x="24" y="488" width="610" height="330" rx="12" fill="#fffbeb" stroke="#f59e0b" stroke-width="1.8"/>
+    <text x="44" y="518" font-size="16.5" font-weight="700" fill="#b45309">行记录结构（示意）</text>
+    <text x="44" y="540" font-size="12" fill="#475569">以下为一条行记录的内部组织示意（实际长度可变）</text>
+    <g font-size="11.5" fill="#6b7280">
+      <text x="44" y="566">偏移（相对记录起始）</text>
+      <text x="186" y="566">0</text>
+      <text x="268" y="566">2</text>
+      <text x="380" y="566">n</text>
+      <text x="470" y="566">n+…</text>
+      <text x="556" y="566">…</text>
+    </g>
+    <!-- segment boxes -->
+    <g font-size="12" text-anchor="middle">
+      <rect x="44" y="576" width="66" height="72" rx="6" fill="#fef2f2" stroke="#ef4444" stroke-width="1.4"/>
+      <text x="77" y="608" font-family="Consolas,monospace" font-weight="700" fill="#b91c1c">00 2E</text>
+      <rect x="118" y="576" width="110" height="72" rx="6" fill="#f0fdf4" stroke="#22c55e" stroke-width="1.4"/>
+      <text x="173" y="604" fill="#166534">行头/控制字段</text>
+      <text x="173" y="624" fill="#475569">（固定/可变）</text>
+      <rect x="236" y="576" width="106" height="72" rx="6" fill="#eff6ff" stroke="#3b82f6" stroke-width="1.4"/>
+      <text x="289" y="600" fill="#1e40af">NULL 位图/</text>
+      <text x="289" y="618" fill="#1e40af">标志位</text>
+      <text x="289" y="636" fill="#475569">（可选）</text>
+      <rect x="350" y="576" width="128" height="72" rx="6" fill="#fff7ed" stroke="#f97316" stroke-width="1.4"/>
+      <text x="414" y="604" fill="#9a3412">列数据负载</text>
+      <text x="414" y="624" fill="#475569">（定长/变长数据）</text>
+      <rect x="486" y="576" width="128" height="72" rx="6" fill="#faf5ff" stroke="#a855f7" stroke-width="1.4" stroke-dasharray="6 4"/>
+      <text x="550" y="600" fill="#6b21a8">变长字段溢出</text>
+      <text x="550" y="618" fill="#6b21a8">或后续数据</text>
+      <text x="550" y="636" fill="#475569">（可选）</text>
+    </g>
+    <!-- delete flag note -->
+    <rect x="44" y="662" width="180" height="66" rx="8" fill="#ffffff" stroke="#ef4444" stroke-width="1.4" stroke-dasharray="5 4"/>
+    <g font-size="11.8" fill="#b91c1c">
+      <text x="56" y="684">低 15 位：物理行长</text>
+      <text x="56" y="702">0x8000：DELETE 标志</text>
+      <text x="56" y="720">（2 字节，大端）</text>
+    </g>
+    <line x1="77" y1="648" x2="77" y2="662" stroke="#ef4444" stroke-width="1.2" stroke-dasharray="3 3"/>
+    <!-- trx tail note -->
+    <rect x="238" y="662" width="376" height="66" rx="8" fill="#ffffff" stroke="#a855f7" stroke-width="1.4" stroke-dasharray="5 4"/>
+    <g font-size="11.8" fill="#6b21a8">
+      <text x="252" y="684">可选 19 字节事务控制尾：</text>
+      <text x="252" y="704" font-family="Consolas,monospace">clu_rowid(6) + rollback address(7) + trx_id(6)</text>
+    </g>
+    <line x1="550" y1="648" x2="550" y2="662" stroke="#a855f7" stroke-width="1.2" stroke-dasharray="3 3"/>
+    <!-- bullets -->
+    <g font-size="11.8" fill="#1f2937">
+      <text x="44" y="756">• 行头包含删除标志、事务状态、列数量、偏移信息等（实现可能不同）</text>
+      <text x="44" y="778">• NULL 位图按列标识是否为 NULL（可能按字节对齐）</text>
+      <text x="44" y="800">• 列数据按类型定义顺序存储；变长字段使用长度前缀或偏移表</text>
+    </g>
+  </g>
+
+  <!-- ===== Page organization panel ===== -->
+  <g>
+    <rect x="650" y="488" width="280" height="330" rx="12" fill="#ffffff" stroke="#8b5cf6" stroke-width="1.8"/>
+    <text x="790" y="518" font-size="16.5" font-weight="700" fill="#5b21b6" text-anchor="middle">页内组织要点</text>
+    <g font-size="12.5" fill="#1f2937">
+      <text x="670" y="552">• 页大小固定 8192 字节</text>
+      <text x="670" y="584">• 低地址为页头与行数据起点</text>
+      <text x="670" y="616">• 高地址附近为槽数组/尾部元数据</text>
+      <text x="670" y="648">• 槽数组中的每个槽保存记录偏移</text>
+      <text x="682" y="668">（指向行记录的起始位置）</text>
+      <text x="670" y="700">• 删除或迁移后，槽与空闲空间</text>
+      <text x="682" y="720">管理会发生变化</text>
+      <text x="670" y="752">• 普通 unload 只按槽目录读取</text>
+      <text x="682" y="772">活动行（slot-only）</text>
+    </g>
+  </g>
+
+  <!-- ===== Read path panel ===== -->
+  <g>
+    <rect x="946" y="488" width="300" height="330" rx="12" fill="#ffffff" stroke="#0ea5e9" stroke-width="1.8"/>
+    <text x="1096" y="518" font-size="16.5" font-weight="700" fill="#0369a1" text-anchor="middle">读取路径（dmdul 视角）</text>
+    <g font-size="12.5" fill="#1f2937">
+      <text x="966" y="552">① 页头与校验（基本信息）</text>
+      <text x="966" y="586">② 行数 / 空闲指针</text>
+      <text x="966" y="620">③ 计算槽目录起点（考虑 HASH）</text>
+      <text x="966" y="654">④ 按槽定位记录偏移</text>
+      <text x="966" y="688">⑤ 跳转到行数据并解析</text>
+    </g>
+    <g stroke="#0ea5e9" stroke-width="1.6">
+      <line x1="976" y1="560" x2="976" y2="572" marker-end="url(#arrowBlue2)"/>
+      <line x1="976" y1="594" x2="976" y2="606" marker-end="url(#arrowBlue2)"/>
+      <line x1="976" y1="628" x2="976" y2="640" marker-end="url(#arrowBlue2)"/>
+      <line x1="976" y1="662" x2="976" y2="674" marker-end="url(#arrowBlue2)"/>
+    </g>
+    <rect x="962" y="712" width="268" height="90" rx="8" fill="#f0f9ff" stroke="#bae6fd"/>
+    <g font-size="11.8" fill="#075985">
+      <text x="974" y="734">说明：读取流程需结合 PAGE_CHECK 模式</text>
+      <text x="974" y="754">（详见右侧「页尾与页保护」）正确计算</text>
+      <text x="974" y="774">槽目录起点，确保定位准确。</text>
+    </g>
+  </g>
+
+  <!-- ===== Tail & page protection panel ===== -->
+  <g>
+    <rect x="1262" y="488" width="294" height="330" rx="12" fill="#ffffff" stroke="#dc2626" stroke-width="1.8"/>
+    <text x="1409" y="518" font-size="16.5" font-weight="700" fill="#b91c1c" text-anchor="middle">页尾与页保护（dmdul 实测）</text>
+    <g font-size="11.8" fill="#1f2937">
+      <text x="1280" y="546">每个 4 KiB 扇区边界前 4 字节</text>
+      <text x="1280" y="564">可能被页保护数据替换：</text>
+    </g>
+    <g font-size="11" text-anchor="middle">
+      <rect x="1280" y="576" width="150" height="30" rx="4" fill="#f8fafc" stroke="#94a3b8"/>
+      <text x="1355" y="595" fill="#475569">… 扇区数据 …</text>
+      <rect x="1434" y="576" width="104" height="30" rx="4" fill="#fee2e2" stroke="#ef4444"/>
+      <text x="1486" y="590" fill="#b91c1c">扇区边界前</text>
+      <text x="1486" y="602" fill="#b91c1c">4 字节</text>
+    </g>
+    <text x="1280" y="632" font-size="11.8" fill="#1f2937">原始 4 字节备份保存在页尾保留区：</text>
+    <g font-size="11" text-anchor="middle">
+      <rect x="1280" y="642" width="258" height="30" rx="4" fill="#fef9c3" stroke="#eab308"/>
+      <text x="1409" y="661" fill="#854d0e">页尾保留区（固定尾部之前）：原始 4 字节备份</text>
+    </g>
+    <text x="1280" y="694" font-size="11.8" fill="#1f2937">恢复时：从尾部备份还原到扇区边界前 4 字节</text>
+    <text x="1280" y="712" font-size="11" fill="#dc2626">（dmdul 仅对 SYSTEM.DBF 字典页执行此恢复）</text>
+    <rect x="1276" y="724" width="266" height="86" rx="8" fill="#fff1f2" stroke="#fda4af" stroke-dasharray="6 4"/>
+    <g font-size="11.8">
+      <text x="1288" y="744" font-weight="700" fill="#0f172a">PAGE_CHECK 模式（尾部标志设置）</text>
+      <text x="1288" y="762" fill="#1f2937">0：关闭；1：CRC32；2：HASH；3：CRC32C</text>
+      <text x="1288" y="782" fill="#dc2626">PAGE_CHECK=2：HASH 摘要位于固定尾部之前；</text>
+      <text x="1288" y="800" fill="#dc2626">槽目录起点随摘要长度前移。</text>
+    </g>
+  </g>
+
+  <!-- ===== Raw byte view ===== -->
+  <g>
+    <rect x="24" y="838" width="1532" height="216" rx="12" fill="#ffffff" stroke="#3b82f6" stroke-width="1.6" stroke-dasharray="8 5"/>
+    <text x="44" y="868" font-size="15.5" font-weight="700" fill="#1d4ed8">原始字节视图（示例）</text>
+    <g font-size="12" fill="#374151" font-family="Consolas,monospace">
+      <text x="44" y="896">偏移（十六进制）</text>
+      <text x="210" y="896">0000h</text>
+      <text x="440" y="896">0080h (128)</text>
+      <text x="680" y="896">0100h (256)</text>
+      <text x="850" y="896">……</text>
+      <text x="950" y="896">1F80h (8064)</text>
+      <text x="1180" y="896">1FC0h (8128)</text>
+      <text x="1400" y="896">1FFFh (8191)</text>
+    </g>
+    <text x="44" y="948" font-size="12.5" fill="#374151">Hex 数据</text>
+    <g font-size="12" font-family="Consolas,monospace">
+      <rect x="140" y="908" width="280" height="92" rx="4" fill="#f0fdf4" stroke="#86efac"/>
+      <g fill="#166534">
+        <text x="152" y="930">44 4D 38 00 | 01 00 00 00 | …</text>
+        <text x="152" y="952">10 27 00 00 | 20 1A 00 00 | …</text>
+        <text x="152" y="974">A0 1A 00 00 | 5C 00 00 00 | …</text>
+      </g>
+      <rect x="424" y="908" width="280" height="92" rx="4" fill="#fffbeb" stroke="#fde68a"/>
+      <g fill="#92400e">
+        <text x="436" y="930">00 2E 00 10 | 81 03 05 00 | …</text>
+        <text x="436" y="952">4A 6F 68 6E | 00 32 00 00 | …</text>
+        <text x="436" y="974">00 1A 00 08 | …  …  …</text>
+      </g>
+      <rect x="708" y="908" width="220" height="92" rx="4" fill="#eff6ff" stroke="#bfdbfe"/>
+      <g fill="#1e40af">
+        <text x="740" y="930">…  …  …  …</text>
+        <text x="726" y="952">（空闲区域，内容不确定）</text>
+        <text x="740" y="974">…  …  …  …</text>
+      </g>
+      <rect x="932" y="908" width="280" height="92" rx="4" fill="#faf5ff" stroke="#d8b4fe"/>
+      <g fill="#6b21a8">
+        <text x="944" y="930">34 1F 00 00 | 90 1B 00 00 | …</text>
+        <text x="944" y="952">58 17 00 00 | 20 10 00 00 | …</text>
+        <text x="944" y="974">E8 0E 00 00 | A0 0C 00 00 | …</text>
+      </g>
+      <rect x="1216" y="908" width="280" height="92" rx="4" fill="#fef2f2" stroke="#fecaca"/>
+      <g fill="#b91c1c">
+        <text x="1228" y="930">7A 3C 12 9B | 01 00 00 00 | …</text>
+        <text x="1228" y="952">5F 00 00 00 | 00 00 00 00 | …</text>
+        <text x="1228" y="974">…  …（页末最后字节）</text>
+      </g>
+    </g>
+    <g font-size="12" fill="#374151">
+      <text x="200" y="1030" fill="#166534">绿色：页头（固定 128B）</text>
+      <text x="470" y="1030" fill="#92400e">黄色：行记录区（向右增长）</text>
+      <text x="740" y="1030" fill="#1e40af">蓝色：空闲区（可变）</text>
+      <text x="960" y="1030" fill="#6b21a8">紫色：槽数组（向左增长）</text>
+      <text x="1230" y="1030" fill="#b91c1c">红色：页尾（固定 64B）</text>
+    </g>
+  </g>
+
+  <text x="24" y="1090" font-size="12.5" fill="#4b5563">注：以上结构为基于 dmdul 工具与实验观测的示意，不同版本、表类型、存储策略可能存在差异，请以实际版本为准。</text>
+</svg>

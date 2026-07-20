@@ -66,22 +66,31 @@ SYSTEM.DBF / dm.ctl / user tablespace DBF
 ## 存储结构理解
 
 下面两张示意图概括了 `dmdul` 当前采用的结构理解：第一张从 `SYSTEM.DBF` 文件布局出发，
-说明初始化参数、系统字典页以及 `SYSOBJECTS`、`SYSCOLUMNS`、`SYSCOLINFOS` 之间的关系；
+说明初始化参数、page 0 锚点以及 `SYSOBJECTS`、`SYSINDEXES` 与其他系统字典之间的关系；
 第二张进一步展示典型 8K 数据页中页头、行记录、空闲区、槽目录和页尾的组织方式。
 
 ### SYSTEM.DBF 与系统字典
 
-![SYSTEM.DBF 结构与数据字典定位示意图](docs/images/system-dbf-dictionary-map.png)
+![SYSTEM.DBF 结构与数据字典定位示意图](docs/images/system-dbf-dictionary-map.svg)
 
-这条链路解释了 `dmdul` 如何从原始文件和关键页入口定位系统字典，并逐步还原用户、表、
-列、类型、索引等结构化元数据。
+这条链路解释了 `dmdul` 如何从原始文件进入 `SYSOBJECTS` 与 `SYSINDEXES`，再沿
+`storage root -> internal refs -> leaf chain` 定位字典页，并逐步还原用户、表、列、
+类型和索引等结构化元数据。
+
+深入阅读：[SYSTEM.DBF 离线扫描与系统字典恢复](docs/offline-system-scan.md) ·
+[Standard Bootstrap 字典表下载](docs/bootstrap-standard-table-download.md)
 
 ### DM8 8K 数据页布局
 
-![DM8 8K 数据页结构示意图](docs/images/dm8-8k-data-page-layout.png)
+![DM8 8K 数据页结构示意图](docs/images/dm8-8k-data-page-layout.svg)
 
 行记录从低地址方向增长，槽目录通常从高地址方向增长；`dmdul` 读取页头和槽目录后，
-按记录偏移定位行数据并依据列定义完成解析。
+会结合 `PAGE_CHECK` 模式计算槽目录起点，按记录偏移定位行数据，并解析行长、删除标志、
+NULL 元数据、列值及可选事务控制尾。读取 `SYSTEM.DBF` 字典页时，还会从页尾保留区恢复
+4 KiB 扇区边界前被替换的原始字节；普通用户数据页保持磁盘原始字节。
+
+深入阅读：[DM8 普通行页格式研究](docs/row-page-format.md) ·
+[DM8 PAGE_CHECK 页校验实验](docs/page-check.md)
 
 > **说明：** 两图基于 `dmdul` 的研究与实验观察，用于帮助理解解析思路，并非达梦官方格式文档。
 > 不同数据库版本、表类型和存储策略的实际字段布局可能存在差异，请以目标文件的解析结果为准。
