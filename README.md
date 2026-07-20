@@ -18,7 +18,7 @@
 - 尝试恢复 `DELETE` / `DROP` / `TRUNCATE` 后尚未被覆盖的残留数据；
 - 处理大表、分区表、行外 LOB 和 `STORAGE(USING LONG ROW)` 场景。
 
-**v0.5.6 主题：disql Compatibility Fixes**
+**v0.5.7 主题：Scalable Unload**
 
 ![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go)
 ![License](https://img.shields.io/github/license/greatfinish/dmdul)
@@ -808,6 +808,7 @@ dul.log
 | v0.5.4 | 用户页原样读取、序列/分区修复、字典原子重建与可审计残留恢复 |
 | v0.5.5 | FULL/OWNER/SCHEMAS/TABLES 四级原生逻辑 DMP、模式字典与单文件元数据/数据导出 |
 | v0.5.6 | PL/SQL `/` 终结符修复、disql 160 KiB 超长语句告警 |
+| v0.5.7 | 千万行级内存修复、自动多核并行卸载、渲染热路径优化 |
 | v0.6.x | 迁移行/链式行、损坏页诊断、更多 DM8 版本兼容验证 |
 | v1.0.0 | 固化文件格式兼容矩阵、恢复报告和稳定发布流程 |
 
