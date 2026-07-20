@@ -1,7 +1,7 @@
 # dmdul
 
 <p align="center">
-  <img src="docs/images/dmdul-logo.png" width="480" alt="dmdul">
+  <img src="docs/images/dmdul-logo.svg" width="480" alt="dmdul">
 </p>
 
 **Dameng Database Offline Recovery & Data Unloader**
