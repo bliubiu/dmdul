@@ -1,7 +1,7 @@
 # dmdul
 
 <p align="center">
-  <img src="docs/images/dmdul-logo.svg" width="480" alt="dmdul">
+  <img src="docs/images/dmdul-logo.png" width="480" alt="dmdul">
 </p>
 
 **Dameng Database Offline Recovery & Data Unloader**
@@ -71,7 +71,7 @@ SYSTEM.DBF / dm.ctl / user tablespace DBF
 
 ### SYSTEM.DBF 与系统字典
 
-![SYSTEM.DBF 结构与数据字典定位示意图](docs/images/system-dbf-dictionary-map.svg)
+![SYSTEM.DBF 结构与数据字典定位示意图](docs/images/system-dbf-dictionary-map.png)
 
 这条链路解释了 `dmdul` 如何从原始文件进入 `SYSOBJECTS` 与 `SYSINDEXES`，再沿
 `storage root -> internal refs -> leaf chain` 定位字典页，并逐步还原用户、表、列、
@@ -82,7 +82,7 @@ SYSTEM.DBF / dm.ctl / user tablespace DBF
 
 ### DM8 8K 数据页布局
 
-![DM8 8K 数据页结构示意图](docs/images/dm8-8k-data-page-layout.svg)
+![DM8 8K 数据页结构示意图](docs/images/dm8-8k-data-page-layout.png)
 
 行记录从低地址方向增长，槽目录通常从高地址方向增长；`dmdul` 读取页头和槽目录后，
 会结合 `PAGE_CHECK` 模式计算槽目录起点，按记录偏移定位行数据，并解析行长、删除标志、
