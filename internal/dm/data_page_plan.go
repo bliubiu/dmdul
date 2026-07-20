@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 )
 
 const (
@@ -19,6 +20,9 @@ const (
 )
 
 type dataFilePageCache struct {
+	// mu guards every map below: parallel unload workers resolve LOB and
+	// Long Row chains through one shared cache while decoding pages.
+	mu       sync.Mutex
 	pageSize uint32
 	refs     map[dataFileKey]dataFileRef
 	sizes    map[dataFileKey]int64
@@ -118,11 +122,13 @@ func (c *dataFilePageCache) readPage(ref dataPageRef) ([]byte, bool) {
 	if c == nil || c.pageSize == 0 {
 		return nil, false
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if page, ok := c.pages[ref]; ok {
 		return page, true
 	}
 	pageSize := int(c.pageSize)
-	if pageSize <= 0 || int64(ref.pageNo) >= int64(c.pageCount(ref.key)) {
+	if pageSize <= 0 || int64(ref.pageNo) >= int64(c.pageCountLocked(ref.key)) {
 		return nil, false
 	}
 	file, ok := c.refs[ref.key]
@@ -153,6 +159,15 @@ func (c *dataFilePageCache) readPage(ref dataPageRef) ([]byte, bool) {
 }
 
 func (c *dataFilePageCache) pageCount(key dataFileKey) int {
+	if c == nil || c.pageSize == 0 {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.pageCountLocked(key)
+}
+
+func (c *dataFilePageCache) pageCountLocked(key dataFileKey) int {
 	if c == nil || c.pageSize == 0 {
 		return 0
 	}

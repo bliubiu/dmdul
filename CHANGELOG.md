@@ -29,16 +29,24 @@ v主版本.次版本.修订版本
 
 ### Added
 
+- **并行数据卸载**：page plan 直读阶段自动按页批次并行解码（worker 数取
+  `min(CPU 核数, 8)`，无需任何参数）。普通行页内自包含，按页并行天然安全；
+  行外 LOB 与 Long Row 页链由锚点行所属 worker 经互斥页缓存整链跟随，不拆链。
+  单一 writer 按批次序合并，输出与单线程逐字节一致（600 页合成样本 +
+  1000 万行实机 3.75 GiB 输出 MD5 双重验证）。MaxRows、恢复扫描与各级
+  fallback 保持顺序路径。`DMDUL_UNLOAD_WORKERS` 仅作为测试与应急开关。
+- SQL 行渲染热路径优化：每表 INSERT 前缀只构建一次，行内值用单个 Builder
+  拼接，消除逐行的列名引用、切片与 Join 分配。
 - 新增 env 门控的手工性能剖析测试（`DMDUL_PROFILE_DIR`）与
   `DMDUL_DEBUG_COVERAGE` 覆盖键诊断输出。
 
 ### Validation
 
 - DM8 build 2025-01-17（4C/4GiB 主机）：MOCK.T_CUSTOMER_MOCK 1000 万行 2.13 GiB
-  表空间，SQL 卸载 228 秒（3.75 GiB / 精确 1000 万条 INSERT / 0 失败 / 223712 页
-  全部 page plan 直读），DMP 卸载 347 秒（1.78 GiB）；修复前同场景 OOM。
-  本地剖析堆峰值 47 GiB → 152 MiB。DULTEST 九表 53064 行回归含 ALTER 历史行
-  语义不变。
+  表空间，223712 页全部 page plan 直读、0 失败；修复与并行前后对比：
+  SQL 卸载 修复前 OOM → 单线程 228 秒 → 并行 87 秒（输出 MD5 与单线程一致），
+  DMP 卸载 347 秒 → 175 秒；8 worker 本机 SQL 49 秒。本地剖析堆峰值
+  47 GiB → 240 MiB。DULTEST 九表 53064 行回归含 ALTER 历史行语义不变。
 
 ------
 

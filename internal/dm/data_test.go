@@ -2153,8 +2153,8 @@ func TestTableCoverageStateOverflowStopsTracking(t *testing.T) {
 		state.keys[fmt.Sprintf("k%d", i)] = true
 	}
 	state.mark([]string{"final-key"})
-	if !state.overflow || state.keys != nil {
-		t.Fatalf("state must overflow and drop keys at the cap: overflow=%v keysNil=%v", state.overflow, state.keys == nil)
+	if !state.overflow.Load() || state.keys != nil {
+		t.Fatalf("state must overflow and drop keys at the cap: overflow=%v keysNil=%v", state.overflow.Load(), state.keys == nil)
 	}
 	if state.active() {
 		t.Fatalf("overflowed state must not stay active")
@@ -2162,5 +2162,58 @@ func TestTableCoverageStateOverflowStopsTracking(t *testing.T) {
 	state.mark([]string{"later"})
 	if state.covered("later") || state.covered("final-key") {
 		t.Fatalf("overflowed state must not report coverage")
+	}
+}
+
+func TestParallelDirectUnloadMatchesSequentialOutput(t *testing.T) {
+	dir := t.TempDir()
+	systemPath := filepath.Join(dir, "SYSTEM.DBF")
+	writeDataExportTestSystem(t, systemPath)
+	const storageID = 33555438
+	const pageCount = 600
+	raw := make([]byte, (16+pageCount)*8192)
+	putTestDMPageHeader(raw[:8192], 4, 0, 0, 0, 0)
+	for i := 0; i < pageCount; i++ {
+		pageNo := uint32(16 + i)
+		page := raw[int(pageNo)*8192 : (int(pageNo)+1)*8192]
+		putTestIntDataPage(page, 4, 0, pageNo, storageID, int32(1000+i))
+		if i < pageCount-1 {
+			putTestDMPageRef(page, dmPageNextRefOff, 0, pageNo+1)
+		} else {
+			putTestDMNullPageRef(page, dmPageNextRefOff)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "MAIN.DBF"), raw, 0644); err != nil {
+		t.Fatal(err)
+	}
+	dict := testDataExportDictionary(systemPath, storageID, 16, 0, 0)
+	run := func(workers string, out string) (*DataExportResult, string) {
+		t.Setenv("DMDUL_UNLOAD_WORKERS", workers)
+		result, err := ExportData(DataExportOptions{
+			SystemPath: systemPath, DataDir: dir, OutputPath: filepath.Join(dir, out),
+			OwnerFilter: "APP", TableFilter: "APP.T_PLAN", Charset: "utf-8", Dictionary: dict,
+		})
+		if err != nil {
+			t.Fatalf("ExportData(workers=%s) failed: %v", workers, err)
+		}
+		return result, readDataExportTestFile(t, filepath.Join(dir, out))
+	}
+	seqResult, seqSQL := run("1", "seq.sql")
+	parResult, parSQL := run("4", "par.sql")
+	if seqResult.DirectPagesRead != pageCount || seqResult.RowsExported != pageCount {
+		t.Fatalf("sequential run did not direct-read the full plan: %+v", seqResult)
+	}
+	if parResult.DirectPagesRead != seqResult.DirectPagesRead ||
+		parResult.RowsExported != seqResult.RowsExported ||
+		parResult.RowsFailed != seqResult.RowsFailed ||
+		parResult.PagesScanned != seqResult.PagesScanned ||
+		parResult.FallbackPagesScanned != seqResult.FallbackPagesScanned {
+		t.Fatalf("parallel counters diverge: seq=%+v par=%+v", seqResult, parResult)
+	}
+	if seqSQL != parSQL {
+		t.Fatalf("parallel output is not byte-identical to sequential output (len %d vs %d)", len(seqSQL), len(parSQL))
+	}
+	if !strings.Contains(parSQL, "VALUES (1000)") || !strings.Contains(parSQL, fmt.Sprintf("VALUES (%d)", 1000+pageCount-1)) {
+		t.Fatalf("parallel output is missing boundary rows")
 	}
 }

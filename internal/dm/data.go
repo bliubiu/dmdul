@@ -15,6 +15,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 )
 
 const (
@@ -165,6 +167,10 @@ type dataTableInfo struct {
 	recoveryGroupID uint32
 	segment         tableSegment
 	segmentKnown    bool
+	// sqlInsertPrefix caches `INSERT INTO "O"."T" ("c1", ...) VALUES (` so
+	// the per-row SQL renderer does not rebuild and re-quote the identical
+	// column list for every row.
+	sqlInsertPrefix string
 	// coverage tracks per-row column-prefix keys, which deduplicate
 	// ALTER-history partial rows against full rows when the same logical row
 	// can be visited through more than one storage (historical assists,
@@ -180,19 +186,21 @@ type dataTableInfo struct {
 // count reaches maxCoverageKeysPerTable the map is dropped and key generation
 // stops; pending partial rows are then emitted without full-row dedup and the
 // export reports it, instead of the process dying on multi-GB key maps.
+// overflow is atomic because parallel decode workers consult active() while
+// the writer goroutine marks keys; the keys map itself is writer-only.
 type tableCoverageState struct {
 	keys     map[string]bool
-	overflow bool
+	overflow atomic.Bool
 }
 
 const maxCoverageKeysPerTable = 2_000_000
 
 func (s *tableCoverageState) active() bool {
-	return s != nil && !s.overflow
+	return s != nil && !s.overflow.Load()
 }
 
 func (s *tableCoverageState) mark(keys []string) {
-	if s == nil || s.overflow || len(keys) == 0 {
+	if s == nil || s.overflow.Load() || len(keys) == 0 {
 		return
 	}
 	if s.keys == nil {
@@ -204,7 +212,7 @@ func (s *tableCoverageState) mark(keys []string) {
 		}
 	}
 	if len(s.keys) >= maxCoverageKeysPerTable {
-		s.overflow = true
+		s.overflow.Store(true)
 		s.keys = nil
 	}
 }
@@ -899,6 +907,7 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 			recoveryGroupID: dictionaryTableGroupID(dictionaryTables, tableID),
 			segment:         segmentByTableID(opts.Dictionary, tableID),
 			segmentKnown:    hasSegmentRange(opts.Dictionary, tableID),
+			sqlInsertPrefix: sqlInsertPrefixForTable(table, columnsByTable[tableID]),
 		}
 		selectedTables[tableID] = baseInfo
 		storageUnits[tableID] = baseInfo
@@ -1091,20 +1100,7 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 			rowStart := int(row.offset)
 			rowEnd := rowStart + int(row.length)
 			rowBytes := append([]byte(nil), page[rowStart:rowEnd]...)
-			var line string
-			var record []string
-			var fields []DMPField
-			var meta dataRowRenderMeta
-			var timeFractionLoss bool
-			var err error
-			switch outputFormat {
-			case "csv":
-				record, _, _, meta, err = renderCSVForDataRowWithMeta(info, rowBytes, decoder)
-			case "dmp":
-				fields, _, _, meta, timeFractionLoss, err = renderDMPForDataRowWithMeta(info, rowBytes, decoder, dmpConfig.charset)
-			default:
-				line, _, _, meta, err = renderInsertForDataRowWithMeta(info, rowBytes, decoder)
-			}
+			line, record, fields, meta, timeFractionLoss, err := renderDataRowForExport(outputFormat, info, rowBytes, decoder, dmpConfig.charset)
 			stats := rowStats[info.table.ID]
 			if stats != nil {
 				stats.RowsLocated++
@@ -1162,6 +1158,159 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 		return nil
 	}
 
+	// applyDirectResult replays one decoded page's bookkeeping and output on
+	// the writer side, in plan order, mirroring the sequential loop exactly.
+	applyDirectResult := func(res *directPageResult) error {
+		ref := res.ref
+		candidates := directCandidates[ref]
+		if res.readErr != nil {
+			markFailedPlanUnits(failedPlanUnits, candidates)
+			addFallbackReason(formatDirectPageFailure(ref, res.readErr))
+			return nil
+		}
+		result.DirectPagesRead++
+		result.PagesScanned++
+		touchedFiles[ref.key] = true
+		if res.validationFailed {
+			markFailedPlanUnits(failedPlanUnits, candidates)
+			addFallbackReason(formatDirectPageFailure(ref, fmt.Errorf("page identity, kind, or storage_id validation failed")))
+			return nil
+		}
+		if res.skipped {
+			processedDirectPages[ref] = true
+			return nil
+		}
+		if res.orphanReason != "" {
+			addFallbackReason(res.orphanReason)
+		}
+		info := res.info
+		stats := rowStats[info.table.ID]
+		located, exported, failed := 0, 0, 0
+		for i := range res.rows {
+			row := &res.rows[i]
+			result.RowsLocated++
+			located++
+			if stats != nil {
+				stats.RowsLocated++
+			}
+			if row.failed {
+				result.RowsFailed++
+				failed++
+				if stats != nil {
+					stats.RowsFailed++
+				}
+				if opts.WriteFailedComments && row.failMsg != "" {
+					if err := output.writeFailure(info, row.failMsg); err != nil {
+						return err
+					}
+				}
+				continue
+			}
+			if row.meta.partial {
+				pendingPartialRows = append(pendingPartialRows, pendingPartialDataRow{
+					tableID:          info.table.ID,
+					line:             row.line,
+					record:           row.record,
+					fields:           row.fields,
+					timeFractionLoss: row.timeFractionLoss,
+					stats:            stats,
+					meta:             row.meta,
+				})
+				continue
+			}
+			if row.timeFractionLoss {
+				result.TimeFractionLoss++
+			}
+			coverageStates[info.table.ID].mark(row.meta.coverageKeys)
+			result.RowsExported++
+			exported++
+			if stats != nil {
+				stats.RowsExported++
+			}
+			if err := output.writeRow(info, row.line, row.record, row.fields); err != nil {
+				return err
+			}
+		}
+		recordRecoverySource(info, dataFileRefForKey(dataFiles, ref.key), ref.pageNo, res.storageID, located, exported, failed)
+		processedDirectPages[ref] = true
+		return nil
+	}
+
+	// runParallelDirect fans page decoding out to workers and applies results
+	// in plan order so output stays byte-identical to the sequential path.
+	runParallelDirect := func(refs []dataPageRef, workers int) error {
+		type directJob struct {
+			idx  int
+			refs []dataPageRef
+		}
+		type directBatch struct {
+			idx     int
+			results []directPageResult
+		}
+		batchCount := (len(refs) + directDecodeBatchPages - 1) / directDecodeBatchPages
+		jobs := make(chan directJob)
+		resultsCh := make(chan directBatch, workers*2)
+		var wg sync.WaitGroup
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				reader := newDataFilePageReader(dataFiles, pageSize)
+				defer func() { _ = reader.close() }()
+				for job := range jobs {
+					batch := directBatch{idx: job.idx, results: make([]directPageResult, 0, len(job.refs))}
+					for _, ref := range job.refs {
+						batch.results = append(batch.results, decodeDirectPlannedRef(
+							reader, ref, dataFileRefForKey(dataFiles, ref.key), directCandidates[ref],
+							pageSize, decoder, outputFormat, dmpConfig.charset, opts.WriteFailedComments))
+					}
+					resultsCh <- batch
+				}
+			}()
+		}
+		go func() {
+			for i := 0; i < batchCount; i++ {
+				lo := i * directDecodeBatchPages
+				hi := lo + directDecodeBatchPages
+				if hi > len(refs) {
+					hi = len(refs)
+				}
+				jobs <- directJob{idx: i, refs: refs[lo:hi]}
+			}
+			close(jobs)
+		}()
+		go func() {
+			wg.Wait()
+			close(resultsCh)
+		}()
+		// Jobs are handed out in order, so the reorder buffer stays small
+		// (bounded by worker skew); batches are applied strictly in order.
+		reorder := make(map[int][]directPageResult, workers*2)
+		next := 0
+		var applyErr error
+		for batch := range resultsCh {
+			reorder[batch.idx] = batch.results
+			for {
+				results, ok := reorder[next]
+				if !ok {
+					break
+				}
+				delete(reorder, next)
+				next++
+				if applyErr != nil {
+					continue
+				}
+				for i := range results {
+					if err := applyDirectResult(&results[i]); err != nil {
+						applyErr = err
+						break
+					}
+				}
+			}
+		}
+		return applyErr
+	}
+
 	pageReader := newDataFilePageReader(dataFiles, pageSize)
 	defer func() { _ = pageReader.close() }()
 
@@ -1212,34 +1361,43 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 			}
 		}
 	} else {
-		for _, ref := range sortedDataPageRefs(plannedRefs) {
-			if stop {
-				break
-			}
-			candidates := directCandidates[ref]
-			page, readErr := pageReader.readPage(ref)
-			if readErr != nil {
-				markFailedPlanUnits(failedPlanUnits, candidates)
-				addFallbackReason(formatDirectPageFailure(ref, readErr))
-				continue
-			}
-			result.DirectPagesRead++
-			result.PagesScanned++
-			touchedFiles[ref.key] = true
-			if !plannedDataPageMatches(page, ref, candidates) {
-				markFailedPlanUnits(failedPlanUnits, candidates)
-				addFallbackReason(formatDirectPageFailure(ref, fmt.Errorf("page identity, kind, or storage_id validation failed")))
-				continue
-			}
-			file := dataFileRefForKey(dataFiles, ref.key)
-			if err := processPage(file, ref.pageNo, page, candidates); err != nil {
-				if err == errStopPageScan {
-					stop = true
-					break
-				}
+		directRefs := sortedDataPageRefs(plannedRefs)
+		workers := exportWorkerCount()
+		// MaxRows keeps the sequential path so the early stop stays exact.
+		if workers > 1 && opts.MaxRows == 0 && len(directRefs) >= directDecodeBatchPages {
+			if err := runParallelDirect(directRefs, workers); err != nil {
 				return nil, err
 			}
-			processedDirectPages[ref] = true
+		} else {
+			for _, ref := range directRefs {
+				if stop {
+					break
+				}
+				candidates := directCandidates[ref]
+				page, readErr := pageReader.readPage(ref)
+				if readErr != nil {
+					markFailedPlanUnits(failedPlanUnits, candidates)
+					addFallbackReason(formatDirectPageFailure(ref, readErr))
+					continue
+				}
+				result.DirectPagesRead++
+				result.PagesScanned++
+				touchedFiles[ref.key] = true
+				if !plannedDataPageMatches(page, ref, candidates) {
+					markFailedPlanUnits(failedPlanUnits, candidates)
+					addFallbackReason(formatDirectPageFailure(ref, fmt.Errorf("page identity, kind, or storage_id validation failed")))
+					continue
+				}
+				file := dataFileRefForKey(dataFiles, ref.key)
+				if err := processPage(file, ref.pageNo, page, candidates); err != nil {
+					if err == errStopPageScan {
+						stop = true
+						break
+					}
+					return nil, err
+				}
+				processedDirectPages[ref] = true
+			}
 		}
 
 		storageCandidates, fallbackGroups, fallbackUnits := buildStorageFallbackCandidates(assistByID, plannedUnits, failedPlanUnits)
@@ -1341,7 +1499,7 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 		if state.covered(pending.meta.prefixKey, pending.meta.weakPrefixKey) {
 			continue
 		}
-		if state != nil && state.overflow && !coverageOverflowWarned[pending.tableID] {
+		if state != nil && state.overflow.Load() && !coverageOverflowWarned[pending.tableID] {
 			coverageOverflowWarned[pending.tableID] = true
 			if info, ok := selectedTables[pending.tableID]; ok {
 				addFallbackReason(fmt.Sprintf("%s.%s row coverage tracking exceeded %d keys; partial rows were emitted without full-row dedup, verify duplicates before import", info.table.Owner, info.table.Name, maxCoverageKeysPerTable))
@@ -2503,33 +2661,54 @@ func renderInsertForDataRow(info dataTableInfo, row []byte, decoder textDecoder)
 	return line, dataStart, dataEnd, err
 }
 
+// sqlInsertPrefixForTable renders the per-table constant INSERT frame once so
+// the hot per-row path only appends values.
+func sqlInsertPrefixForTable(table dictionaryObject, columns []columnDef) string {
+	var b strings.Builder
+	b.WriteString("INSERT INTO ")
+	b.WriteString(quoteIdent(table.Owner))
+	b.WriteByte('.')
+	b.WriteString(quoteIdent(table.Name))
+	b.WriteString(" (")
+	for i, col := range columns {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(quoteIdent(col.Name))
+	}
+	b.WriteString(") VALUES (")
+	return b.String()
+}
+
 func renderInsertForDataRowWithMeta(info dataTableInfo, row []byte, decoder textDecoder) (string, int, int, dataRowRenderMeta, error) {
 	values, dataStart, dataEnd, err := parseDataRowValues(row, info.columns, decoder, info.historicalRows, info.lobReader)
 	if err != nil {
 		return "", 0, 0, dataRowRenderMeta{}, err
 	}
-	cols := make([]string, 0, len(info.columns))
-	vals := make([]string, 0, len(info.columns))
-	for _, col := range info.columns {
-		cols = append(cols, quoteIdent(col.Name))
+	prefix := info.sqlInsertPrefix
+	if prefix == "" {
+		prefix = sqlInsertPrefixForTable(info.table, info.columns)
+	}
+	var b strings.Builder
+	b.Grow(len(prefix) + 32*len(info.columns))
+	b.WriteString(prefix)
+	for i, col := range info.columns {
+		if i > 0 {
+			b.WriteString(", ")
+		}
 		value, ok := values[col.ColID]
 		if !ok {
-			vals = append(vals, "NULL")
+			b.WriteString("NULL")
 			continue
 		}
 		sqlValue, err := sqlValueForDataColumn(col, value.value)
 		if err != nil {
 			return "", 0, 0, dataRowRenderMeta{}, err
 		}
-		vals = append(vals, sqlValue)
+		b.WriteString(sqlValue)
 	}
-	sql := fmt.Sprintf("INSERT INTO %s.%s (%s) VALUES (%s);",
-		quoteIdent(info.table.Owner),
-		quoteIdent(info.table.Name),
-		strings.Join(cols, ", "),
-		strings.Join(vals, ", "),
-	)
-	return sql, dataStart, dataEnd, dataRowRenderMetaForValues(info.columns, values, info.coverage.active()), nil
+	b.WriteString(");")
+	return b.String(), dataStart, dataEnd, dataRowRenderMetaForValues(info.columns, values, info.coverage.active()), nil
 }
 
 func renderCSVForDataRow(info dataTableInfo, row []byte, decoder textDecoder) ([]string, int, int, error) {
