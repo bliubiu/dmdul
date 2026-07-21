@@ -425,14 +425,14 @@ func TestDMPDataWriterUsesUint64ForFieldsOver4GiB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDMPDataWriter failed: %v", err)
 	}
-	start, err := writer.file.Seek(0, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
+	start := int64(writer.offset)
 	length := uint64(1)<<32 + 123
 	err = writer.WriteRow([]DMPField{DMPLongReaderField(bytes.NewReader(nil), length)})
 	if err == nil {
 		t.Fatal("empty reader should fail before writing a 4 GiB payload")
+	}
+	if err := writer.flush(); err != nil {
+		t.Fatalf("flush failed: %v", err)
 	}
 	var prefix [10]byte
 	if _, readErr := writer.file.ReadAt(prefix[:], start); readErr != nil {
@@ -582,5 +582,70 @@ func TestDMPGrantMetadataUsesNativeTableAndSchemaRecordLayouts(t *testing.T) {
 	}
 	if !bytes.HasSuffix(raw, []byte{4, 0, 0, 0, 'V', 'I', 'E', 'W'}) {
 		t.Fatalf("schema grant is missing its native object-type suffix: %x", raw[int(tableEnd):])
+	}
+}
+
+func TestWriteEncodedRowMatchesWriteRowBytes(t *testing.T) {
+	dir := t.TempDir()
+	longData := bytes.Repeat([]byte{0xAB}, int(dmpMaxShortFieldLength)+500)
+	rows := [][]DMPField{
+		{DMPShortField([]byte("hello")), DMPNullField(), DMPShortField(nil)},
+		{DMPShortField(bytes.Repeat([]byte("x"), 4000)), DMPShortField([]byte("y")), DMPNullField()},
+		{DMPLongField(longData), DMPShortField([]byte("tail")), DMPShortField([]byte("z"))},
+	}
+	build := func(name string, encoded bool) string {
+		path := filepath.Join(dir, name)
+		writer, err := NewDMPDataWriter(DMPDataOptions{
+			OutputPath: path, Schema: "APP", Table: "T_EQ", TableID: 71, ColumnCount: 3,
+		})
+		if err != nil {
+			t.Fatalf("NewDMPDataWriter failed: %v", err)
+		}
+		// Force frequent phase crossings so atomic-segment handling is hit.
+		writer.phaseSizeLimit = 900
+		for round := 0; round < 40; round++ {
+			for _, fields := range rows {
+				if encoded {
+					segments, ok, err := encodeDMPRowSegments(fields, 3)
+					if err != nil || !ok {
+						t.Fatalf("encodeDMPRowSegments failed: ok=%v err=%v", ok, err)
+					}
+					if err := writer.WriteEncodedRow(segments); err != nil {
+						t.Fatalf("WriteEncodedRow failed: %v", err)
+					}
+				} else if err := writer.WriteRow(fields); err != nil {
+					t.Fatalf("WriteRow failed: %v", err)
+				}
+			}
+		}
+		info, err := writer.Close()
+		if err != nil {
+			t.Fatalf("Close failed: %v", err)
+		}
+		if !info.PayloadMD5Valid || !info.HeaderChecksumValid {
+			t.Fatalf("dmp integrity is broken: %+v", info)
+		}
+		return path
+	}
+	plain, err := os.ReadFile(build("plain.dmp", false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := os.ReadFile(build("encoded.dmp", true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(plain, encoded) {
+		t.Fatalf("WriteEncodedRow output differs from WriteRow (len %d vs %d)", len(plain), len(encoded))
+	}
+}
+
+func TestEncodeDMPRowSegmentsFallsBackForReaderFields(t *testing.T) {
+	segments, ok, err := encodeDMPRowSegments([]DMPField{DMPLongReaderField(bytes.NewReader([]byte("s")), 1)}, 1)
+	if err != nil || ok || segments != nil {
+		t.Fatalf("reader fields must fall back to WriteRow: ok=%v err=%v segments=%v", ok, err, segments)
+	}
+	if _, _, err := encodeDMPRowSegments([]DMPField{DMPShortField([]byte("a"))}, 2); err == nil {
+		t.Fatal("column count mismatch must fail at encode time")
 	}
 }

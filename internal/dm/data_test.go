@@ -2217,3 +2217,55 @@ func TestParallelDirectUnloadMatchesSequentialOutput(t *testing.T) {
 		t.Fatalf("parallel output is missing boundary rows")
 	}
 }
+
+func TestParallelDirectUnloadDMPMatchesSequentialOutput(t *testing.T) {
+	dir := t.TempDir()
+	systemPath := filepath.Join(dir, "SYSTEM.DBF")
+	writeDataExportTestSystem(t, systemPath)
+	const storageID = 33555439
+	const pageCount = 600
+	raw := make([]byte, (16+pageCount)*8192)
+	putTestDMPageHeader(raw[:8192], 4, 0, 0, 0, 0)
+	for i := 0; i < pageCount; i++ {
+		pageNo := uint32(16 + i)
+		page := raw[int(pageNo)*8192 : (int(pageNo)+1)*8192]
+		putTestIntDataPage(page, 4, 0, pageNo, storageID, int32(2000+i))
+		if i < pageCount-1 {
+			putTestDMPageRef(page, dmPageNextRefOff, 0, pageNo+1)
+		} else {
+			putTestDMNullPageRef(page, dmPageNextRefOff)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "MAIN.DBF"), raw, 0644); err != nil {
+		t.Fatal(err)
+	}
+	dict := testDataExportDictionary(systemPath, storageID, 16, 0, 0)
+	run := func(workers string, out string) []byte {
+		t.Setenv("DMDUL_UNLOAD_WORKERS", workers)
+		result, err := ExportData(DataExportOptions{
+			SystemPath: systemPath, DataDir: dir, OutputPath: filepath.Join(dir, out),
+			OwnerFilter: "APP", TableFilter: "APP.T_PLAN", Charset: "utf-8",
+			OutputFormat: "dmp", Dictionary: dict,
+		})
+		if err != nil {
+			t.Fatalf("ExportData(dmp workers=%s) failed: %v", workers, err)
+		}
+		if result.RowsExported != pageCount || result.RowsFailed != 0 {
+			t.Fatalf("dmp export rows are wrong (workers=%s): %+v", workers, result)
+		}
+		data, err := os.ReadFile(filepath.Join(dir, out))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	seq := run("1", "seq.dmp")
+	par := run("4", "par.dmp")
+	if !bytes.Equal(seq, par) {
+		t.Fatalf("parallel dmp output is not byte-identical (len %d vs %d)", len(seq), len(par))
+	}
+	info, err := InspectDMP(filepath.Join(dir, "par.dmp"))
+	if err != nil || !info.PayloadMD5Valid || len(info.Tables) != 1 || info.Tables[0].RowCount != pageCount {
+		t.Fatalf("parallel dmp failed inspection: err=%v info=%+v", err, info)
+	}
+}

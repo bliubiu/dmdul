@@ -643,6 +643,20 @@ func (r *dataOutputRouter) writeRow(table dataTableInfo, line string, record []s
 	return nil
 }
 
+// writeDMPSegments appends a worker-pre-encoded row to the table's DMP
+// writer, mirroring writeRow's dmp error handling.
+func (r *dataOutputRouter) writeDMPSegments(table dataTableInfo, segments []dmpRowSegment) error {
+	target, err := r.targetForTable(table)
+	if err != nil {
+		return err
+	}
+	if err := target.dmpWriter.WriteEncodedRow(segments); err != nil {
+		_ = target.dmpWriter.Abort()
+		return fmt.Errorf("write dmp row: %w", err)
+	}
+	return nil
+}
+
 func (r *dataOutputRouter) writeFailure(table dataTableInfo, message string) error {
 	if r.format == "csv" || r.format == "dmp" {
 		return nil
@@ -1227,7 +1241,11 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 			if stats != nil {
 				stats.RowsExported++
 			}
-			if err := output.writeRow(info, row.line, row.record, row.fields); err != nil {
+			if row.dmpSegments != nil {
+				if err := output.writeDMPSegments(info, row.dmpSegments); err != nil {
+					return err
+				}
+			} else if err := output.writeRow(info, row.line, row.record, row.fields); err != nil {
 				return err
 			}
 		}

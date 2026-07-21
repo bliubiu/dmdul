@@ -1,6 +1,7 @@
 package dm
 
 import (
+	"bufio"
 	"compress/zlib"
 	"crypto/md5"
 	"encoding/binary"
@@ -553,7 +554,13 @@ type dmpDataPhase struct {
 }
 
 type DMPDataWriter struct {
-	file           *os.File
+	file *os.File
+	// bw buffers sequential appends; offset tracks the logical end of the
+	// appended stream so phase accounting needs no Seek syscalls. Every
+	// sequential write must go through (*DMPDataWriter).Write; WriteAt
+	// patches and payload hashing flush the buffer first.
+	bw             *bufio.Writer
+	offset         uint64
 	opts           DMPDataOptions
 	phase1Offset   uint64
 	phase2Offset   uint64
@@ -566,6 +573,23 @@ type DMPDataWriter struct {
 	phaseSizeLimit uint64
 	inRow          bool
 	closed         bool
+}
+
+const dmpWriterBufferSize = 512 << 10
+
+// Write appends to the dump through the buffer and keeps the logical offset
+// in sync. It is the only path sequential dump bytes may take.
+func (w *DMPDataWriter) Write(p []byte) (int, error) {
+	n, err := w.bw.Write(p)
+	w.offset += uint64(n)
+	return n, err
+}
+
+func (w *DMPDataWriter) flush() error {
+	if w.bw == nil {
+		return nil
+	}
+	return w.bw.Flush()
 }
 
 func NewDMPDataWriter(opts DMPDataOptions) (*DMPDataWriter, error) {
@@ -622,7 +646,8 @@ func NewDMPDataWriter(opts DMPDataOptions) (*DMPDataWriter, error) {
 		return nil, fmt.Errorf("create dmp output: %w", err)
 	}
 	writer := &DMPDataWriter{
-		file: file, opts: opts, phase1Offset: DMPHeaderSize,
+		file: file, bw: bufio.NewWriterSize(file, dmpWriterBufferSize),
+		opts: opts, phase1Offset: DMPHeaderSize,
 		charset: charset, schemaBytes: schemaBytes, tableBytes: tableBytes,
 		phaseSizeLimit: dmpDataPhaseSizeLimit,
 	}
@@ -634,40 +659,36 @@ func NewDMPDataWriter(opts DMPDataOptions) (*DMPDataWriter, error) {
 }
 
 func (w *DMPDataWriter) writePreamble() error {
-	if _, err := w.file.Write(make([]byte, DMPHeaderSize)); err != nil {
+	if _, err := w.Write(make([]byte, DMPHeaderSize)); err != nil {
 		return fmt.Errorf("write dmp header placeholder: %w", err)
 	}
-	if err := writeDMPUint16(w.file, 2); err != nil {
+	if err := writeDMPUint16(w, 2); err != nil {
 		return err
 	}
-	if err := writeDMPUint16(w.file, 0xFFFF); err != nil {
+	if err := writeDMPUint16(w, 0xFFFF); err != nil {
 		return err
 	}
 	for _, value := range []uint32{w.opts.TableID, 1, 0, 0} {
-		if err := writeDMPUint32(w.file, value); err != nil {
+		if err := writeDMPUint32(w, value); err != nil {
 			return err
 		}
 	}
-	if _, err := w.file.Write([]byte{0}); err != nil {
+	if _, err := w.Write([]byte{0}); err != nil {
 		return err
 	}
-	if err := writeDMPString32(w.file, w.tableBytes); err != nil {
+	if err := writeDMPString32(w, w.tableBytes); err != nil {
 		return err
 	}
-	if err := writeDMPUint16(w.file, 14); err != nil {
+	if err := writeDMPUint16(w, 14); err != nil {
 		return err
 	}
-	if err := writeDMPUint16(w.file, 0xFFFF); err != nil {
+	if err := writeDMPUint16(w, 0xFFFF); err != nil {
 		return err
 	}
-	if err := writeDMPUint16(w.file, w.opts.ColumnCount); err != nil {
+	if err := writeDMPUint16(w, w.opts.ColumnCount); err != nil {
 		return err
 	}
-	position, err := w.file.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return err
-	}
-	w.phase2Offset = uint64(position)
+	w.phase2Offset = w.offset
 	w.phaseOffsets = append(w.phaseOffsets, w.phase1Offset)
 	return w.startDataPhase(false)
 }
@@ -711,10 +732,10 @@ func (w *DMPDataWriter) WriteRow(fields []DMPField) error {
 			if err := w.ensurePhaseCapacity(10); err != nil {
 				return err
 			}
-			if err := writeDMPUint16(w.file, dmpFieldLong); err != nil {
+			if err := writeDMPUint16(w, dmpFieldLong); err != nil {
 				return err
 			}
-			if err := writeDMPUint64(w.file, length); err != nil {
+			if err := writeDMPUint64(w, length); err != nil {
 				return err
 			}
 		} else {
@@ -736,42 +757,123 @@ func (w *DMPDataWriter) WriteRow(fields []DMPField) error {
 	return nil
 }
 
+// dmpRowSegment is one wire chunk of a pre-encoded row. Atomic segments
+// (null markers, length prefixes) must not straddle a phase boundary, exactly
+// like WriteRow's writePhaseUint16 / long-field header handling; data
+// segments may be split across phases freely.
+type dmpRowSegment struct {
+	atomic bool
+	data   []byte
+}
+
+var dmpNullFieldMarker = []byte{0xFD, 0xFF}
+
+// encodeDMPRowSegments pre-encodes a row into wire segments so decode workers
+// carry the field-encoding cost instead of the single writer goroutine. Rows
+// with streaming (Reader) fields return ok=false and take the WriteRow path,
+// keeping huge LOBs out of memory. The segment stream replayed by
+// WriteEncodedRow is byte-identical to WriteRow's output.
+func encodeDMPRowSegments(fields []DMPField, columnCount uint16) ([]dmpRowSegment, bool, error) {
+	if len(fields) != int(columnCount) {
+		return nil, false, fmt.Errorf("dmp row has %d fields, want %d", len(fields), columnCount)
+	}
+	segments := make([]dmpRowSegment, 0, len(fields)*2)
+	for _, field := range fields {
+		if field.Reader != nil {
+			return nil, false, nil
+		}
+		if field.Null {
+			if len(field.Data) != 0 || field.Length != 0 {
+				return nil, false, fmt.Errorf("null dmp field cannot contain data")
+			}
+			segments = append(segments, dmpRowSegment{atomic: true, data: dmpNullFieldMarker})
+			continue
+		}
+		length := uint64(len(field.Data))
+		if field.Length != 0 && field.Length != length {
+			return nil, false, fmt.Errorf("dmp field length %d does not match data length %d", field.Length, length)
+		}
+		if field.Long || length > dmpMaxShortFieldLength {
+			header := make([]byte, 10)
+			binary.LittleEndian.PutUint16(header[0:2], dmpFieldLong)
+			binary.LittleEndian.PutUint64(header[2:10], length)
+			segments = append(segments, dmpRowSegment{atomic: true, data: header})
+		} else {
+			header := make([]byte, 2)
+			binary.LittleEndian.PutUint16(header, uint16(length))
+			segments = append(segments, dmpRowSegment{atomic: true, data: header})
+		}
+		if len(field.Data) > 0 {
+			segments = append(segments, dmpRowSegment{atomic: false, data: field.Data})
+		}
+	}
+	return segments, true, nil
+}
+
+// WriteEncodedRow appends a row pre-encoded by encodeDMPRowSegments. Field
+// validation already happened at encode time; this only replays the segments
+// with the same phase-boundary rules as WriteRow.
+func (w *DMPDataWriter) WriteEncodedRow(segments []dmpRowSegment) error {
+	if w.closed {
+		return fmt.Errorf("dmp writer is closed")
+	}
+	if w.file == nil {
+		if err := w.resume(); err != nil {
+			return err
+		}
+	}
+	if w.rowCount == ^uint32(0) {
+		return fmt.Errorf("dmp row count exceeds uint32")
+	}
+	w.inRow = true
+	for _, segment := range segments {
+		if segment.atomic {
+			if err := w.ensurePhaseCapacity(uint64(len(segment.data))); err != nil {
+				return err
+			}
+			if _, err := w.Write(segment.data); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := w.writePhaseBytes(segment.data); err != nil {
+			return fmt.Errorf("write dmp field: %w", err)
+		}
+	}
+	w.inRow = false
+	w.currentPhase.rowsCompleted++
+	w.rowCount++
+	return nil
+}
+
 func (w *DMPDataWriter) startDataPhase(continuation bool) error {
 	if uint64(len(w.phaseOffsets)) >= uint64(^uint32(0)) {
 		return fmt.Errorf("dmp phase count exceeds uint32")
 	}
-	position, err := w.file.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return err
-	}
-	offset := uint64(position)
+	offset := w.offset
 	number := uint32(len(w.phaseOffsets) + 1)
 	w.phaseOffsets = append(w.phaseOffsets, offset)
 	w.currentPhase = dmpDataPhase{
 		offset: offset, number: number, startsContinuation: continuation, active: true,
 	}
-	if err := writeDMPUint16(w.file, 2); err != nil {
+	if err := writeDMPUint16(w, 2); err != nil {
 		return err
 	}
-	if err := writeDMPUint16(w.file, 0xFFFF); err != nil {
+	if err := writeDMPUint16(w, 0xFFFF); err != nil {
 		return err
 	}
 	for _, value := range []uint32{w.opts.TableID, number, 0, 0} {
-		if err := writeDMPUint32(w.file, value); err != nil {
+		if err := writeDMPUint32(w, value); err != nil {
 			return err
 		}
 	}
-	if _, err := w.file.Write([]byte{0}); err != nil {
+	if _, err := w.Write([]byte{0}); err != nil {
 		return err
 	}
-	if err := writeDMPString32(w.file, w.tableBytes); err != nil {
+	if err := writeDMPString32(w, w.tableBytes); err != nil {
 		return err
 	}
-	position, err = w.file.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return err
-	}
-	if uint64(position)-offset >= w.phaseSizeLimit {
+	if w.offset-offset >= w.phaseSizeLimit {
 		return fmt.Errorf("dmp phase size limit %d is too small for the phase header", w.phaseSizeLimit)
 	}
 	return nil
@@ -781,17 +883,16 @@ func (w *DMPDataWriter) finishDataPhase() error {
 	if !w.currentPhase.active {
 		return nil
 	}
-	position, err := w.file.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return err
-	}
-	length := uint64(position) - w.currentPhase.offset
+	length := w.offset - w.currentPhase.offset
 	if length > uint64(^uint32(0)) {
 		return fmt.Errorf("dmp table phase exceeds uint32 length")
 	}
 	rows := w.currentPhase.rowsCompleted
 	if rows == 0 && (w.currentPhase.startsContinuation || w.inRow) {
 		rows = ^uint32(0)
+	}
+	if err := w.flush(); err != nil {
+		return err
 	}
 	if err := patchDMPUint32(w.file, int64(w.currentPhase.offset+12), uint32(length)); err != nil {
 		return err
@@ -804,11 +905,7 @@ func (w *DMPDataWriter) finishDataPhase() error {
 }
 
 func (w *DMPDataWriter) phaseRemaining() (uint64, error) {
-	position, err := w.file.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return 0, err
-	}
-	used := uint64(position) - w.currentPhase.offset
+	used := w.offset - w.currentPhase.offset
 	if used >= w.phaseSizeLimit {
 		return 0, nil
 	}
@@ -843,7 +940,7 @@ func (w *DMPDataWriter) writePhaseUint16(value uint16) error {
 	if err := w.ensurePhaseCapacity(2); err != nil {
 		return err
 	}
-	return writeDMPUint16(w.file, value)
+	return writeDMPUint16(w, value)
 }
 
 func (w *DMPDataWriter) writePhaseBytes(data []byte) error {
@@ -865,7 +962,7 @@ func (w *DMPDataWriter) writePhaseBytes(data []byte) error {
 		if length > remaining {
 			length = remaining
 		}
-		if _, err := w.file.Write(data[:int(length)]); err != nil {
+		if _, err := w.Write(data[:int(length)]); err != nil {
 			return err
 		}
 		data = data[int(length):]
@@ -900,7 +997,7 @@ func (w *DMPDataWriter) writePhaseReader(reader io.Reader, length uint64) error 
 		if _, err := io.ReadFull(reader, buffer[:int(length)]); err != nil {
 			return err
 		}
-		if _, err := w.file.Write(buffer[:int(length)]); err != nil {
+		if _, err := w.Write(buffer[:int(length)]); err != nil {
 			return err
 		}
 		remainingTotal -= length
@@ -926,18 +1023,17 @@ func (w *DMPDataWriter) Close() (*DMPInfo, error) {
 		_ = w.file.Close()
 		return nil, err
 	}
-	payloadEndPosition, err := w.file.Seek(0, io.SeekCurrent)
-	if err != nil {
-		_ = w.file.Close()
-		return nil, err
-	}
-	payloadEnd := uint64(payloadEndPosition)
+	payloadEnd := w.offset
 	phase1Length := w.phase2Offset - w.phase1Offset
 	if phase1Length > uint64(^uint32(0)) {
 		_ = w.file.Close()
 		return nil, fmt.Errorf("dmp table phase exceeds uint32 length")
 	}
 	if err := w.writeFooter(); err != nil {
+		_ = w.file.Close()
+		return nil, err
+	}
+	if err := w.flush(); err != nil {
 		_ = w.file.Close()
 		return nil, err
 	}
@@ -1000,6 +1096,9 @@ func (w *DMPDataWriter) suspend() error {
 	if w.inRow {
 		return fmt.Errorf("cannot suspend dmp writer with an incomplete row")
 	}
+	if err := w.flush(); err != nil {
+		return fmt.Errorf("flush dmp output before suspend: %w", err)
+	}
 	if err := w.file.Sync(); err != nil {
 		return fmt.Errorf("sync dmp output before suspend: %w", err)
 	}
@@ -1021,53 +1120,59 @@ func (w *DMPDataWriter) resume() error {
 	if err != nil {
 		return fmt.Errorf("resume dmp output: %w", err)
 	}
-	if _, err := file.Seek(0, io.SeekEnd); err != nil {
+	end, err := file.Seek(0, io.SeekEnd)
+	if err != nil {
 		_ = file.Close()
 		return fmt.Errorf("seek resumed dmp output: %w", err)
 	}
+	if uint64(end) != w.offset {
+		_ = file.Close()
+		return fmt.Errorf("resumed dmp output size %d does not match writer offset %d", end, w.offset)
+	}
 	w.file = file
+	w.bw = bufio.NewWriterSize(file, dmpWriterBufferSize)
 	return nil
 }
 
 func (w *DMPDataWriter) writeFooter() error {
-	if _, err := w.file.Write(dmpFooterMagic[:]); err != nil {
+	if _, err := w.Write(dmpFooterMagic[:]); err != nil {
 		return err
 	}
-	if err := writeDMPUint16(w.file, 0); err != nil {
+	if err := writeDMPUint16(w, 0); err != nil {
 		return err
 	}
-	if err := writeDMPUint64(w.file, w.phase1Offset); err != nil {
+	if err := writeDMPUint64(w, w.phase1Offset); err != nil {
 		return err
 	}
-	if err := writeDMPString16(w.file, w.schemaBytes); err != nil {
+	if err := writeDMPString16(w, w.schemaBytes); err != nil {
 		return err
 	}
-	if err := writeDMPString16(w.file, w.schemaBytes); err != nil {
+	if err := writeDMPString16(w, w.schemaBytes); err != nil {
 		return err
 	}
-	if err := writeDMPUint32(w.file, dmpTableIndexMarker); err != nil {
+	if err := writeDMPUint32(w, dmpTableIndexMarker); err != nil {
 		return err
 	}
-	if err := writeDMPUint16(w.file, 0); err != nil {
+	if err := writeDMPUint16(w, 0); err != nil {
 		return err
 	}
-	if err := writeDMPUint64(w.file, w.phase1Offset); err != nil {
+	if err := writeDMPUint64(w, w.phase1Offset); err != nil {
 		return err
 	}
-	if err := writeDMPUint32(w.file, w.opts.TableID); err != nil {
+	if err := writeDMPUint32(w, w.opts.TableID); err != nil {
 		return err
 	}
-	if err := writeDMPString16(w.file, w.tableBytes); err != nil {
+	if err := writeDMPString16(w, w.tableBytes); err != nil {
 		return err
 	}
-	if err := writeDMPUint32(w.file, uint32(len(w.phaseOffsets))); err != nil {
+	if err := writeDMPUint32(w, uint32(len(w.phaseOffsets))); err != nil {
 		return err
 	}
 	for _, offset := range w.phaseOffsets {
-		if err := writeDMPUint16(w.file, 0); err != nil {
+		if err := writeDMPUint16(w, 0); err != nil {
 			return err
 		}
-		if err := writeDMPUint64(w.file, offset); err != nil {
+		if err := writeDMPUint64(w, offset); err != nil {
 			return err
 		}
 	}

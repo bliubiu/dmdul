@@ -12,6 +12,21 @@ v主版本.次版本.修订版本
 
 ------
 
+## 未发布
+
+### Changed
+
+- DMP 写入器全面缓冲化：所有顺序写经 512 KiB 缓冲追加并以逻辑偏移做 phase
+  核算，消除此前每字段 2 次 write + 2 次 seek 的系统调用风暴（1000 万行
+  ≈ 5 亿次 syscall → 每 512 KiB 一次）；WriteAt 补写与 MD5 计算前显式 flush。
+- DMP 行编码移入并行 worker：行在解码线程预编码为 wire 段（原子段不跨
+  phase 边界，与 WriteRow 字节级等价，有单测证明），writer 仅按序追加；
+  流式 LOB 字段仍走 WriteRow 保持大对象不落内存。
+- 实测（4C/4GiB，1000 万行）：DMP 卸载 175 秒 → 116 秒；dimp SHOW=Y
+  识别行数正确；新增 DMP 并行/顺序输出字节一致性回归。
+
+------
+
 ## v0.5.7 - Scalable Unload
 
 ### Fixed

@@ -47,9 +47,12 @@ func exportWorkerCount() int {
 }
 
 type directDecodedRow struct {
-	line             string
-	record           []string
-	fields           []DMPField
+	line   string
+	record []string
+	fields []DMPField
+	// dmpSegments holds the row pre-encoded on the worker; nil when the row
+	// carries streaming LOB fields, which fall back to writer-side WriteRow.
+	dmpSegments      []dmpRowSegment
 	meta             dataRowRenderMeta
 	timeFractionLoss bool
 	failed           bool
@@ -140,6 +143,12 @@ func decodeDirectPlannedRef(
 			if writeFailedComments {
 				decoded.failMsg = fmt.Sprintf("-- FAILED %s.%s page=%d slot=%d off=0x%X len=%d: %v",
 					quoteIdent(info.table.Owner), quoteIdent(info.table.Name), ref.pageNo, row.slotNo, row.offset, row.length, err)
+			}
+		} else if outputFormat == "dmp" && !meta.partial {
+			// Pre-encode on the worker; encode errors fall back to the
+			// writer-side WriteRow path, which reports them identically.
+			if segments, ok, encodeErr := encodeDMPRowSegments(fields, uint16(len(info.columns))); ok && encodeErr == nil {
+				decoded.dmpSegments = segments
 			}
 		}
 		res.rows = append(res.rows, decoded)
