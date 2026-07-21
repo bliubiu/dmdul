@@ -25,10 +25,15 @@ const (
 	// defaultRecoveredPassword must satisfy every DM PWD_POLICY flag
 	// (length >= 9, upper + lower case, digit, punctuation, not a user name)
 	// so the generated CREATE USER statements run on hardened instances.
-	defaultRecoveredPassword         = "Dmdul_2026#Reset"
-	tableIOTInfo1Mask                = 0xFFFF0
-	tableTemporaryInfo3Flag          = 0x40
-	tableTemporarySessionInfo3Flag   = 0x10000
+	defaultRecoveredPassword       = "Dmdul_2026#Reset"
+	tableIOTInfo1Mask              = 0xFFFF0
+	tableTemporaryInfo3Flag        = 0x40
+	tableTemporarySessionInfo3Flag = 0x10000
+	// tableLongRowInfo3Flag is bit 50 of SYSOBJECTS.INFO3, set for tables
+	// created with STORAGE(USING LONG ROW). Verified by diffing minimal
+	// plain vs USING LONG ROW tables: only this bit changes.
+	tableLongRowInfo3Flag            = uint64(1) << 50
+	longRowStorageOrg                = "USING LONG ROW"
 	tableTemporaryDeleteRowsClause   = "ON COMMIT DELETE ROWS"
 	tableTemporaryPreserveRowsClause = "ON COMMIT PRESERVE ROWS"
 	sysObjectsInfo1Offset            = 0x1F
@@ -161,11 +166,19 @@ func (obj dictionaryObject) temporaryCommitClause() string {
 	return tableTemporaryDeleteRowsClause
 }
 
+func (obj dictionaryObject) isLongRowTable() bool {
+	return obj.Info3&tableLongRowInfo3Flag != 0
+}
+
 func (obj dictionaryObject) tableStorageOrganization() string {
+	org := heapStorageOrg
 	if obj.isIOTTable() {
-		return defaultStorageOrg
+		org = defaultStorageOrg
 	}
-	return heapStorageOrg
+	if obj.isLongRowTable() {
+		return org + ", " + longRowStorageOrg
+	}
+	return org
 }
 
 type columnDef struct {

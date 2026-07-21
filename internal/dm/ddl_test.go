@@ -416,3 +416,30 @@ func TestRenderTriggersAndRoutinesEmitPLSQLSlashTerminator(t *testing.T) {
 		t.Fatalf("expected 2 '/' terminators (trigger + procedure), got:\n%s", got)
 	}
 }
+
+func TestTableStorageOrganizationLongRowFlag(t *testing.T) {
+	// bit 50 of INFO3 marks STORAGE(USING LONG ROW).
+	longRowInfo3 := uint64(1) << 50
+	tests := []struct {
+		name  string
+		info1 uint32
+		info3 uint64
+		want  string
+	}{
+		// isIOTTable: Info1 & 0xFFFF0 == 0 means IOT (CLUSTERBTR); any bit in
+		// that mask makes it a heap table (NOBRANCH).
+		{name: "iot plain", info1: 0, info3: 0, want: "CLUSTERBTR"},
+		{name: "heap plain", info1: 0x10, info3: 0, want: "NOBRANCH"},
+		{name: "iot long row", info1: 0, info3: longRowInfo3, want: "CLUSTERBTR, USING LONG ROW"},
+		{name: "heap long row", info1: 0x10, info3: longRowInfo3, want: "NOBRANCH, USING LONG ROW"},
+		{name: "long row plus other info3 bits", info1: 0, info3: longRowInfo3 | 0x1010000000010000, want: "CLUSTERBTR, USING LONG ROW"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			obj := dictionaryObject{Info1: tt.info1, Info3: tt.info3}
+			if got := obj.tableStorageOrganization(); got != tt.want {
+				t.Fatalf("tableStorageOrganization() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

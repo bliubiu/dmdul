@@ -12,6 +12,22 @@ v主版本.次版本.修订版本
 
 ------
 
+## 未发布
+
+### Added
+
+- DDL 输出 `STORAGE(USING LONG ROW)`:逆向确认 `SYSOBJECTS.INFO3` 的 **bit 50**
+  即 USING LONG ROW 存储标志(用列相同、只差该存储选项的最小对照表 diff 出单 bit,
+  并跨 9 张表验证)。字典现捕获该标志,恢复宽行表时 DDL 自动带
+  `USING LONG ROW` 子句,不再需要手工补(即解除 v0.6.1 的已知限制)。
+  bootstrap 与 `load dictionary` 两条路径均生效。
+- 实机 T_LONGROW(3×VARCHAR(4000),12000/11700 字节两行)DMP 往返验证:
+  `dimp` 用导出 DMP 自动建 `USING LONG ROW` 表并导入,MINUS 双向比对完全一致。
+  (注:SQL 格式的超宽行受 disql stdin 每行 2499 字符限制无法直接导回,大宽行
+  表应使用 DMP 通道——本就是推荐做法。)
+
+------
+
 ## v0.6.1 - Long Row & Safe Check Paths
 
 ### Fixed
