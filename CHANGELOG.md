@@ -12,7 +12,7 @@ v主版本.次版本.修订版本
 
 ------
 
-## 未发布
+## v0.6.2 - USING LONG ROW DDL Restoration
 
 ### Added
 
