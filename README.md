@@ -18,7 +18,7 @@
 - 尝试恢复 `DELETE` / `DROP` / `TRUNCATE` 后尚未被覆盖的残留数据；
 - 处理大表、分区表、行外 LOB 和 `STORAGE(USING LONG ROW)` 场景。
 
-**v0.6.0 主题：Offline Page Diagnostics**
+**v0.6.1 主题：Long Row & Safe Check Paths**
 
 ![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go)
 ![License](https://img.shields.io/github/license/greatfinish/dmdul)
@@ -819,6 +819,7 @@ dul.log
 | v0.5.7 | 千万行级内存修复、自动多核并行卸载、渲染热路径优化 |
 | v0.5.8 | DMP 写入缓冲化与 worker 侧编码、大 LOB 表在飞字节背压阀 |
 | v0.6.0 | `check pages` 离线页损坏诊断、坏页表归属、叶链检测、字典一致性 |
+| v0.6.1 | USING LONG ROW 宽行卸载修复、`check` 默认 data_dir-only 避坑 |
 | v0.6.x | 迁移行/链式行、损坏页诊断、更多 DM8 版本兼容验证 |
 | v1.0.0 | 固化文件格式兼容矩阵、恢复报告和稳定发布流程 |
 

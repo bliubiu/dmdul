@@ -12,7 +12,7 @@ v主版本.次版本.修订版本
 
 ------
 
-## 未发布
+## v0.6.1 - Long Row & Safe Check Paths
 
 ### Fixed
 
