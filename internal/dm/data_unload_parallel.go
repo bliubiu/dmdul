@@ -20,12 +20,95 @@ import (
 	"os"
 	"runtime"
 	"strconv"
+	"sync"
 )
 
 // directDecodeBatchPages is the work-queue granularity. Batches this size keep
 // channel traffic low while letting the queue balance skew from pages whose
 // rows carry large LOB chains.
 const directDecodeBatchPages = 256
+
+// directDecodeChunkBytes caps the decoded output a worker buffers before
+// handing a sub-chunk to the writer. SQL/CSV rows materialize out-of-line LOB
+// content, so a fixed page count is not a memory bound; cutting at a byte
+// budget (at whole-page boundaries) is. DMDUL_UNLOAD_CHUNK_BYTES overrides it
+// for tests.
+func directDecodeChunkBytes() int64 {
+	if raw := os.Getenv("DMDUL_UNLOAD_CHUNK_BYTES"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			return int64(n)
+		}
+	}
+	return 4 << 20
+}
+
+// directUnloadMemoryLimit bounds total in-flight decoded bytes (chunks being
+// decoded, queued, or awaiting in-order apply). DMDUL_UNLOAD_MEM_BYTES
+// overrides it for tests; the default keeps peak decode memory near a few
+// hundred MiB even on tables whose SQL/CSV rows carry very large LOBs.
+func directUnloadMemoryLimit() int64 {
+	if raw := os.Getenv("DMDUL_UNLOAD_MEM_BYTES"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			return int64(n)
+		}
+	}
+	return 256 << 20
+}
+
+// directChunk is a byte-bounded run of whole-page decode results carrying its
+// position in plan order. jobIdx is the 256-page work unit; subIdx orders the
+// byte-cut chunks within it. The writer applies chunks in (jobIdx, subIdx)
+// order, identical to the sequential page order.
+type directChunk struct {
+	jobIdx  int
+	subIdx  int
+	last    bool
+	bytes   int64
+	results []directPageResult
+}
+
+// byteBudget is a weighted semaphore bounding total in-flight decoded bytes.
+// It is deadlock-free under strict in-order apply because the job the writer
+// is currently applying (applyingJob) is always exempt from the limit: its
+// worker can always make progress, the writer consumes and releases it, then
+// advances to the next job. A single chunk larger than the whole limit is also
+// allowed through when nothing else is in flight.
+type byteBudget struct {
+	mu          sync.Mutex
+	cond        *sync.Cond
+	limit       int64
+	inFlight    int64
+	applyingJob int
+}
+
+func newByteBudget(limit int64) *byteBudget {
+	b := &byteBudget{limit: limit}
+	b.cond = sync.NewCond(&b.mu)
+	return b
+}
+
+func (b *byteBudget) acquire(n int64, jobIdx int) {
+	b.mu.Lock()
+	for b.inFlight > 0 && b.inFlight+n > b.limit && b.applyingJob != jobIdx {
+		b.cond.Wait()
+	}
+	b.inFlight += n
+	b.mu.Unlock()
+}
+
+func (b *byteBudget) release(n int64) {
+	b.mu.Lock()
+	b.inFlight -= n
+	b.cond.Broadcast()
+	b.mu.Unlock()
+}
+
+func (b *byteBudget) setApplyingJob(jobIdx int) {
+	b.mu.Lock()
+	b.applyingJob = jobIdx
+	b.cond.Broadcast()
+	b.mu.Unlock()
+}
 
 // exportWorkerCount picks the decode parallelism. There is deliberately no
 // user-facing knob: extraction speed is the tool's job. DMDUL_UNLOAD_WORKERS
@@ -68,6 +151,29 @@ type directPageResult struct {
 	info             dataTableInfo
 	storageID        uint32
 	rows             []directDecodedRow
+}
+
+// approxBytes estimates the live decoded memory a page result holds so the
+// byte budget can throttle look-ahead. Streamed LOB fields (Reader != nil)
+// carry no buffered bytes here and are intentionally excluded. A per-row floor
+// keeps many-tiny-row pages from reading as near-zero.
+func (r *directPageResult) approxBytes() int64 {
+	var n int64
+	for i := range r.rows {
+		row := &r.rows[i]
+		n += int64(len(row.line)) + int64(len(row.failMsg))
+		for _, field := range row.record {
+			n += int64(len(field))
+		}
+		for _, seg := range row.dmpSegments {
+			n += int64(len(seg.data))
+		}
+		for _, field := range row.fields {
+			n += int64(len(field.Data))
+		}
+		n += 64
+	}
+	return n
 }
 
 // renderDataRowForExport is the single render dispatch shared by the

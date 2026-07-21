@@ -1254,20 +1254,22 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 		return nil
 	}
 
-	// runParallelDirect fans page decoding out to workers and applies results
+	// runParallelDirect fans page decoding out to workers and applies chunks
 	// in plan order so output stays byte-identical to the sequential path.
+	// Workers cut each 256-page job into byte-bounded sub-chunks and a shared
+	// byte budget throttles look-ahead, so total decode memory stays bounded
+	// even when SQL/CSV rows materialize very large LOBs.
 	runParallelDirect := func(refs []dataPageRef, workers int) error {
 		type directJob struct {
-			idx  int
-			refs []dataPageRef
-		}
-		type directBatch struct {
-			idx     int
-			results []directPageResult
+			idx int
+			lo  int
+			hi  int
 		}
 		batchCount := (len(refs) + directDecodeBatchPages - 1) / directDecodeBatchPages
+		chunkByteCap := directDecodeChunkBytes()
+		budget := newByteBudget(directUnloadMemoryLimit())
 		jobs := make(chan directJob)
-		resultsCh := make(chan directBatch, workers*2)
+		resultsCh := make(chan directChunk, workers*2)
 		var wg sync.WaitGroup
 		for w := 0; w < workers; w++ {
 			wg.Add(1)
@@ -1276,13 +1278,29 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 				reader := newDataFilePageReader(dataFiles, pageSize)
 				defer func() { _ = reader.close() }()
 				for job := range jobs {
-					batch := directBatch{idx: job.idx, results: make([]directPageResult, 0, len(job.refs))}
-					for _, ref := range job.refs {
-						batch.results = append(batch.results, decodeDirectPlannedRef(
-							reader, ref, dataFileRefForKey(dataFiles, ref.key), directCandidates[ref],
-							pageSize, decoder, outputFormat, dmpConfig.charset, opts.WriteFailedComments))
+					sub := 0
+					chunk := directChunk{jobIdx: job.idx}
+					emit := func(last bool) {
+						chunk.last = last
+						budget.acquire(chunk.bytes, job.idx)
+						resultsCh <- chunk
+						sub++
+						chunk = directChunk{jobIdx: job.idx, subIdx: sub}
 					}
-					resultsCh <- batch
+					for i := job.lo; i < job.hi; i++ {
+						ref := refs[i]
+						res := decodeDirectPlannedRef(
+							reader, ref, dataFileRefForKey(dataFiles, ref.key), directCandidates[ref],
+							pageSize, decoder, outputFormat, dmpConfig.charset, opts.WriteFailedComments)
+						chunk.bytes += res.approxBytes()
+						chunk.results = append(chunk.results, res)
+						if chunk.bytes >= chunkByteCap {
+							emit(false)
+						}
+					}
+					// Always emit a final (possibly empty) chunk so the writer
+					// sees the job's last marker and advances the exempt job.
+					emit(true)
 				}
 			}()
 		}
@@ -1293,7 +1311,7 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 				if hi > len(refs) {
 					hi = len(refs)
 				}
-				jobs <- directJob{idx: i, refs: refs[lo:hi]}
+				jobs <- directJob{idx: i, lo: lo, hi: hi}
 			}
 			close(jobs)
 		}()
@@ -1301,28 +1319,35 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 			wg.Wait()
 			close(resultsCh)
 		}()
-		// Jobs are handed out in order, so the reorder buffer stays small
-		// (bounded by worker skew); batches are applied strictly in order.
-		reorder := make(map[int][]directPageResult, workers*2)
-		next := 0
+		// Apply chunks strictly in (jobIdx, subIdx) order; release each
+		// chunk's budget on apply and advance the exempt job on its last
+		// chunk so a blocked worker for that job can proceed.
+		reorder := make(map[[2]int]directChunk)
+		curJob, curSub := 0, 0
 		var applyErr error
-		for batch := range resultsCh {
-			reorder[batch.idx] = batch.results
+		for chunk := range resultsCh {
+			reorder[[2]int{chunk.jobIdx, chunk.subIdx}] = chunk
 			for {
-				results, ok := reorder[next]
+				c, ok := reorder[[2]int{curJob, curSub}]
 				if !ok {
 					break
 				}
-				delete(reorder, next)
-				next++
-				if applyErr != nil {
-					continue
-				}
-				for i := range results {
-					if err := applyDirectResult(&results[i]); err != nil {
-						applyErr = err
-						break
+				delete(reorder, [2]int{curJob, curSub})
+				if applyErr == nil {
+					for i := range c.results {
+						if err := applyDirectResult(&c.results[i]); err != nil {
+							applyErr = err
+							break
+						}
 					}
+				}
+				budget.release(c.bytes)
+				if c.last {
+					curJob++
+					curSub = 0
+					budget.setApplyingJob(curJob)
+				} else {
+					curSub++
 				}
 			}
 		}

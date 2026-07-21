@@ -2269,3 +2269,58 @@ func TestParallelDirectUnloadDMPMatchesSequentialOutput(t *testing.T) {
 		t.Fatalf("parallel dmp failed inspection: err=%v info=%+v", err, info)
 	}
 }
+
+func TestParallelDirectUnloadBackpressureStaysDeterministic(t *testing.T) {
+	dir := t.TempDir()
+	systemPath := filepath.Join(dir, "SYSTEM.DBF")
+	writeDataExportTestSystem(t, systemPath)
+	const storageID = 33555441
+	const pageCount = 900
+	raw := make([]byte, (16+pageCount)*8192)
+	putTestDMPageHeader(raw[:8192], 4, 0, 0, 0, 0)
+	for i := 0; i < pageCount; i++ {
+		pageNo := uint32(16 + i)
+		page := raw[int(pageNo)*8192 : (int(pageNo)+1)*8192]
+		putTestIntDataPage(page, 4, 0, pageNo, storageID, int32(3000+i))
+		if i < pageCount-1 {
+			putTestDMPageRef(page, dmPageNextRefOff, 0, pageNo+1)
+		} else {
+			putTestDMNullPageRef(page, dmPageNextRefOff)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "MAIN.DBF"), raw, 0644); err != nil {
+		t.Fatal(err)
+	}
+	dict := testDataExportDictionary(systemPath, storageID, 16, 0, 0)
+	run := func(name string, envs map[string]string) []byte {
+		for k, v := range envs {
+			t.Setenv(k, v)
+		}
+		result, err := ExportData(DataExportOptions{
+			SystemPath: systemPath, DataDir: dir, OutputPath: filepath.Join(dir, name),
+			OwnerFilter: "APP", TableFilter: "APP.T_PLAN", Charset: "utf-8", Dictionary: dict,
+		})
+		if err != nil {
+			t.Fatalf("ExportData(%s) failed: %v", name, err)
+		}
+		if result.RowsExported != pageCount || result.DirectPagesRead != pageCount {
+			t.Fatalf("%s exported wrong counts: %+v", name, result)
+		}
+		data, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	seq := run("seq.sql", map[string]string{"DMDUL_UNLOAD_WORKERS": "1"})
+	// One page per sub-chunk and a budget smaller than a single chunk forces
+	// the exempt-job path and constant blocking; it must still finish and match.
+	pressured := run("pressured.sql", map[string]string{
+		"DMDUL_UNLOAD_WORKERS":     "4",
+		"DMDUL_UNLOAD_CHUNK_BYTES": "1",
+		"DMDUL_UNLOAD_MEM_BYTES":   "1",
+	})
+	if !bytes.Equal(seq, pressured) {
+		t.Fatalf("backpressured output diverged from sequential (len %d vs %d)", len(seq), len(pressured))
+	}
+}
