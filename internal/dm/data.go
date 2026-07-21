@@ -3042,7 +3042,11 @@ func readOutOfLineDataValue(col columnDef, row []byte, pos int, decoder textDeco
 		return value, next, nil
 	}
 	if isCharacterDataType(col.DataType) {
-		payload, err := lobReader.readLongRowPayload(locator)
+		// An out-of-line VARCHAR/CHAR column can land in either storage: DM
+		// keeps sub-page overflow columns in long-row (0x22) pages but spills
+		// larger ones (~page/2 and up) into regular LOB (0x20) pages. Try both,
+		// LOB first, so wide USING LONG ROW rows resolve either way.
+		payload, err := lobReader.readTextLOBOrLongRowPayload(locator)
 		if err != nil {
 			return nil, pos, fmt.Errorf("%s: %w", col.Name, err)
 		}
@@ -3630,7 +3634,11 @@ func readVariableDataValue(col columnDef, row []byte, pos int, decoder textDecod
 		if lobReader == nil {
 			return nil, pos, fmt.Errorf("%s: out-of-line long row locator cannot be resolved without data files", col.Name)
 		}
-		raw, err = lobReader.readLongRowPayload(locator)
+		// An overflow VARCHAR/CHAR column can live in either a long-row (0x22)
+		// page or a regular LOB (0x20) page: DM keeps sub-page overflow in
+		// long-row pages but spills columns at/over ~page/2 into LOB pages
+		// (observed at the 4000-byte boundary on 8K pages). Try both.
+		raw, err = lobReader.readTextLOBOrLongRowPayload(locator)
 		if err != nil {
 			return nil, pos, fmt.Errorf("%s: %w", col.Name, err)
 		}

@@ -14,6 +14,29 @@ v主版本.次版本.修订版本
 
 ## 未发布
 
+### Fixed
+
+- 修复 `STORAGE(USING LONG ROW)` 宽行卸载:实测发现达梦对超过约半页(8K 页约
+  4000 字节)的行外 VARCHAR/CHAR 列,会溢出到**常规 LOB(0x20)页**而非长行
+  (0x22)页。此前普通 VARCHAR 行外路径只搜 0x22 长行页,导致这类列所在的宽行
+  整行卸载失败(实测 12000 字节行失败、11700 字节行成功)。改为先试 LOB(0x20)
+  再试长行(0x22),两种溢出形态都能正确读出。实机 T_LONGROW(3×VARCHAR(4000))
+  两行全部导出,内容逐字节与源表吻合(各列纯净单字符、长度 4000/3900 精确)。
+
+### Known Limitation
+
+- 恢复 `STORAGE(USING LONG ROW)` 表时,导出的 DDL 暂不含 `USING LONG ROW` 子句
+  (字典尚未捕获该存储标志),建出的是普通表。宽行**数据可正确提取**,但导回前
+  需手工给建表语句补 `STORAGE(USING LONG ROW)`,否则 DM 以超长记录拒绝。
+
+### 调研结论(v0.6.x 方向澄清)
+
+- 实测确认**达梦不存在 Oracle 式的行迁移(row migration)和行链(row chaining)**:
+  UPDATE 撑大行是整行重新放置(无转发指针),普通超大行直接以 `[-2665]` 拒绝
+  (最大 in-row 记录约半页)。超大数据走 LOB(行外 0x20,已支持)或
+  `STORAGE(USING LONG ROW)`(长行 0x22)。路线图「迁移行/链式行支持」据此
+  澄清为「Long Row 宽行支持加固」,即本次修复。
+
 ### Changed
 
 - `check pages` 默认只在 `data_dir` 内按页头识别定位 DBF 文件,不再跟随
