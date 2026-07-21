@@ -12,6 +12,35 @@ v主版本.次版本.修订版本
 
 ------
 
+## 未发布
+
+### Added
+
+- **新增 `check pages` 页损坏诊断命令**(v0.6.x 方向,借鉴官方 dmdbchk):离线只读
+  扫描数据文件,分三层证据判定坏页,无需在线实例:
+  - 文件层:文件大小非页大小整数倍(截断/页大小不符);
+  - 页头层:页自描述三元组 `(group,file,page)` 与物理位置不符(页头错乱),
+    以及格式化后被清零的页(自描述在但 kind/正文全零,区别于保留填充页);
+  - 结构层:数据页(kind 0x14/0x16)的 slot 计数、freeEnd、记录数与行长合计
+    自相矛盾(对齐 dmdbchk 的 rec_total_len 检查)。
+  正确跳过空页、保留/填充页、B 树内部分支页(tree_level>0)和合法内部页,
+  避免误报。坏页坐标格式 `page(tablespace,file,page)` 与 dmdbchk 一致,
+  便于交叉核对;控制台摘要 + `dul.log` 坏页清单。
+  `check pages [<dbf-name>[,...]]` 可限定文件;`set page_check 0/1/2/3` 与
+  `set page_hash` 可在 PAGE_CHECK 启用时叠加校验和层。
+- 关键设计:DM 实例常年 `PAGE_CHECK=0`,官方 dmdbchk 手册也承认"用户数据被改到
+  非校验区查不出";dmdul 的页头+结构证据链在无校验和时仍能定位坏页,是对
+  dmdbchk 的差异化补充。
+
+### Validation
+
+- DM8 build 2025-01-17:CHKTEST.T_CHK 2 万行独立表空间,`dd` 注入 4 种损坏
+  (页头 page_no 错乱、行数据区破坏、slot 计数破坏、整页清零)。dmdul check
+  4/4 精确检出,坐标与官方 dmdbchk 报告逐一吻合;干净全库(MAIN 16384 页 +
+  TBS_CHK 8192 页,含真实数据/索引/分区/空页/保留页/B 树内部页)零误报。
+
+------
+
 ## v0.5.8 - Bounded-Memory DMP & LOB Unload
 
 ### Changed

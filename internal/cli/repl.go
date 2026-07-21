@@ -35,6 +35,9 @@ type interactiveSession struct {
 	logPathSet      bool
 	logOpenPath     string
 	initSource      string
+	pageCheckMode   uint32
+	pageCheckSet    bool
+	pageHashName    string
 	metadata        dm.DatabaseMetadata
 	dictionary      *dm.DictionaryInfo
 	logFile         *os.File
@@ -125,6 +128,8 @@ func (s *interactiveSession) execute(command string, stdout io.Writer) (bool, er
 		return false, s.executeUnload(fields[1:], stdout)
 	case "recover":
 		return false, s.executeRecover(fields[1:], stdout)
+	case "check":
+		return false, s.executeCheck(fields[1:], stdout)
 	default:
 		return false, fmt.Errorf("unknown command %q", fields[0])
 	}
@@ -159,6 +164,8 @@ func printInteractiveHelp(stdout io.Writer) {
 	fmt.Fprintln(stdout, "      Export all recovered objects; DMP mode writes one native FULL file.")
 	fmt.Fprintln(stdout, "  recover table <owner.table_name>;")
 	fmt.Fprintln(stdout, "      Scan residual pages by storage/assist id for TRUNCATE/DROP table recovery.")
+	fmt.Fprintln(stdout, "  check pages [<dbf-name>[,<dbf-name>...]];")
+	fmt.Fprintln(stdout, "      Scan data files for corrupt pages (checksum + header + structure). Read-only.")
 	fmt.Fprintln(stdout, "  set system <SYSTEM.DBF path>;")
 	fmt.Fprintln(stdout, "  set data_dir <DBF directory>;")
 	fmt.Fprintln(stdout, "  set control <dm.ctl path>;")
@@ -186,6 +193,91 @@ func (s *interactiveSession) executeRecover(args []string, stdout io.Writer) err
 		return s.recoverTable(args[1:], stdout)
 	default:
 		return fmt.Errorf("usage: recover table <owner.table_name>")
+	}
+}
+
+// executeCheck scans data files for corrupt pages (the `check` command).
+// Usage: check pages [<dbf-name>[,<dbf-name>...]]
+func (s *interactiveSession) executeCheck(args []string, stdout io.Writer) error {
+	target := "pages"
+	if len(args) > 0 {
+		target = strings.ToLower(args[0])
+	}
+	if target != "pages" && target != "page" {
+		return fmt.Errorf("usage: check pages [<dbf-name>[,<dbf-name>...]]")
+	}
+	if strings.TrimSpace(s.systemPath) == "" && !s.dataDirSet {
+		return fmt.Errorf("check requires set system or set data_dir first")
+	}
+	var fileFilter []string
+	if len(args) > 1 {
+		fileFilter = splitIdentifierList(args[1])
+	}
+	pageSize := s.metadata.PageSize
+	if pageSize == 0 {
+		pageSize = dm.DefaultPageSize
+	}
+	result, err := dm.CheckPages(dm.PageCheckOptions{
+		SystemPath:     s.systemPath,
+		ControlPath:    s.controlPath,
+		ControlDULPath: s.effectiveControlDULPath(),
+		DataDir:        s.effectiveDataDir(),
+		PageSize:       pageSize,
+		PageCheckMode:  s.pageCheckMode,
+		PageHashName:   s.pageHashName,
+		FileFilter:     fileFilter,
+	})
+	if err != nil {
+		return err
+	}
+	s.printPageCheckResult(result, stdout)
+	return nil
+}
+
+func (s *interactiveSession) printPageCheckResult(result *dm.PageCheckResult, stdout io.Writer) {
+	fmt.Fprintf(stdout, "page size: %d bytes\n", result.PageSize)
+	if result.PageCheckMode == 0 {
+		fmt.Fprintln(stdout, "PAGE_CHECK: 0 (checksum disabled; using header + structure evidence)")
+	} else {
+		fmt.Fprintf(stdout, "PAGE_CHECK: %d\n", result.PageCheckMode)
+	}
+	for i := range result.Files {
+		file := &result.Files[i]
+		status := "OK"
+		if file.SizeInvalid {
+			status = "FILE-INVALID"
+		} else if file.BadPages > 0 {
+			status = "BAD"
+		}
+		fmt.Fprintf(stdout, "[%s] %s (group=%d file=%d tablespace=%s) pages=%d empty=%d bad=%d\n",
+			status, file.Path, file.GroupID, file.FileID, defaultIfBlank(file.Tablespace, "?"),
+			file.PagesChecked, file.PagesEmpty, file.BadPages)
+		if file.SizeInvalid && file.SizeDetail != "" {
+			fmt.Fprintf(stdout, "    file: %s\n", file.SizeDetail)
+		}
+		for _, bad := range file.Bad {
+			fmt.Fprintf(stdout, "    page(%d,%d,%d) %s storage_id=%d: %s\n",
+				bad.GroupID, bad.FileID, bad.PageNo, bad.Kind, bad.StorageID, bad.Detail)
+		}
+		if file.ReportTruncated {
+			fmt.Fprintf(stdout, "    ... bad-page list truncated; %d total in this file\n", file.BadPages)
+		}
+	}
+	fmt.Fprintf(stdout, "files checked: %d\n", result.FilesChecked)
+	fmt.Fprintf(stdout, "pages checked: %d (empty: %d)\n", result.PagesChecked, result.PagesEmpty)
+	fmt.Fprintf(stdout, "bad pages total: %d\n", result.BadPagesTotal)
+	if result.BadPagesTotal > 0 {
+		fmt.Fprintf(stdout, "  header invalid: %d\n", result.Corruption[dm.PageCorruptionHeader])
+		fmt.Fprintf(stdout, "  checksum fail: %d\n", result.Corruption[dm.PageCorruptionChecksum])
+		fmt.Fprintf(stdout, "  structure invalid: %d\n", result.Corruption[dm.PageCorruptionStructure])
+	}
+	s.log(fmt.Sprintf("[CHECK] files=%d pages=%d empty=%d bad=%d header=%d checksum=%d structure=%d",
+		result.FilesChecked, result.PagesChecked, result.PagesEmpty, result.BadPagesTotal,
+		result.Corruption[dm.PageCorruptionHeader], result.Corruption[dm.PageCorruptionChecksum],
+		result.Corruption[dm.PageCorruptionStructure]))
+	for _, bad := range result.SortedBadPages() {
+		s.log(fmt.Sprintf("[CHECK] page(%d,%d,%d) %s storage_id=%d %s",
+			bad.GroupID, bad.FileID, bad.PageNo, bad.Kind, bad.StorageID, bad.Detail))
 	}
 }
 
@@ -234,11 +326,35 @@ func (s *interactiveSession) executeSet(args []string, stdout io.Writer) error {
 	case "log":
 		s.logPath = value
 		s.logPathSet = strings.TrimSpace(value) != ""
+	case "page_check", "pagecheck":
+		mode, err := parsePageCheckMode(value)
+		if err != nil {
+			return err
+		}
+		s.pageCheckMode = mode
+		s.pageCheckSet = true
+	case "page_hash", "pagehash":
+		s.pageHashName = strings.TrimSpace(value)
 	default:
 		return fmt.Errorf("unknown parameter %q", args[0])
 	}
 	fmt.Fprintf(stdout, "%s = %s\n", name, value)
 	return nil
+}
+
+func parsePageCheckMode(value string) (uint32, error) {
+	switch strings.TrimSpace(value) {
+	case "0":
+		return 0, nil
+	case "1":
+		return 1, nil
+	case "2":
+		return 2, nil
+	case "3":
+		return 3, nil
+	default:
+		return 0, fmt.Errorf("page_check must be 0 (off), 1 (CRC32), 2 (HASH), or 3 (CRC32C)")
+	}
 }
 
 func (s *interactiveSession) executeShow(args []string, stdout io.Writer) error {
