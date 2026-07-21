@@ -164,8 +164,9 @@ func printInteractiveHelp(stdout io.Writer) {
 	fmt.Fprintln(stdout, "      Export all recovered objects; DMP mode writes one native FULL file.")
 	fmt.Fprintln(stdout, "  recover table <owner.table_name>;")
 	fmt.Fprintln(stdout, "      Scan residual pages by storage/assist id for TRUNCATE/DROP table recovery.")
-	fmt.Fprintln(stdout, "  check pages [<dbf-name>[,<dbf-name>...]];")
+	fmt.Fprintln(stdout, "  check pages [<dbf-name>[,<dbf-name>...]] [control];")
 	fmt.Fprintln(stdout, "      Scan data files for corrupt pages (checksum + header + structure). Read-only.")
+	fmt.Fprintln(stdout, "      Files are located in data_dir; add 'control' to follow dm.ctl absolute paths.")
 	fmt.Fprintln(stdout, "  set system <SYSTEM.DBF path>;")
 	fmt.Fprintln(stdout, "  set data_dir <DBF directory>;")
 	fmt.Fprintln(stdout, "  set control <dm.ctl path>;")
@@ -197,21 +198,32 @@ func (s *interactiveSession) executeRecover(args []string, stdout io.Writer) err
 }
 
 // executeCheck scans data files for corrupt pages (the `check` command).
-// Usage: check pages [<dbf-name>[,<dbf-name>...]]
+// Usage: check pages [<dbf-name>[,<dbf-name>...]] [control]
+//
+// By default files are located strictly inside data_dir (safe: it never
+// follows dm.ctl absolute paths that may point at the live database). The
+// optional trailing `control` keyword opts into control-path resolution for
+// databases whose DBF files are spread across directories.
 func (s *interactiveSession) executeCheck(args []string, stdout io.Writer) error {
 	target := "pages"
 	if len(args) > 0 {
 		target = strings.ToLower(args[0])
 	}
 	if target != "pages" && target != "page" {
-		return fmt.Errorf("usage: check pages [<dbf-name>[,<dbf-name>...]]")
+		return fmt.Errorf("usage: check pages [<dbf-name>[,<dbf-name>...]] [control]")
 	}
 	if strings.TrimSpace(s.systemPath) == "" && !s.dataDirSet {
 		return fmt.Errorf("check requires set system or set data_dir first")
 	}
+	rest := args[1:]
+	followControl := false
+	if n := len(rest); n > 0 && strings.EqualFold(rest[n-1], "control") {
+		followControl = true
+		rest = rest[:n-1]
+	}
 	var fileFilter []string
-	if len(args) > 1 {
-		fileFilter = splitIdentifierList(args[1])
+	if len(rest) > 0 {
+		fileFilter = splitIdentifierList(rest[0])
 	}
 	pageSize := s.metadata.PageSize
 	if pageSize == 0 {
@@ -227,15 +239,16 @@ func (s *interactiveSession) executeCheck(args []string, stdout io.Writer) error
 		}
 	}
 	result, err := dm.CheckPages(dm.PageCheckOptions{
-		SystemPath:     s.systemPath,
-		ControlPath:    s.controlPath,
-		ControlDULPath: s.effectiveControlDULPath(),
-		DataDir:        s.effectiveDataDir(),
-		PageSize:       pageSize,
-		PageCheckMode:  s.pageCheckMode,
-		PageHashName:   s.pageHashName,
-		FileFilter:     fileFilter,
-		Dictionary:     dict,
+		SystemPath:         s.systemPath,
+		ControlPath:        s.controlPath,
+		ControlDULPath:     s.effectiveControlDULPath(),
+		DataDir:            s.effectiveDataDir(),
+		PageSize:           pageSize,
+		PageCheckMode:      s.pageCheckMode,
+		PageHashName:       s.pageHashName,
+		FileFilter:         fileFilter,
+		Dictionary:         dict,
+		FollowControlPaths: followControl,
 	})
 	if err != nil {
 		return err

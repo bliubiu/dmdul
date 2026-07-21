@@ -12,6 +12,18 @@ v主版本.次版本.修订版本
 
 ------
 
+## 未发布
+
+### Changed
+
+- `check pages` 默认只在 `data_dir` 内按页头识别定位 DBF 文件,不再跟随
+  `dm.ctl` / `control.dul` 的绝对路径。此前若原库文件仍在原位置,check 会读到
+  线上原文件而非 `data_dir` 里的离线副本(表现为坏页数为 0)。需要跨目录跟随
+  control 路径时,用 `check pages [<dbf>...] control` 显式开启。表空间名仍取自
+  control 元数据。新增该行为的回归测试。
+
+------
+
 ## v0.6.0 - Offline Page Diagnostics
 
 ### Added

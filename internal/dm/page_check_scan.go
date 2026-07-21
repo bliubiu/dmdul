@@ -58,6 +58,13 @@ type PageCheckOptions struct {
 	// detection, and dictionary self-consistency is checked. Without it, only
 	// the whole-file physical page scan runs.
 	Dictionary *DictionaryInfo
+	// FollowControlPaths resolves data files through dm.ctl / control.dul
+	// absolute paths. It is OFF by default for check: those paths often point
+	// at the live database's original location, so following them would scan
+	// the running files instead of the offline copies under DataDir. When off,
+	// files are located by scanning DataDir and reading page headers; control
+	// metadata is still used only for tablespace names.
+	FollowControlPaths bool
 }
 
 // BadPage locates and classifies one corrupt page. GroupID doubles as the
@@ -144,12 +151,21 @@ func CheckPages(opts PageCheckOptions) (*PageCheckResult, error) {
 	if dataDir == "" && opts.SystemPath != "" {
 		dataDir = filepathDir(opts.SystemPath)
 	}
-	files, err := resolveDataFiles(opts.ControlPath, opts.ControlDULPath, dataDir)
-	if err != nil {
-		return nil, err
+	var files []dataFileRef
+	var err error
+	if opts.FollowControlPaths {
+		files, err = resolveDataFiles(opts.ControlPath, opts.ControlDULPath, dataDir)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		if strings.TrimSpace(dataDir) == "" {
+			return nil, fmt.Errorf("check requires data_dir; set data_dir to the directory holding the DBF files")
+		}
+		files = resolveDataFilesInDir(dataDir, opts.ControlDULPath)
 	}
 	if len(files) == 0 {
-		return nil, fmt.Errorf("no data files resolved for check; set data_dir/control")
+		return nil, fmt.Errorf("no DBF files found in data_dir for check")
 	}
 	filter := newFileBaseFilter(opts.FileFilter)
 
@@ -445,6 +461,17 @@ func (r *PageCheckResult) SortedBadPages() []BadPage {
 		return all[i].PageNo < all[j].PageNo
 	})
 	return all
+}
+
+// resolveDataFilesInDir locates DBF files strictly inside dataDir by reading
+// their page headers, never following control absolute paths. Tablespace names
+// are still taken from control.dul metadata for readable labels.
+func resolveDataFilesInDir(dataDir string, controlDULPath string) []dataFileRef {
+	tablespaceNames := defaultTablespaceNames()
+	mergeControlDULTablespaceNames(tablespaceNames, controlDULPath)
+	refs := scanDataFilesByPageHeader(dataDir, tablespaceNames, make(map[dataFileKey]bool))
+	sortDataFileRefs(refs)
+	return refs
 }
 
 func filepathDir(path string) string {

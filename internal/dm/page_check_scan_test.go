@@ -176,3 +176,32 @@ func TestCheckPagesFlagsTruncatedFile(t *testing.T) {
 		t.Fatalf("expected size-invalid file, got %+v", result.Files)
 	}
 }
+
+func TestCheckPagesDataDirOnlyIgnoresControlAbsolutePaths(t *testing.T) {
+	// A "live" directory holds a clean file; the snapshot dir holds a
+	// corrupted copy of the same tablespace file. Default (data_dir-only)
+	// must scan the snapshot, not follow any absolute path to the clean file.
+	live := t.TempDir()
+	snap := t.TempDir()
+	clean := make([]byte, 2*8192)
+	buildHealthyRowPage(clean[0:8192], 8192, 12, 0, 0, 33555845, 10)
+	buildHealthyRowPage(clean[8192:16384], 8192, 12, 0, 1, 33555845, 10)
+	if err := os.WriteFile(filepath.Join(live, "TBS.DBF"), clean, 0644); err != nil {
+		t.Fatal(err)
+	}
+	corrupt := append([]byte(nil), clean...)
+	binary.LittleEndian.PutUint32(corrupt[8192+4:], 0xDEADBEEF) // smash page 1 self-id
+	if err := os.WriteFile(filepath.Join(snap, "TBS.DBF"), corrupt, 0644); err != nil {
+		t.Fatal(err)
+	}
+	result, err := CheckPages(PageCheckOptions{DataDir: snap, PageSize: 8192})
+	if err != nil {
+		t.Fatalf("CheckPages failed: %v", err)
+	}
+	if result.BadPagesTotal != 1 {
+		t.Fatalf("data_dir-only must scan the corrupted snapshot copy, got bad=%d", result.BadPagesTotal)
+	}
+	if len(result.Files) != 1 || filepath.Dir(result.Files[0].Path) != snap {
+		t.Fatalf("scanned the wrong file: %+v", result.Files)
+	}
+}
