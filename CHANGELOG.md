@@ -28,16 +28,28 @@ v主版本.次版本.修订版本
   便于交叉核对;控制台摘要 + `dul.log` 坏页清单。
   `check pages [<dbf-name>[,...]]` 可限定文件;`set page_check 0/1/2/3` 与
   `set page_hash` 可在 PAGE_CHECK 启用时叠加校验和层。
+- **存储范围诊断(字典可用时自动启用)**:check 自动加载磁盘字典后,三项增强:
+  - **坏页归属**:按页 storage_id 映射到 `owner.table`;storage_id 被清零的页
+    用表段范围(header_file/block/blocks)回退归属;
+  - **B 树叶链断链/环检测**:遍历各表存储根→叶链,只报"根有效但链中途断裂/成环"
+    的高置信损坏(对齐 dmdbchk 的 "page is broken");根指针陈旧/不匹配等
+    字典漂移不误报(unload 路径本就用 fallback 处理);
+  - **字典自一致性检查**:重复表 ID、指向不存在表的列、指向不存在 owner 的表。
+    目标同 dmdbchk 的对象 ID 合法性检查(发现不可能的目录项),但用更稳健的
+    引用一致性方式,不依赖未逆向的 DM ID 预留页格式。
 - 关键设计:DM 实例常年 `PAGE_CHECK=0`,官方 dmdbchk 手册也承认"用户数据被改到
   非校验区查不出";dmdul 的页头+结构证据链在无校验和时仍能定位坏页,是对
-  dmdbchk 的差异化补充。
+  dmdbchk 的差异化补充。bootstrap 流程零改动、不变慢——check 复用已落盘字典。
 
 ### Validation
 
 - DM8 build 2025-01-17:CHKTEST.T_CHK 2 万行独立表空间,`dd` 注入 4 种损坏
   (页头 page_no 错乱、行数据区破坏、slot 计数破坏、整页清零)。dmdul check
-  4/4 精确检出,坐标与官方 dmdbchk 报告逐一吻合;干净全库(MAIN 16384 页 +
-  TBS_CHK 8192 页,含真实数据/索引/分区/空页/保留页/B 树内部页)零误报。
+  4/4 精确检出并全部归属到 CHKTEST.T_CHK(含 storage_id 清零页经段范围回退),
+  坐标与官方 dmdbchk 报告逐一吻合;叶链检测精确报告 T_CHK 因 page 60
+  断裂的单条真损坏,32 张陈旧根指针表零误报;干净全库(MAIN 16384 页 +
+  TBS_CHK 8192 页,含真实数据/索引/分区/空页/保留页/B 树内部页)0 坏页、
+  0 叶链问题、0 字典问题。
 
 ------
 

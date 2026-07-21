@@ -217,6 +217,15 @@ func (s *interactiveSession) executeCheck(args []string, stdout io.Writer) error
 	if pageSize == 0 {
 		pageSize = dm.DefaultPageSize
 	}
+	// Attach the dictionary when available so bad pages are attributed to
+	// owner.table and the leaf-chain and consistency checks run. It is loaded
+	// best-effort: a missing dictionary just falls back to the physical scan.
+	dict := s.dictionary
+	if dict == nil {
+		if loaded, err := s.tryLoadDictionaryForCheck(); err == nil {
+			dict = loaded
+		}
+	}
 	result, err := dm.CheckPages(dm.PageCheckOptions{
 		SystemPath:     s.systemPath,
 		ControlPath:    s.controlPath,
@@ -226,12 +235,20 @@ func (s *interactiveSession) executeCheck(args []string, stdout io.Writer) error
 		PageCheckMode:  s.pageCheckMode,
 		PageHashName:   s.pageHashName,
 		FileFilter:     fileFilter,
+		Dictionary:     dict,
 	})
 	if err != nil {
 		return err
 	}
 	s.printPageCheckResult(result, stdout)
 	return nil
+}
+
+// tryLoadDictionaryForCheck loads the on-disk dictionary without failing the
+// check when none exists.
+func (s *interactiveSession) tryLoadDictionaryForCheck() (*dm.DictionaryInfo, error) {
+	dict, _, err := dm.LoadDictionaryFiles(s.effectiveDictionaryDir())
+	return dict, err
 }
 
 func (s *interactiveSession) printPageCheckResult(result *dm.PageCheckResult, stdout io.Writer) {
@@ -256,11 +273,30 @@ func (s *interactiveSession) printPageCheckResult(result *dm.PageCheckResult, st
 			fmt.Fprintf(stdout, "    file: %s\n", file.SizeDetail)
 		}
 		for _, bad := range file.Bad {
-			fmt.Fprintf(stdout, "    page(%d,%d,%d) %s storage_id=%d: %s\n",
-				bad.GroupID, bad.FileID, bad.PageNo, bad.Kind, bad.StorageID, bad.Detail)
+			owner := ""
+			if bad.Owner != "" || bad.Table != "" {
+				owner = fmt.Sprintf(" table=%s.%s", bad.Owner, bad.Table)
+			}
+			fmt.Fprintf(stdout, "    page(%d,%d,%d) %s storage_id=%d%s: %s\n",
+				bad.GroupID, bad.FileID, bad.PageNo, bad.Kind, bad.StorageID, owner, bad.Detail)
 		}
 		if file.ReportTruncated {
 			fmt.Fprintf(stdout, "    ... bad-page list truncated; %d total in this file\n", file.BadPages)
+		}
+	}
+	if result.DictionaryUsed {
+		if len(result.ChainIssues) > 0 {
+			fmt.Fprintln(stdout, "B-tree leaf chain issues:")
+			for _, issue := range result.ChainIssues {
+				fmt.Fprintf(stdout, "    %s.%s storage_id=%d root=%d/%d: %s\n",
+					issue.Owner, issue.Table, issue.StorageID, issue.RootFile, issue.RootPage, issue.Reason)
+			}
+		}
+		if len(result.DictIssues) > 0 {
+			fmt.Fprintln(stdout, "dictionary consistency issues:")
+			for _, issue := range result.DictIssues {
+				fmt.Fprintf(stdout, "    [%s] %s\n", issue.Category, issue.Detail)
+			}
 		}
 	}
 	fmt.Fprintf(stdout, "files checked: %d\n", result.FilesChecked)
@@ -271,13 +307,27 @@ func (s *interactiveSession) printPageCheckResult(result *dm.PageCheckResult, st
 		fmt.Fprintf(stdout, "  checksum fail: %d\n", result.Corruption[dm.PageCorruptionChecksum])
 		fmt.Fprintf(stdout, "  structure invalid: %d\n", result.Corruption[dm.PageCorruptionStructure])
 	}
-	s.log(fmt.Sprintf("[CHECK] files=%d pages=%d empty=%d bad=%d header=%d checksum=%d structure=%d",
+	if result.DictionaryUsed {
+		fmt.Fprintf(stdout, "leaf chain issues: %d\n", len(result.ChainIssues))
+		fmt.Fprintf(stdout, "dictionary issues: %d\n", len(result.DictIssues))
+	}
+	s.log(fmt.Sprintf("[CHECK] files=%d pages=%d empty=%d bad=%d header=%d checksum=%d structure=%d chain=%d dict=%d",
 		result.FilesChecked, result.PagesChecked, result.PagesEmpty, result.BadPagesTotal,
 		result.Corruption[dm.PageCorruptionHeader], result.Corruption[dm.PageCorruptionChecksum],
-		result.Corruption[dm.PageCorruptionStructure]))
+		result.Corruption[dm.PageCorruptionStructure], len(result.ChainIssues), len(result.DictIssues)))
 	for _, bad := range result.SortedBadPages() {
-		s.log(fmt.Sprintf("[CHECK] page(%d,%d,%d) %s storage_id=%d %s",
-			bad.GroupID, bad.FileID, bad.PageNo, bad.Kind, bad.StorageID, bad.Detail))
+		table := ""
+		if bad.Owner != "" || bad.Table != "" {
+			table = fmt.Sprintf(" table=%s.%s", bad.Owner, bad.Table)
+		}
+		s.log(fmt.Sprintf("[CHECK] page(%d,%d,%d) %s storage_id=%d%s %s",
+			bad.GroupID, bad.FileID, bad.PageNo, bad.Kind, bad.StorageID, table, bad.Detail))
+	}
+	for _, issue := range result.ChainIssues {
+		s.log(fmt.Sprintf("[CHECK] chain %s.%s storage_id=%d: %s", issue.Owner, issue.Table, issue.StorageID, issue.Reason))
+	}
+	for _, issue := range result.DictIssues {
+		s.log(fmt.Sprintf("[CHECK] dict [%s] %s", issue.Category, issue.Detail))
 	}
 }
 

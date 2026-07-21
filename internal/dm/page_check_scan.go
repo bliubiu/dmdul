@@ -53,6 +53,11 @@ type PageCheckOptions struct {
 	// MaxReported caps the per-file bad-page list retained in memory; the
 	// totals stay exact. Zero means the built-in default.
 	MaxReported int
+	// Dictionary, when set, enables storage-scoped diagnosis: bad pages are
+	// attributed to owner.table, B-tree leaf chains are walked for break/cycle
+	// detection, and dictionary self-consistency is checked. Without it, only
+	// the whole-file physical page scan runs.
+	Dictionary *DictionaryInfo
 }
 
 // BadPage locates and classifies one corrupt page. GroupID doubles as the
@@ -62,8 +67,30 @@ type BadPage struct {
 	FileID    int16
 	PageNo    uint32
 	StorageID uint32
+	Owner     string // attributed table owner, when a dictionary is available
+	Table     string // attributed table name, when a dictionary is available
 	Kind      PageCorruptionKind
 	Detail    string
+}
+
+// ChainIssue records a broken or cyclic B-tree leaf chain for one table
+// storage, mirroring dmdbchk's "page is broken, unable to get" index errors.
+type ChainIssue struct {
+	Owner     string
+	Table     string
+	StorageID uint32
+	RootFile  int16
+	RootPage  uint32
+	Reason    string
+}
+
+// DictIssue records a dictionary self-consistency problem (dangling reference,
+// duplicate id). It targets the same goal as dmdbchk's object-id validity
+// check — catching impossible catalog entries — without depending on the DM
+// id-reserve page layout.
+type DictIssue struct {
+	Category string
+	Detail   string
 }
 
 // PageCheckFileResult summarises one data file.
@@ -83,15 +110,18 @@ type PageCheckFileResult struct {
 
 // PageCheckResult is the whole-scan report.
 type PageCheckResult struct {
-	PageSize      uint32
-	PageCheckMode uint32
-	PageHashName  string
-	Files         []PageCheckFileResult
-	FilesChecked  int
-	PagesChecked  int
-	PagesEmpty    int
-	BadPagesTotal int
-	Corruption    map[PageCorruptionKind]int
+	PageSize       uint32
+	PageCheckMode  uint32
+	PageHashName   string
+	DictionaryUsed bool
+	Files          []PageCheckFileResult
+	FilesChecked   int
+	PagesChecked   int
+	PagesEmpty     int
+	BadPagesTotal  int
+	Corruption     map[PageCorruptionKind]int
+	ChainIssues    []ChainIssue
+	DictIssues     []DictIssue
 }
 
 const defaultMaxReportedBadPages = 4096
@@ -130,11 +160,26 @@ func CheckPages(opts PageCheckOptions) (*PageCheckResult, error) {
 		Corruption:    make(map[PageCorruptionKind]int),
 	}
 	sortDataFileRefs(files)
-	for _, file := range files {
+
+	var attribution *pageAttribution
+	if opts.Dictionary != nil {
+		result.DictionaryUsed = true
+		attribution = newPageAttribution(opts.Dictionary)
+	}
+
+	for fi := range files {
+		file := files[fi]
 		if file.path == "" || !filter.allows(file.path) {
 			continue
 		}
 		fileResult := checkOneDataFile(file, pageSize, opts, maxReported)
+		if attribution != nil {
+			for bi := range fileResult.Bad {
+				owner, table := attribution.attribute(&fileResult.Bad[bi])
+				fileResult.Bad[bi].Owner = owner
+				fileResult.Bad[bi].Table = table
+			}
+		}
 		result.Files = append(result.Files, fileResult)
 		result.FilesChecked++
 		result.PagesChecked += fileResult.PagesChecked
@@ -143,6 +188,11 @@ func CheckPages(opts PageCheckOptions) (*PageCheckResult, error) {
 		for _, bad := range fileResult.Bad {
 			result.Corruption[bad.Kind]++
 		}
+	}
+
+	if opts.Dictionary != nil {
+		result.ChainIssues = checkLeafChains(opts.Dictionary, files, pageSize)
+		result.DictIssues = checkDictionaryConsistency(opts.Dictionary)
 	}
 	return result, nil
 }
