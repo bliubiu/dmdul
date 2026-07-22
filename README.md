@@ -370,23 +370,31 @@ sha256sum dmdul_linux_amd64_<version>.tar.gz
 
 ### 1. 准备离线文件
 
-建议把相关文件放在同一个目录中：
+把 `dmdul` 可执行文件和待恢复的离线文件放进**同一个恢复目录**——这是推荐的零配置用法：
 
 ```text
-D:\temp\oldpro\
+D:\recovery\           ← 恢复目录（可写）
+├── dmdul.exe          ← 把可执行文件也放进来
 ├── SYSTEM.DBF
-├── dm.ctl
+├── dm.ctl             ← 可选，强烈建议提供
 ├── MAIN.DBF
 ├── ROLL.DBF
 ├── TEMP.DBF
 └── TBS_*.DBF
 ```
 
-`dm.ctl` 是可选增强文件，但强烈建议提供。没有 `dm.ctl` 时，工具会尝试通过 `control.dul` 和 DBF 页头识别数据文件。
+`dmdul` 默认就从**自己所在目录**读取 `SYSTEM.DBF` 和数据文件，因此按上面这样摆放后
+无需任何 `set` 命令即可开始恢复。`dm.ctl` 是可选增强文件；没有它时，工具会通过
+`control.dul` 和 DBF 页头识别数据文件。
+
+> 提示：请把恢复目录放在可写位置（不要放在 `Program Files` 等只读目录），因为
+> `bootstrap` 会在同目录写出 `dmdul_dict/`、`control.dul`、`init.dul`、`dul.log`。
 
 ------
 
 ### 2. 启动交互式 DUL Shell
+
+在恢复目录中直接运行：
 
 Windows：
 
@@ -400,13 +408,12 @@ Linux：
 ./dmdul
 ```
 
-示例：
+启动后会**自动探测同目录的 SYSTEM.DBF 并打印数据库身份**，`system` 和 `data_dir`
+已自动就绪，直接 `bootstrap` 即可：
 
 ```text
-DMDUL> set data_dir D:\temp\oldpro;
-DMDUL> set system D:\temp\oldpro\SYSTEM.DBF;
-DMDUL> set control D:\temp\oldpro\dm.ctl;
-DMDUL> show parameter;
+detected: db_name=DAMENG instance=DMSERVER page_size=8192 pages=9472 charset=UTF-8 case_sensitive=0 (SYSTEM.DBF: D:\recovery\SYSTEM.DBF)
+DMDUL> list datafile;
 DMDUL> bootstrap;
 DMDUL> list user;
 DMDUL> list table HR_TEST;
@@ -416,6 +423,21 @@ DMDUL> unload user HR_TEST;
 DMDUL> unload database;
 DMDUL> exit;
 ```
+
+如果离线文件不在 `dmdul` 同目录（例如文件散在别处），启动时会提示手动指定，再按需设置：
+
+```text
+no SYSTEM.DBF found in D:\recovery; run: set system <SYSTEM.DBF path>; set data_dir <DBF directory>;
+DMDUL> set data_dir D:\temp\oldpro;
+DMDUL> set system D:\temp\oldpro\SYSTEM.DBF;
+DMDUL> set control D:\temp\oldpro\dm.ctl;
+DMDUL> list datafile;
+DMDUL> show parameter;
+DMDUL> bootstrap;
+```
+
+`list datafile;` 会列出已识别的所有数据文件及其表空间、组/文件号、页数和可读状态，
+恢复前建议先跑一次，确认文件都被正确识别、没有读不到的。
 
 `bootstrap;` 会生成：
 

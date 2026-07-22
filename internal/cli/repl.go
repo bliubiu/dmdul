@@ -159,6 +159,8 @@ func printInteractiveHelp(stdout io.Writer) {
 	fmt.Fprintln(stdout, "      Reload parameters from the effective init.dul file.")
 	fmt.Fprintln(stdout, "  load parameter;")
 	fmt.Fprintln(stdout, "      Reload configuration and persisted bootstrap parameters from init.dul.")
+	fmt.Fprintln(stdout, "  list datafile;")
+	fmt.Fprintln(stdout, "      List resolved data files with tablespace, page count and read status (pre-flight check).")
 	fmt.Fprintln(stdout, "  list user;")
 	fmt.Fprintln(stdout, "      List recovered users/owners and dictionary cache status.")
 	fmt.Fprintln(stdout, "  list table <owner>;")
@@ -451,7 +453,13 @@ func (s *interactiveSession) executeShow(args []string, stdout io.Writer) error 
 
 func (s *interactiveSession) executeList(args []string, stdout io.Writer) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: list user | list schema [owner] | list table <owner>")
+		return fmt.Errorf("usage: list datafile | list user | list schema [owner] | list table <owner>")
+	}
+	// list datafile inspects physical files and must work before bootstrap,
+	// so it does not require a loaded dictionary.
+	switch strings.ToLower(args[0]) {
+	case "datafile", "datafiles", "file", "files":
+		return s.printDataFiles(stdout)
 	}
 	if err := s.ensureDictionaryLoaded(); err != nil {
 		return err
@@ -471,8 +479,51 @@ func (s *interactiveSession) executeList(args []string, stdout io.Writer) error 
 		}
 		s.printSchemas(stdout, owner)
 	default:
-		return fmt.Errorf("usage: list user | list schema [owner] | list table <owner>")
+		return fmt.Errorf("usage: list datafile | list user | list schema [owner] | list table <owner>")
 	}
+	return nil
+}
+
+// printDataFiles lists every resolved offline data file with its tablespace,
+// group/file id, page count and read status — a pre-flight check that all DBFs
+// were identified and are readable, in the spirit of DUL's "show datafiles".
+func (s *interactiveSession) printDataFiles(stdout io.Writer) error {
+	files, err := dm.ScanOfflineDataFiles(s.controlPath, s.effectiveControlDULPath(), s.effectiveDataDir())
+	if err != nil {
+		return err
+	}
+	if len(files) == 0 {
+		fmt.Fprintf(stdout, "no data files found under %s\n", s.effectiveDataDir())
+		return nil
+	}
+	pageSize := s.metadata.PageSize
+	if pageSize == 0 {
+		pageSize = dm.DefaultPageSize
+	}
+	fmt.Fprintf(stdout, "%-5s %-5s %-20s %10s %8s  %-6s %s\n", "group", "file", "tablespace", "pages", "size_MB", "status", "path")
+	okCount := 0
+	for _, f := range files {
+		pages := int64(0)
+		sizeMB := 0.0
+		status := "OK"
+		if info, statErr := os.Stat(f.Path); statErr != nil {
+			status = "UNREADABLE"
+		} else if info.IsDir() {
+			status = "DIR?"
+		} else {
+			size := info.Size()
+			sizeMB = float64(size) / (1024 * 1024)
+			pages = size / int64(pageSize)
+			if size%int64(pageSize) != 0 {
+				status = "SIZE?" // not a whole number of pages (truncated / wrong page size)
+			} else {
+				okCount++
+			}
+		}
+		fmt.Fprintf(stdout, "%-5d %-5d %-20s %10d %8.1f  %-6s %s\n",
+			f.GroupID, f.FileID, defaultIfBlank(f.Tablespace, "?"), pages, sizeMB, status, f.Path)
+	}
+	fmt.Fprintf(stdout, "data files: %d (readable & page-aligned: %d), page_size=%d\n", len(files), okCount, pageSize)
 	return nil
 }
 

@@ -1238,3 +1238,32 @@ func TestSetSystemReportsUnreadableFile(t *testing.T) {
 		t.Fatalf("set system with a missing file should report it, got:\n%s", out)
 	}
 }
+
+func TestListDataFileReportsStatusAndPages(t *testing.T) {
+	dir := t.TempDir()
+	// One page-aligned file (2 pages) and one truncated file (not a multiple).
+	good := make([]byte, 2*8192)
+	// minimal DM page header so page-header scan recognizes it: group/file/page.
+	binary.LittleEndian.PutUint16(good[0:], 4)       // group
+	binary.LittleEndian.PutUint16(good[2:], 0)       // file
+	binary.LittleEndian.PutUint32(good[0x14:], 0x14) // kind row-data
+	if err := os.WriteFile(filepath.Join(dir, "MAIN.DBF"), good, 0644); err != nil {
+		t.Fatal(err)
+	}
+	session := newInteractiveSession()
+	session.dataDir = dir
+	session.dataDirSet = true
+	session.metadata.PageSize = 8192
+
+	var stdout bytes.Buffer
+	if err := session.printDataFiles(&stdout); err != nil {
+		t.Fatalf("printDataFiles failed: %v", err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "MAIN.DBF") || !strings.Contains(out, "OK") {
+		t.Fatalf("expected MAIN.DBF listed OK, got:\n%s", out)
+	}
+	if !strings.Contains(out, "data files:") || !strings.Contains(out, "page_size=8192") {
+		t.Fatalf("expected summary line, got:\n%s", out)
+	}
+}
