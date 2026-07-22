@@ -68,27 +68,40 @@ DMDUL> unload table SYSDBA.T;
 
 ## 版本信息
 
-源码默认版本建议保持为 `dev`。正式发布版本通过 `-ldflags` 注入：
+`internal/version/version.go` 里的 `Version` 是没有 `-ldflags` 注入时的兜底值，发版时
+同步成当前 tag。正式发布构建通过 `-ldflags` 注入版本号、提交号和构建日期。
+
+### 发布构建
+
+**`-s -w` 不能漏。** 它去掉符号表和 DWARF 调试信息，二进制从约 6.2 MB 降到约 4.5 MB，
+压缩包从约 3.4 MB 降到约 1.9 MB（v0.6.4 实测）。历史发布包都是带这两个 flag 构建的，
+漏掉会让新版本看起来凭空"胖"了一大圈。`-s -w` 与 `-X` 注入不冲突，`dmdul version`
+照常打印完整版本串。
+
+三条命令要在**同一个 PowerShell 会话**里依次执行，后两条复用第一条定义的 `$ldflags`：
 
 ```powershell
-.\build.ps1
+$ver = "v0.6.4"; $commit = git rev-parse --short HEAD; $ldflags = "-s -w -X dmdul/internal/version.Version=$ver -X dmdul/internal/version.Commit=$commit -X dmdul/internal/version.BuildTime=$(Get-Date -Format yyyy-MM-dd)"; go build -ldflags $ldflags -o bin\dmdul.exe .\cmd\dmdul; if ($?) { .\bin\dmdul.exe version }
 ```
 
-发布构建可以写入版本号和提交号：
+```powershell
+$env:GOOS="linux"; $env:GOARCH="amd64"; go build -ldflags $ldflags -o bin\dmdul .\cmd\dmdul; Remove-Item Env:GOOS, Env:GOARCH
+```
 
 ```powershell
-cd D:\OneDrive\learn\dmdul
+Compress-Archive -Path .\bin\dmdul.exe -DestinationPath .\bin\dmdul_windows_amd64_$ver.zip -Force; tar -czf bin\dmdul_linux_amd64_$ver.tar.gz -C bin dmdul; Get-FileHash .\bin\dmdul_windows_amd64_$ver.zip, .\bin\dmdul_linux_amd64_$ver.tar.gz -Algorithm SHA256 | Format-List Hash, Path
+```
 
-$ver = "v0.1.7"
-$commit = git rev-parse --short HEAD
+Windows PowerShell 5.1 没有 `&&` 和三元运算符，串联用 `;`，条件串联用 `if ($?) { }`。
 
-go build -ldflags "-X dmdul/internal/version.Version=$ver -X dmdul/internal/version.Commit=$commit" -o bin/dmdul.exe ./cmd/dmdul
+`bin/` 在 `.gitignore` 里，构建产物不会进仓库。
 
-.\bin\dmdul.exe version
+### 本地开发构建
 
-Compress-Archive -Path .\bin\dmdul.exe -DestinationPath .\bin\dmdul_windows_amd64_v0.1.6.zip -Force
+日常构建不需要注入，直接：
 
-Get-FileHash .\bin\dmdul_windows_amd64_v0.1.7.zip -Algorithm SHA256
+```powershell
+go build -o bin\dmdul.exe .\cmd\dmdul
 ```
 
 ## 测试覆盖方向
