@@ -16,6 +16,10 @@ v主版本.次版本.修订版本
 
 ### Added
 
+- 新增 `list datafile;` 命令(借鉴 DUL 的 `show datafiles`):列出已识别的所有
+  数据文件及其表空间、组/文件号、页数、大小和读取状态(OK / UNREADABLE /
+  SIZE?),无需先 bootstrap。恢复前的预检查——一眼确认文件都被正确识别、
+  没有读不到或被截断的。
 - 启动与 `set system` 后自动探测并打印一行数据库身份(借鉴 Oracle DUL 的
   "Found db_name = ..."):`detected: db_name=... instance=... page_size=...
   pages=... charset=... case_sensitive=...`,让用户立刻确认"打开的是对的库",
