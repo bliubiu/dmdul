@@ -21,9 +21,11 @@ v主版本.次版本.修订版本
   pages=... charset=... case_sensitive=...`,让用户立刻确认"打开的是对的库",
   无需先 bootstrap/show parameter。仅读 SYSTEM.DBF 文件头 + 可选 dm.ctl/ini,
   不扫字典,几乎零耗时。
-- 启动时自动在**可执行文件同目录**(其次当前目录)查找 `SYSTEM.DBF`,找到则
-  自动设为 `system`/`data_dir` 并打印身份——把离线文件放在 dmdul 旁边即可直接
-  `bootstrap`,少两条 `set` 命令。找不到时完全静默,不加噪音。
+- 默认从**可执行文件同目录**读取 `SYSTEM.DBF` 和数据文件(其次当前目录):默认
+  `system` 路径与派生的 `data_dir` 都指向 dmdul 所在目录,把离线文件放在 dmdul
+  旁边即可启动直接 `bootstrap`,无需任何 `set`。启动时自动探测该位置——找到则设
+  好 `system`/`data_dir` 并打印身份;找不到则打印一行提示,引导手动
+  `set system` / `set data_dir`。
 
 ------
 

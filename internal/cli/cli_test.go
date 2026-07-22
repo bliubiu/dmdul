@@ -1201,7 +1201,7 @@ func TestRemovedFunctionalCommandsAreRejected(t *testing.T) {
 	}
 }
 
-func TestStartupIdentityProbeSilentWhenNoSystemFile(t *testing.T) {
+func TestStartupHintsWhenNoSystemFile(t *testing.T) {
 	previousDir, _ := os.Getwd()
 	if err := os.Chdir(t.TempDir()); err != nil {
 		t.Fatalf("Chdir failed: %v", err)
@@ -1212,8 +1212,12 @@ func TestStartupIdentityProbeSilentWhenNoSystemFile(t *testing.T) {
 	if err := RunInteractive(strings.NewReader("exit;\n"), &stdout, &stderr); err != nil {
 		t.Fatalf("RunInteractive returned error: %v", err)
 	}
-	if strings.Contains(stdout.String(), "detected:") {
-		t.Fatalf("startup must stay silent without a SYSTEM.DBF, got:\n%s", stdout.String())
+	out := stdout.String()
+	if strings.Contains(out, "detected:") {
+		t.Fatalf("no SYSTEM.DBF present, must not report a detected database, got:\n%s", out)
+	}
+	if !strings.Contains(out, "no SYSTEM.DBF found") || !strings.Contains(out, "set system") {
+		t.Fatalf("startup should hint to set paths manually when no SYSTEM.DBF, got:\n%s", out)
 	}
 }
 

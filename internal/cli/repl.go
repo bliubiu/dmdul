@@ -91,13 +91,24 @@ func RunInteractive(input io.Reader, stdout io.Writer, stderr io.Writer) error {
 
 func newInteractiveSession() *interactiveSession {
 	session := &interactiveSession{
-		systemPath:    defaultSystemPath,
+		systemPath:    defaultSystemFilePath(),
 		charset:       "auto",
 		dataFormat:    "sql",
 		caseSensitive: "auto",
 	}
 	session.resetDatabaseMetadata()
 	return session
+}
+
+// defaultSystemFilePath is the default SYSTEM.DBF location: next to the dmdul
+// executable, so dropping the offline files beside the binary works with no
+// setup. effectiveDataDir derives the default data_dir from this path's
+// directory, so both default to the executable's folder.
+func defaultSystemFilePath() string {
+	if exe, err := os.Executable(); err == nil {
+		return filepath.Join(filepath.Dir(exe), defaultSystemPath)
+	}
+	return defaultSystemPath
 }
 
 func (s *interactiveSession) execute(command string, stdout io.Writer) (bool, error) {
@@ -2270,14 +2281,19 @@ func (s *interactiveSession) probeDatabaseIdentity(stdout io.Writer, announce bo
 	s.log("[DETECT] " + strings.Join(parts, " ") + " path=" + path)
 }
 
-// autoProbeStartupSystem looks for a SYSTEM.DBF next to the dmdul executable
-// (the natural drop-in location) and, failing that, in the current directory.
-// When one is found it becomes the active system/data_dir and its identity is
-// printed. Nothing is set or printed when none is found.
+// autoProbeStartupSystem loads the default database on startup: a SYSTEM.DBF
+// next to the dmdul executable (the drop-in location), or in the current
+// directory. When found it becomes the active system/data_dir and its identity
+// is printed, so the user can run bootstrap immediately with no setup. When
+// none is found it prints a one-line hint to set the paths manually.
 func (s *interactiveSession) autoProbeStartupSystem(stdout io.Writer) {
-	candidates := []string{}
+	var exeDir string
 	if exe, err := os.Executable(); err == nil {
-		candidates = append(candidates, filepath.Join(filepath.Dir(exe), defaultSystemPath))
+		exeDir = filepath.Dir(exe)
+	}
+	candidates := []string{}
+	if exeDir != "" {
+		candidates = append(candidates, filepath.Join(exeDir, defaultSystemPath))
 	}
 	candidates = append(candidates, defaultSystemPath) // current directory
 	for _, candidate := range candidates {
@@ -2291,6 +2307,11 @@ func (s *interactiveSession) autoProbeStartupSystem(stdout io.Writer) {
 		s.probeDatabaseIdentity(stdout, false)
 		return
 	}
+	where := "the executable directory or current directory"
+	if exeDir != "" {
+		where = exeDir
+	}
+	fmt.Fprintf(stdout, "no SYSTEM.DBF found in %s; run: set system <SYSTEM.DBF path>; set data_dir <DBF directory>;\n", where)
 }
 
 func (s *interactiveSession) applyDictionaryMetadata(dict *dm.DictionaryInfo) {
