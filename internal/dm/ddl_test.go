@@ -443,3 +443,26 @@ func TestTableStorageOrganizationLongRowFlag(t *testing.T) {
 		})
 	}
 }
+
+func TestRenderCreateSchemasEmitsNonDefaultOnly(t *testing.T) {
+	objects := map[uint32]dictionaryObject{
+		200: {ID: 200, Type: "SCH", Name: "APP", ParentID: 100, Valid: "Y"},         // default (same name)
+		201: {ID: 201, Type: "SCH", Name: "APP_EXTRA", ParentID: 100, Valid: "Y"},   // extra schema
+		202: {ID: 202, Type: "SCH", Name: "APP_INVALID", ParentID: 100, Valid: "N"}, // dropped
+	}
+	users := map[uint32]dictionaryObject{
+		100: {ID: 100, Type: "USER", Name: "APP"},
+	}
+	var out strings.Builder
+	renderCreateSchemas(&out, objects, users, newOwnerMatcher("all"))
+	got := out.String()
+	if !strings.Contains(got, "CREATE SCHEMA APP_EXTRA AUTHORIZATION APP;\n/") {
+		t.Fatalf("non-default schema must be created with a / terminator, got:\n%s", got)
+	}
+	if strings.Contains(got, "CREATE SCHEMA APP AUTHORIZATION") {
+		t.Fatalf("default same-name schema must not be re-created (CREATE USER makes it), got:\n%s", got)
+	}
+	if strings.Contains(got, "APP_INVALID") {
+		t.Fatalf("dropped schema must not be emitted, got:\n%s", got)
+	}
+}

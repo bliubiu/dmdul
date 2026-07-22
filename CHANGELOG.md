@@ -12,6 +12,20 @@ v主版本.次版本.修订版本
 
 ------
 
+## 未发布
+
+### Fixed
+
+- SQL DDL 现在为**非同名附加模式**输出 `CREATE SCHEMA ... AUTHORIZATION`。达梦中
+  用户与模式是一对多关系:建用户自动创建同名默认模式,但附加模式(`CREATE SCHEMA
+  x AUTHORIZATION user`)此前不会被 DDL 重建,导致多模式用户的 SQL DDL 恢复到新库
+  时,附加模式的 `CREATE TABLE schema.tbl` 因模式不存在而失败。修复后每个非同名
+  模式以 `/` 批终结符输出(DM 的 CREATE SCHEMA 会吞掉后续语句直到 `/`,实测仅用
+  `;` 会导致模式建不成)。DMP 路径本就正确处理多模式,不受影响。实机 SCHTEST
+  用户(含 SCHTEST_EXTRA 附加模式)SQL DDL 干净往返、模式与表全部重建。
+
+------
+
 ## v0.6.3 - Recovery UX & Offline-First Resolution
 
 ### Changed
