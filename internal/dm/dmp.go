@@ -546,11 +546,10 @@ func DMPLongReaderField(reader io.Reader, length uint64) DMPField {
 }
 
 type dmpDataPhase struct {
-	offset             uint64
-	number             uint32
-	rowsCompleted      uint32
-	startsContinuation bool
-	active             bool
+	offset        uint64
+	number        uint32
+	rowsCompleted uint32
+	active        bool
 }
 
 type DMPDataWriter struct {
@@ -690,7 +689,7 @@ func (w *DMPDataWriter) writePreamble() error {
 	}
 	w.phase2Offset = w.offset
 	w.phaseOffsets = append(w.phaseOffsets, w.phase1Offset)
-	return w.startDataPhase(false)
+	return w.startDataPhase()
 }
 
 func (w *DMPDataWriter) WriteRow(fields []DMPField) error {
@@ -708,13 +707,16 @@ func (w *DMPDataWriter) WriteRow(fields []DMPField) error {
 	if w.rowCount == ^uint32(0) {
 		return fmt.Errorf("dmp row count exceeds uint32")
 	}
+	if err := w.beginRowPhase(); err != nil {
+		return err
+	}
 	w.inRow = true
 	for _, field := range fields {
 		if field.Null {
 			if field.Reader != nil || len(field.Data) != 0 || field.Length != 0 {
 				return fmt.Errorf("null dmp field cannot contain data")
 			}
-			if err := w.writePhaseUint16(dmpFieldNull); err != nil {
+			if err := writeDMPUint16(w, dmpFieldNull); err != nil {
 				return err
 			}
 			continue
@@ -729,9 +731,6 @@ func (w *DMPDataWriter) WriteRow(fields []DMPField) error {
 			return fmt.Errorf("dmp field length %d does not match data length %d", field.Length, length)
 		}
 		if field.Long || length > dmpMaxShortFieldLength {
-			if err := w.ensurePhaseCapacity(10); err != nil {
-				return err
-			}
 			if err := writeDMPUint16(w, dmpFieldLong); err != nil {
 				return err
 			}
@@ -739,15 +738,15 @@ func (w *DMPDataWriter) WriteRow(fields []DMPField) error {
 				return err
 			}
 		} else {
-			if err := w.writePhaseUint16(uint16(length)); err != nil {
+			if err := writeDMPUint16(w, uint16(length)); err != nil {
 				return err
 			}
 		}
 		if field.Reader != nil {
-			if err := w.writePhaseReader(field.Reader, length); err != nil {
+			if err := w.writeStreamedField(field.Reader, length); err != nil {
 				return fmt.Errorf("write streamed dmp field: %w", err)
 			}
-		} else if err := w.writePhaseBytes(field.Data); err != nil {
+		} else if _, err := w.Write(field.Data); err != nil {
 			return fmt.Errorf("write dmp field: %w", err)
 		}
 	}
@@ -825,18 +824,12 @@ func (w *DMPDataWriter) WriteEncodedRow(segments []dmpRowSegment) error {
 	if w.rowCount == ^uint32(0) {
 		return fmt.Errorf("dmp row count exceeds uint32")
 	}
+	if err := w.beginRowPhase(); err != nil {
+		return err
+	}
 	w.inRow = true
 	for _, segment := range segments {
-		if segment.atomic {
-			if err := w.ensurePhaseCapacity(uint64(len(segment.data))); err != nil {
-				return err
-			}
-			if _, err := w.Write(segment.data); err != nil {
-				return err
-			}
-			continue
-		}
-		if err := w.writePhaseBytes(segment.data); err != nil {
+		if _, err := w.Write(segment.data); err != nil {
 			return fmt.Errorf("write dmp field: %w", err)
 		}
 	}
@@ -846,7 +839,7 @@ func (w *DMPDataWriter) WriteEncodedRow(segments []dmpRowSegment) error {
 	return nil
 }
 
-func (w *DMPDataWriter) startDataPhase(continuation bool) error {
+func (w *DMPDataWriter) startDataPhase() error {
 	if uint64(len(w.phaseOffsets)) >= uint64(^uint32(0)) {
 		return fmt.Errorf("dmp phase count exceeds uint32")
 	}
@@ -854,7 +847,7 @@ func (w *DMPDataWriter) startDataPhase(continuation bool) error {
 	number := uint32(len(w.phaseOffsets) + 1)
 	w.phaseOffsets = append(w.phaseOffsets, offset)
 	w.currentPhase = dmpDataPhase{
-		offset: offset, number: number, startsContinuation: continuation, active: true,
+		offset: offset, number: number, active: true,
 	}
 	if err := writeDMPUint16(w, 2); err != nil {
 		return err
@@ -888,9 +881,6 @@ func (w *DMPDataWriter) finishDataPhase() error {
 		return fmt.Errorf("dmp table phase exceeds uint32 length")
 	}
 	rows := w.currentPhase.rowsCompleted
-	if rows == 0 && (w.currentPhase.startsContinuation || w.inRow) {
-		rows = ^uint32(0)
-	}
 	if err := w.flush(); err != nil {
 		return err
 	}
@@ -904,103 +894,43 @@ func (w *DMPDataWriter) finishDataPhase() error {
 	return nil
 }
 
-func (w *DMPDataWriter) phaseRemaining() (uint64, error) {
-	used := w.offset - w.currentPhase.offset
-	if used >= w.phaseSizeLimit {
-		return 0, nil
+// beginRowPhase closes the current phase and opens the next one when the size
+// threshold is already reached. It is called only between rows, never inside
+// one: official dexp dumps overshoot the 8 MiB limit to finish the row in
+// progress (observed phase lengths 8493595 / 8388757 / 8540709 against a
+// 8388608 limit), and dimp rejects the whole table with "data abnormal" if a
+// phase starts mid-row. Cutting at exactly 8 MiB made every table larger than
+// one phase unimportable.
+func (w *DMPDataWriter) beginRowPhase() error {
+	if !w.currentPhase.active {
+		return nil
 	}
-	return w.phaseSizeLimit - used, nil
-}
-
-func (w *DMPDataWriter) ensurePhaseCapacity(length uint64) error {
-	remaining, err := w.phaseRemaining()
-	if err != nil {
-		return err
-	}
-	if remaining >= length {
+	if w.offset-w.currentPhase.offset < w.phaseSizeLimit {
 		return nil
 	}
 	if err := w.finishDataPhase(); err != nil {
 		return err
 	}
-	if err := w.startDataPhase(w.inRow); err != nil {
-		return err
-	}
-	remaining, err = w.phaseRemaining()
-	if err != nil {
-		return err
-	}
-	if remaining < length {
-		return fmt.Errorf("dmp phase has %d bytes available, need %d", remaining, length)
-	}
-	return nil
+	return w.startDataPhase()
 }
 
-func (w *DMPDataWriter) writePhaseUint16(value uint16) error {
-	if err := w.ensurePhaseCapacity(2); err != nil {
-		return err
-	}
-	return writeDMPUint16(w, value)
-}
-
-func (w *DMPDataWriter) writePhaseBytes(data []byte) error {
-	for len(data) > 0 {
-		remaining, err := w.phaseRemaining()
-		if err != nil {
-			return err
-		}
-		if remaining == 0 {
-			if err := w.finishDataPhase(); err != nil {
-				return err
-			}
-			if err := w.startDataPhase(w.inRow); err != nil {
-				return err
-			}
-			continue
-		}
-		length := uint64(len(data))
-		if length > remaining {
-			length = remaining
-		}
-		if _, err := w.Write(data[:int(length)]); err != nil {
-			return err
-		}
-		data = data[int(length):]
-	}
-	return nil
-}
-
-func (w *DMPDataWriter) writePhaseReader(reader io.Reader, length uint64) error {
+// writeStreamedField copies a LOB straight through the output buffer. Like
+// every other field write it stays inside the current phase, however large the
+// value is.
+func (w *DMPDataWriter) writeStreamedField(reader io.Reader, length uint64) error {
 	buffer := make([]byte, dmpStreamBufferSize)
-	remainingTotal := length
-	for remainingTotal > 0 {
-		remainingPhase, err := w.phaseRemaining()
-		if err != nil {
+	for length > 0 {
+		chunk := length
+		if chunk > uint64(len(buffer)) {
+			chunk = uint64(len(buffer))
+		}
+		if _, err := io.ReadFull(reader, buffer[:int(chunk)]); err != nil {
 			return err
 		}
-		if remainingPhase == 0 {
-			if err := w.finishDataPhase(); err != nil {
-				return err
-			}
-			if err := w.startDataPhase(w.inRow); err != nil {
-				return err
-			}
-			continue
-		}
-		length := remainingTotal
-		if length > remainingPhase {
-			length = remainingPhase
-		}
-		if length > uint64(len(buffer)) {
-			length = uint64(len(buffer))
-		}
-		if _, err := io.ReadFull(reader, buffer[:int(length)]); err != nil {
+		if _, err := w.Write(buffer[:int(chunk)]); err != nil {
 			return err
 		}
-		if _, err := w.Write(buffer[:int(length)]); err != nil {
-			return err
-		}
-		remainingTotal -= length
+		length -= chunk
 	}
 	return nil
 }

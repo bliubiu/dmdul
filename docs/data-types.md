@@ -107,6 +107,9 @@ DM8 实例上用 `/dm8/bin/dmfldr` 实测确定的：
   官方 `dimp` 回灌。
 - DM8 原生 DMP 通道不保存 `TIME` 的小数秒。dmdul 检测到非零小数秒时会打印告警；
   要无损恢复该字段应使用 SQL 或 dmfldr。
+- 单表数据超过 8 MiB 时会跨多个数据 phase。phase 边界只在行与行之间切,行内不分片
+  (与官方 `dexp` 一致);此前在精确 8 MiB 处硬切会让 `dimp` 报 `data abnormal` 并放弃
+  整张表,v0.6.4 及更早版本导出的大表 DMP 需要用新版本重新导出。
 - JSON/JSONB 必须使用 `FAST_LOAD=N`。本次测试中，`FAST_LOAD=Y` 对 dmdul 和官方
   `dexp` 生成的 DMP 都会写入不可查询的 JSONB 内容。
 - BFILE 只恢复 locator；目标库必须预先创建同名 DIRECTORY，并准备对应外部文件。

@@ -12,6 +12,31 @@ v主版本.次版本.修订版本
 
 ------
 
+## 未发布
+
+### Fixed
+
+- **修复超过 8 MiB 的表 DMP 无法被 `dimp` 导入**。DMP 数据段按 8 MiB 切 phase,此前是
+  在精确 8388608 字节处硬切,会把一行数据劈成两半跨 phase。`dimp` 读完第一个数据
+  phase 后就在半行处报 `[WARNING]data abnormal, import fail...` 并放弃整张表——1000 万行
+  的表只导进 47113 行(正好等于第一个数据 phase 的 rows 字段)。
+  对照官方 `dexp` 的多 phase 转储发现,它的 phase 长度总是**略大于** 8 MiB
+  (实测 8493595 / 8388757 / 8540709,限额 8388608),即填到限额后把当前行写完才收尾,
+  一行永不跨 phase。改为同样语义:phase 边界只在行与行之间判定,行内不再分片,
+  随之删除跨 phase 续行的 `0xFFFFFFFF` 标记机制。
+  修复后同一张 1000 万行表 `dimp` 报 `terminate import success without warning`,
+  30 秒导完 10000000 行,`SUM(ID)`/`MIN`/`MAX` 与源表一致。
+  此前只用 `dimp SHOW=Y`(仅解析元数据、不导数据)验证过大表,因此漏检;
+  回归测试改为断言"行不跨 phase、phase 长度 overshoot 限额"。
+
+### Added
+
+- 新增[离线恢复标准流程](docs/recovery-workflow.md):从取一致性快照、预检、bootstrap、
+  盘点对象、选通道(SQL / dmfldr / DMP)、卸载、回灌到隔离测试库、双向 MINUS 校验的
+  完整作业手册,含常见坑对照表和实测性能参考。
+
+------
+
 ## v0.6.4 - dmfldr Loadable Export
 
 ### Changed

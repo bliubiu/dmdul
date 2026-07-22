@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 )
 
@@ -332,7 +333,10 @@ func TestDMPDataWriterRejectsWrongFieldCountAndAbortRemovesFile(t *testing.T) {
 	}
 }
 
-func TestDMPDataWriterSplitsAndStreamsLongField(t *testing.T) {
+// A row must never straddle a phase boundary. Official dexp dumps overshoot
+// the phase size limit to finish the row in progress, and dimp rejects the
+// whole table with "data abnormal" when a phase starts mid-row.
+func TestDMPDataWriterKeepsRowsWholeInsidePhases(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "streamed.dmp")
 	writer, err := NewDMPDataWriter(DMPDataOptions{
 		OutputPath: path, Schema: "APP", Table: "T_STREAM", TableID: 91, ColumnCount: 2,
@@ -341,30 +345,48 @@ func TestDMPDataWriterSplitsAndStreamsLongField(t *testing.T) {
 		t.Fatalf("NewDMPDataWriter failed: %v", err)
 	}
 	writer.phaseSizeLimit = 256
-	longValue := bytes.Repeat([]byte("0123456789ABCDEF"), 256)
-	if err := writer.WriteRow([]DMPField{
-		DMPShortField([]byte("1")),
-		DMPLongReaderField(bytes.NewReader(longValue), uint64(len(longValue))),
-	}); err != nil {
-		t.Fatalf("WriteRow failed: %v", err)
+	longValue := bytes.Repeat([]byte("0123456789ABCDEF"), 256) // far larger than the limit
+	const rows = 6
+	for i := 0; i < rows; i++ {
+		if err := writer.WriteRow([]DMPField{
+			DMPShortField([]byte(strconv.Itoa(i))),
+			DMPLongReaderField(bytes.NewReader(longValue), uint64(len(longValue))),
+		}); err != nil {
+			t.Fatalf("WriteRow %d failed: %v", i, err)
+		}
 	}
 	info, err := writer.Close()
 	if err != nil {
 		t.Fatalf("Close failed: %v", err)
 	}
-	if len(info.Tables) != 1 || info.Tables[0].RowCount != 1 {
+	if len(info.Tables) != 1 || info.Tables[0].RowCount != rows {
 		t.Fatalf("unexpected streamed table info %+v", info.Tables)
 	}
-	if len(info.Tables[0].PhaseOffsets) <= 2 {
-		t.Fatalf("long streamed field should span several phases: %+v", info.Tables[0].PhaseOffsets)
+	// Each row is bigger than the limit, so every row opens its own phase:
+	// one preamble phase plus one per row.
+	if got := len(info.Tables[0].PhaseOffsets); got != rows+1 {
+		t.Fatalf("got %d phases, want %d (preamble + one per oversized row)", got, rows+1)
 	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("ReadFile failed: %v", err)
 	}
-	firstDataPhase := info.Tables[0].PhaseOffsets[1]
-	if rows := binary.LittleEndian.Uint32(raw[firstDataPhase+16 : firstDataPhase+20]); rows != ^uint32(0) {
-		t.Fatalf("incomplete first data phase row marker = %d, want 0xFFFFFFFF", rows)
+	for i, offset := range info.Tables[0].PhaseOffsets {
+		declared := binary.LittleEndian.Uint32(raw[offset+16 : offset+20])
+		if declared == ^uint32(0) {
+			t.Fatalf("phase %d is marked as continuing a split row; dimp rejects that", i+1)
+		}
+		if i == 0 {
+			continue // preamble phase carries no rows
+		}
+		if declared != 1 {
+			t.Fatalf("phase %d declared %d rows, want 1", i+1, declared)
+		}
+		length := binary.LittleEndian.Uint32(raw[offset+12 : offset+16])
+		if uint64(length) <= writer.phaseSizeLimit {
+			t.Fatalf("phase %d length %d should overshoot the %d limit to finish its row",
+				i+1, length, writer.phaseSizeLimit)
+		}
 	}
 	if !info.PayloadMD5Valid || !info.HeaderChecksumValid || !info.FooterMagicValid {
 		t.Fatalf("invalid streamed dmp checks %+v", info)
