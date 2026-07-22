@@ -1200,3 +1200,37 @@ func TestRemovedFunctionalCommandsAreRejected(t *testing.T) {
 		})
 	}
 }
+
+func TestStartupIdentityProbeSilentWhenNoSystemFile(t *testing.T) {
+	previousDir, _ := os.Getwd()
+	if err := os.Chdir(t.TempDir()); err != nil {
+		t.Fatalf("Chdir failed: %v", err)
+	}
+	defer os.Chdir(previousDir)
+
+	var stdout, stderr bytes.Buffer
+	if err := RunInteractive(strings.NewReader("exit;\n"), &stdout, &stderr); err != nil {
+		t.Fatalf("RunInteractive returned error: %v", err)
+	}
+	if strings.Contains(stdout.String(), "detected:") {
+		t.Fatalf("startup must stay silent without a SYSTEM.DBF, got:\n%s", stdout.String())
+	}
+}
+
+func TestSetSystemReportsUnreadableFile(t *testing.T) {
+	previousDir, _ := os.Getwd()
+	if err := os.Chdir(t.TempDir()); err != nil {
+		t.Fatalf("Chdir failed: %v", err)
+	}
+	defer os.Chdir(previousDir)
+
+	missing := filepath.Join(t.TempDir(), "NOPE", "SYSTEM.DBF")
+	var stdout, stderr bytes.Buffer
+	if err := RunInteractive(strings.NewReader("set system "+missing+";\nexit;\n"), &stdout, &stderr); err != nil {
+		t.Fatalf("RunInteractive returned error: %v", err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "detected: SYSTEM.DBF not readable") {
+		t.Fatalf("set system with a missing file should report it, got:\n%s", out)
+	}
+}

@@ -12,6 +12,21 @@ v主版本.次版本.修订版本
 
 ------
 
+## 未发布
+
+### Added
+
+- 启动与 `set system` 后自动探测并打印一行数据库身份(借鉴 Oracle DUL 的
+  "Found db_name = ..."):`detected: db_name=... instance=... page_size=...
+  pages=... charset=... case_sensitive=...`,让用户立刻确认"打开的是对的库",
+  无需先 bootstrap/show parameter。仅读 SYSTEM.DBF 文件头 + 可选 dm.ctl/ini,
+  不扫字典,几乎零耗时。
+- 启动时自动在**可执行文件同目录**(其次当前目录)查找 `SYSTEM.DBF`,找到则
+  自动设为 `system`/`data_dir` 并打印身份——把离线文件放在 dmdul 旁边即可直接
+  `bootstrap`,少两条 `set` 命令。找不到时完全静默,不加噪音。
+
+------
+
 ## v0.6.2 - USING LONG ROW DDL Restoration
 
 ### Added

@@ -58,6 +58,8 @@ func RunInteractive(input io.Reader, stdout io.Writer, stderr io.Writer) error {
 	fmt.Fprintln(stdout, "https://github.com/greatfinish/dmdul")
 	fmt.Fprintln(stdout, "Type help; for available commands.")
 
+	session.autoProbeStartupSystem(stdout)
+
 	scanner := bufio.NewScanner(input)
 	scanner.Buffer(make([]byte, 0, 4096), 1024*1024)
 	for {
@@ -357,6 +359,9 @@ func (s *interactiveSession) executeSet(args []string, stdout io.Writer) error {
 		s.charset = "auto"
 		s.charsetExplicit = false
 		s.resetDatabaseMetadata()
+		fmt.Fprintf(stdout, "%s = %s\n", name, value)
+		s.probeDatabaseIdentity(stdout, true)
+		return nil
 	case "data_dir", "datadir":
 		s.dataDir = value
 		s.dataDirSet = strings.TrimSpace(value) != ""
@@ -2213,6 +2218,79 @@ func (s *interactiveSession) resetDatabaseMetadata() {
 	metadata.ControlPath = s.controlPath
 	metadata.IniPath = dm.DefaultIniPathForSystem(s.systemPath)
 	s.metadata = metadata
+}
+
+// probeDatabaseIdentity does a lightweight inspection of the current SYSTEM.DBF
+// (header + optional dm.ctl/ini only, no dictionary scan) and prints a one-line
+// identity summary. It gives immediate "am I opening the right database?"
+// feedback like Oracle DUL's "Found db_name = ...". announce=true always prints
+// (including a not-found hint); announce=false stays silent when nothing is
+// readable, so startup auto-probing never adds noise.
+func (s *interactiveSession) probeDatabaseIdentity(stdout io.Writer, announce bool) {
+	path := strings.TrimSpace(s.systemPath)
+	if path == "" {
+		return
+	}
+	if info, err := os.Stat(path); err != nil || info.IsDir() {
+		if announce {
+			fmt.Fprintf(stdout, "detected: SYSTEM.DBF not readable at %s\n", path)
+		}
+		return
+	}
+	meta := dm.InspectDatabaseMetadata(path, s.controlPath, dm.DefaultIniPathForSystem(path), s.charset)
+	s.metadata = meta
+	if meta.PageSize == 0 {
+		if announce {
+			fmt.Fprintf(stdout, "detected: %s is not a recognizable SYSTEM.DBF\n", path)
+		}
+		return
+	}
+	parts := []string{}
+	if name := strings.TrimSpace(meta.DatabaseName); name != "" {
+		parts = append(parts, "db_name="+name)
+	}
+	if name := strings.TrimSpace(meta.InstanceName); name != "" {
+		parts = append(parts, "instance="+name)
+	}
+	parts = append(parts, fmt.Sprintf("page_size=%d", meta.PageSize))
+	if meta.PageCount > 0 {
+		parts = append(parts, fmt.Sprintf("pages=%d", meta.PageCount))
+	}
+	if charset := strings.TrimSpace(meta.Charset); charset != "" {
+		parts = append(parts, "charset="+charset)
+	}
+	if meta.HasCaseSensitive {
+		cs := 0
+		if meta.CaseSensitive {
+			cs = 1
+		}
+		parts = append(parts, fmt.Sprintf("case_sensitive=%d", cs))
+	}
+	fmt.Fprintf(stdout, "detected: %s (SYSTEM.DBF: %s)\n", strings.Join(parts, " "), path)
+	s.log("[DETECT] " + strings.Join(parts, " ") + " path=" + path)
+}
+
+// autoProbeStartupSystem looks for a SYSTEM.DBF next to the dmdul executable
+// (the natural drop-in location) and, failing that, in the current directory.
+// When one is found it becomes the active system/data_dir and its identity is
+// printed. Nothing is set or printed when none is found.
+func (s *interactiveSession) autoProbeStartupSystem(stdout io.Writer) {
+	candidates := []string{}
+	if exe, err := os.Executable(); err == nil {
+		candidates = append(candidates, filepath.Join(filepath.Dir(exe), defaultSystemPath))
+	}
+	candidates = append(candidates, defaultSystemPath) // current directory
+	for _, candidate := range candidates {
+		info, err := os.Stat(candidate)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		s.systemPath = candidate
+		s.dataDir = filepath.Dir(candidate)
+		s.dataDirSet = true
+		s.probeDatabaseIdentity(stdout, false)
+		return
+	}
 }
 
 func (s *interactiveSession) applyDictionaryMetadata(dict *dm.DictionaryInfo) {
