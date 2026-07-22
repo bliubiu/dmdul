@@ -259,7 +259,23 @@ SELECT COUNT(*) FROM (SELECT * FROM <src_owner>.<table> MINUS SELECT * FROM RECO
 SELECT COUNT(*) FROM (SELECT * FROM RECOVER_V.<table> MINUS SELECT * FROM <src_owner>.<table>);
 ```
 
-两个方向都必须是 0。LOB 列不能直接进 MINUS，单独比：
+两个方向都必须是 0。
+
+> **千万行级的表不要直接 MINUS。** MINUS 需要把两侧结果集全部排序/哈希，
+> 两张 1000 万行表的双向比对实测能把一台 4 GB 的实例直接 OOM（内核杀掉 dmserver）。
+> 大表按主键分块比，每块几十万行：
+
+```sql
+SELECT COUNT(*) FROM (
+  SELECT * FROM <src_owner>.<table> WHERE <pk> BETWEEN 1 AND 500000
+  MINUS
+  SELECT * FROM RECOVER_V.<table>  WHERE <pk> BETWEEN 1 AND 500000);
+```
+
+表有主键、两侧行数又相等时，单向为空即可判定相等（无重复行，A ⊆ B 且 |A| = |B| ⟹ A = B），
+不必跑两遍。
+
+LOB 列不能直接进 MINUS，单独比：
 
 ```sql
 SELECT a.id, LENGTH(a.c), LENGTH(b.c), DBMS_LOB.COMPARE(a.c, b.c)
@@ -278,6 +294,8 @@ FROM <src_owner>.<table> a, RECOVER_V.<table> b WHERE a.id = b.id;
 | DDL 建表失败：模式不存在 | 多模式用户，`CREATE SCHEMA` 被跳过或漏了 `/` | 用 v0.6.3+ 重新导出 DDL |
 | 超宽行 INSERT 报 input too long | disql stdin 每行 2499 字符上限 | 改走 DMP 通道 |
 | dmfldr 装载后 BLOB 长度翻倍 | 控制文件用了 `BLOB_TYPE='HEX'` | 用 v0.6.4+ 重新导出（应为 `'HEX_CHAR'`） |
+| `dmfldr` 报 `parameters parse error[...]` | 参数值没加引号，含 `.` 被截断 | 写成 `CONTROL='x.ctl'`，注意单引号 |
+| 比对大表时实例被 OOM 杀掉 | 千万行双向 MINUS 撑爆内存 | 按主键分块比对，见第 9 步 |
 | `dimp` 报 data abnormal，只导进一部分 | 数据段 phase 边界切在行中间 | 用 v0.6.5+ 重新导出 DMP |
 | `rows exported` 比预期多 | 命中了 TRUNCATE 前的旧存储（历史行） | 用 `describe` 看 `assist_ids`，按主键去重 |
 | 内存吃紧 | 大 LOB 表解码缓冲 | `DMDUL_UNLOAD_MEM_BYTES` 调小（默认 256 MiB） |
