@@ -2516,17 +2516,23 @@ func dataFileKeyFromPageHeader(path string) (dataFileKey, bool) {
 	}, true
 }
 
+// resolveDataFilePath maps a dm.ctl / control.dul path entry to an actual file.
+// The offline files the user placed in data_dir are authoritative: a same-named
+// file there wins over the recorded (often absolute) path. dm.ctl/control.dul
+// therefore act only as a cross-reference for the group/file/tablespace mapping,
+// never dragging the read to the live database's original location when
+// recovering on the same host. The recorded absolute path is used only as a
+// fallback when no matching file exists in data_dir.
 func resolveDataFilePath(controlValue string, dataDir string) (string, bool) {
+	base := pathpkg.Base(strings.ReplaceAll(controlValue, "\\", "/"))
+	if base != "." && base != "/" && base != "" && strings.TrimSpace(dataDir) != "" {
+		candidate := filepath.Join(dataDir, base)
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate, true
+		}
+	}
 	if info, err := os.Stat(controlValue); err == nil && !info.IsDir() {
 		return controlValue, true
-	}
-	base := pathpkg.Base(strings.ReplaceAll(controlValue, "\\", "/"))
-	if base == "." || base == "/" || base == "" {
-		return "", false
-	}
-	candidate := filepath.Join(dataDir, base)
-	if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
-		return candidate, true
 	}
 	return "", false
 }

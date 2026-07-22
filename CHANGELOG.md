@@ -14,6 +14,15 @@ v主版本.次版本.修订版本
 
 ## 未发布
 
+### Changed
+
+- 数据文件解析全局改为**以用户放置的离线文件为准**:`data_dir`(默认可执行文件
+  同目录)里的同名文件优先于 `dm.ctl` / `control.dul` 记录的(常为绝对)路径,
+  后者降级为映射参考,仅当本地无该文件时才回退使用。这样在与线上库同机恢复时,
+  不会因 dm.ctl 存的原始绝对路径而误读线上原文件——`bootstrap` / `unload` /
+  `recover` 与 `list datafile` 全部读用户的离线副本。(此前仅 `check` 做了
+  data_dir-only;现在对所有命令一致。)
+
 ### Added
 
 - 新增 `list datafile;` 命令(借鉴 DUL 的 `show datafiles`):列出已识别的所有

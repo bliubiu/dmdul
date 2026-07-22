@@ -2324,3 +2324,31 @@ func TestParallelDirectUnloadBackpressureStaysDeterministic(t *testing.T) {
 		t.Fatalf("backpressured output diverged from sequential (len %d vs %d)", len(seq), len(pressured))
 	}
 }
+
+func TestResolveDataFilePathPrefersDataDirOverControlAbsolute(t *testing.T) {
+	dataDir := t.TempDir()
+	liveDir := t.TempDir()
+	// The offline copy the user placed in data_dir, and a same-named "live"
+	// file at the absolute path recorded in dm.ctl.
+	if err := os.WriteFile(filepath.Join(dataDir, "TBS.DBF"), []byte("offline"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	liveAbs := filepath.Join(liveDir, "TBS.DBF")
+	if err := os.WriteFile(liveAbs, []byte("live"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// data_dir copy must win even though the absolute path also exists.
+	got, ok := resolveDataFilePath(liveAbs, dataDir)
+	if !ok || got != filepath.Join(dataDir, "TBS.DBF") {
+		t.Fatalf("expected data_dir copy to win, got %q ok=%v", got, ok)
+	}
+	// When the file is NOT in data_dir, fall back to the recorded absolute path.
+	otherAbs := filepath.Join(liveDir, "OTHER.DBF")
+	if err := os.WriteFile(otherAbs, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	got, ok = resolveDataFilePath(otherAbs, dataDir)
+	if !ok || got != otherAbs {
+		t.Fatalf("expected fallback to absolute path, got %q ok=%v", got, ok)
+	}
+}
