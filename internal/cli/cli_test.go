@@ -594,10 +594,13 @@ func TestInteractiveUnloadUserSQLExportsPerTableFiles(t *testing.T) {
 		}
 		output := stdout.String()
 		for _, want := range []string{
-			"table: APP.WITH_ROWS",
+			// Per-table progress lines report what each table yielded.
+			". unloading table APP.WITH_ROWS",
+			"1 rows unloaded",
 			"APP_WITH_ROWS_ddl.sql",
 			"APP_WITH_ROWS_data.sql",
-			"table: APP.EMPTY_TABLE",
+			". unloading table APP.EMPTY_TABLE",
+			"0 rows unloaded",
 			"APP_EMPTY_TABLE_ddl.sql",
 			"APP_EMPTY_TABLE_data.sql",
 			"tables exported: 2",
@@ -1265,5 +1268,56 @@ func TestListDataFileReportsStatusAndPages(t *testing.T) {
 	}
 	if !strings.Contains(out, "data files:") || !strings.Contains(out, "page_size=8192") {
 		t.Fatalf("expected summary line, got:\n%s", out)
+	}
+}
+
+func TestDescribeTableShowsPhysicalLocationAndColumns(t *testing.T) {
+	session := newInteractiveSession()
+	session.dictionary = &dm.DictionaryInfo{
+		Tables: []dm.DictionaryTable{{
+			ID: 1268, Owner: "MOCK", Name: "T_CUSTOMER_MOCK", ColumnCount: 2,
+			Tablespace: "TBS_MOCK", GroupID: 10, StorageID: 33555838,
+			RootFile: 0, RootPage: 16, HeaderFile: 0, HeaderBlock: 16,
+			Blocks: 269600, Extents: 16850, Bytes: 2208563200,
+			Storage: "CLUSTERBTR", AssistIDs: []uint32{33555838, 33555700},
+		}},
+		Columns: []dm.DictionaryColumn{
+			{TableID: 1268, ColID: 0, Name: "ID", DataType: "BIGINT", Length: 8, Nullable: "N"},
+			{TableID: 1268, ColID: 1, Name: "AMOUNT", DataType: "DEC", Length: 12, Scale: 2, Default: "0"},
+		},
+	}
+	var stdout bytes.Buffer
+	if err := session.executeDescribe([]string{"MOCK.T_CUSTOMER_MOCK"}, &stdout); err != nil {
+		t.Fatalf("executeDescribe failed: %v", err)
+	}
+	out := stdout.String()
+	for _, want := range []string{
+		"Table MOCK.T_CUSTOMER_MOCK",
+		"table_id= 1268",
+		"tablespace= TBS_MOCK",
+		"storage_id= 33555838",
+		"root= file#0/page#16",
+		"blocks= 269600",
+		"storage= CLUSTERBTR",
+		"assist_ids= [33555838 33555700]",
+		"Column information:",
+		"ID", "BIGINT len=8", "NOT NULL",
+		"AMOUNT", "DEC len=12 scale=2", "DEFAULT 0",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("describe output should contain %q, got:\n%s", want, out)
+		}
+	}
+}
+
+func TestDescribeRejectsBadNameAndMissingTable(t *testing.T) {
+	session := newInteractiveSession()
+	session.dictionary = &dm.DictionaryInfo{}
+	var stdout bytes.Buffer
+	if err := session.executeDescribe([]string{"NOT_QUALIFIED"}, &stdout); err == nil {
+		t.Fatal("describe must reject a name without owner.table form")
+	}
+	if err := session.executeDescribe([]string{"APP.GHOST"}, &stdout); err == nil {
+		t.Fatal("describe must report a table missing from the dictionary")
 	}
 }

@@ -143,6 +143,8 @@ func (s *interactiveSession) execute(command string, stdout io.Writer) (bool, er
 		return false, s.executeRecover(fields[1:], stdout)
 	case "check":
 		return false, s.executeCheck(fields[1:], stdout)
+	case "describe", "desc":
+		return false, s.executeDescribe(fields[1:], stdout)
 	default:
 		return false, fmt.Errorf("unknown command %q", fields[0])
 	}
@@ -161,6 +163,8 @@ func printInteractiveHelp(stdout io.Writer) {
 	fmt.Fprintln(stdout, "      Reload configuration and persisted bootstrap parameters from init.dul.")
 	fmt.Fprintln(stdout, "  list datafile;")
 	fmt.Fprintln(stdout, "      List resolved data files with tablespace, page count and read status (pre-flight check).")
+	fmt.Fprintln(stdout, "  describe <owner.table_name>;")
+	fmt.Fprintln(stdout, "      Show one table's recovered definition, physical location and columns (alias: desc).")
 	fmt.Fprintln(stdout, "  list user;")
 	fmt.Fprintln(stdout, "      List recovered users/owners and dictionary cache status.")
 	fmt.Fprintln(stdout, "  list table <owner>;")
@@ -482,6 +486,98 @@ func (s *interactiveSession) executeList(args []string, stdout io.Writer) error 
 		return fmt.Errorf("usage: list datafile | list user | list schema [owner] | list table <owner>")
 	}
 	return nil
+}
+
+// executeDescribe prints one table's recovered definition and where it lives on
+// disk (the spirit of DUL's "desc owner.table"): physical identity first, so a
+// recovery operator can confirm the table was located, then the column list.
+func (s *interactiveSession) executeDescribe(args []string, stdout io.Writer) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: describe <owner.table_name>")
+	}
+	owner, tableName, ok := parseOwnerTableToken(args[0])
+	if !ok {
+		return fmt.Errorf("invalid table name %q; use owner.table_name", args[0])
+	}
+	if err := s.ensureDictionaryLoaded(); err != nil {
+		return err
+	}
+	table, found := s.findTable(owner, tableName)
+	if !found {
+		return fmt.Errorf("table %s.%s not found in dictionary", owner, tableName)
+	}
+	s.printTableDescription(stdout, table)
+	return nil
+}
+
+func (s *interactiveSession) printTableDescription(stdout io.Writer, table dm.DictionaryTable) {
+	tablespace := table.Tablespace
+	if tablespace == "" && table.GroupID != 0 {
+		tablespace = fmt.Sprintf("GROUP_%d", table.GroupID)
+	}
+	fmt.Fprintf(stdout, "Table %s.%s\n", table.Owner, table.Name)
+	fmt.Fprintf(stdout, "  table_id= %d, tablespace= %s (group#= %d), columns= %d\n",
+		table.ID, defaultIfBlank(tablespace, "?"), table.GroupID, table.ColumnCount)
+	fmt.Fprintf(stdout, "  storage_id= %d, root= file#%d/page#%d, segment= file#%d/block#%d, blocks= %d, extents= %d\n",
+		table.StorageID, table.RootFile, table.RootPage,
+		table.HeaderFile, table.HeaderBlock, table.Blocks, table.Extents)
+	attrs := defaultIfBlank(table.Storage, "?")
+	if table.Partitioned {
+		attrs += ", PARTITIONED"
+	}
+	if table.Temporary {
+		attrs += ", TEMPORARY"
+	}
+	fmt.Fprintf(stdout, "  storage= %s, bytes= %d\n", attrs, table.Bytes)
+	if len(table.AssistIDs) > 0 {
+		fmt.Fprintf(stdout, "  assist_ids= %v\n", table.AssistIDs)
+	}
+
+	fmt.Fprintln(stdout, "Column information:")
+	shown := 0
+	for _, col := range s.dictionary.Columns {
+		if col.TableID != table.ID {
+			continue
+		}
+		shown++
+		nullable := "NULL"
+		if col.Nullable == "N" {
+			nullable = "NOT NULL"
+		}
+		line := fmt.Sprintf("  col# %02d %-32s %-28s %-8s",
+			col.ColID, col.Name, formatDescribeType(col), nullable)
+		if strings.TrimSpace(col.Default) != "" {
+			line += " DEFAULT " + col.Default
+		}
+		fmt.Fprintln(stdout, strings.TrimRight(line, " "))
+	}
+	if shown == 0 {
+		fmt.Fprintln(stdout, "  (no columns recovered for this table)")
+	}
+
+	// Partition detail helps confirm which physical sub-tables carry the data.
+	parts := 0
+	for _, part := range s.dictionary.Partitions {
+		if part.BaseTableID != table.ID {
+			continue
+		}
+		if parts == 0 {
+			fmt.Fprintln(stdout, "Partitions:")
+		}
+		parts++
+		fmt.Fprintf(stdout, "  #%d %-24s type= %-6s part_table_id= %d\n",
+			part.Position, part.Name, part.Type, part.PartTableID)
+	}
+}
+
+// formatDescribeType renders the recovered column type with its length/scale,
+// mirroring how the DDL writer would emit it.
+func formatDescribeType(col dm.DictionaryColumn) string {
+	base := strings.TrimSpace(col.DataType)
+	if base == "" {
+		return "?"
+	}
+	return fmt.Sprintf("%s len=%d scale=%d", base, col.Length, col.Scale)
 }
 
 // printDataFiles lists every resolved offline data file with its tablespace,
@@ -1236,10 +1332,12 @@ func (s *interactiveSession) unloadUser(args []string, stdout io.Writer) error {
 	for _, output := range data.TableOutputs {
 		dataOutputs[qualifiedTableOutputKey(output.Owner, output.Name)] = output
 	}
+	rowCounts := dataTableRowCountIndex(data)
 	for _, output := range ddl.TableOutputs {
-		fmt.Fprintf(stdout, "table: %s.%s\n", output.Owner, output.Name)
+		key := qualifiedTableOutputKey(output.Owner, output.Name)
+		fmt.Fprintln(stdout, formatUnloadingTableLine(output.Owner, output.Name, rowCounts[key]))
 		fmt.Fprintf(stdout, "  ddl output: %s\n", output.OutputPath)
-		if dataOutput, ok := dataOutputs[qualifiedTableOutputKey(output.Owner, output.Name)]; ok {
+		if dataOutput, ok := dataOutputs[key]; ok {
 			fmt.Fprintf(stdout, "  data output: %s\n", dataOutput.OutputPath)
 		} else {
 			table, found := s.findTable(output.Owner, output.Name)
@@ -1373,6 +1471,30 @@ func (s *interactiveSession) unloadDatabaseSplitData(prefix string, format strin
 		}
 	}
 	return data, nil
+}
+
+// dataTableRowCountIndex keys the per-table row statistics by owner.table so
+// each table's line can report how many rows it actually yielded.
+func dataTableRowCountIndex(data *dm.DataExportResult) map[string]dm.DataTableRowCount {
+	index := make(map[string]dm.DataTableRowCount)
+	if data == nil {
+		return index
+	}
+	for _, item := range data.TableRowCounts {
+		index[qualifiedTableOutputKey(item.Owner, item.Name)] = item
+	}
+	return index
+}
+
+// formatUnloadingTableLine renders one per-table progress line in the spirit of
+// DUL's ". unloading table T_XIFENFEI  2 rows unloaded", so a multi-table
+// unload shows what each table yielded instead of only a final total.
+func formatUnloadingTableLine(owner string, table string, counts dm.DataTableRowCount) string {
+	line := fmt.Sprintf(". unloading table %-30s %10d rows unloaded", owner+"."+table, counts.RowsExported)
+	if counts.RowsFailed > 0 {
+		line += fmt.Sprintf(" (%d failed)", counts.RowsFailed)
+	}
+	return line
 }
 
 type logicalDMPUnloadRequest struct {

@@ -14,6 +14,17 @@ v主版本.次版本.修订版本
 
 ## 未发布
 
+### Added
+
+- 新增 `describe <owner.table_name>;`(别名 `desc`,借鉴 DUL 的 `desc owner.table`):
+  打印单表的恢复定义与**物理位置**——table_id、表空间/组号、storage_id、B 树 root
+  (file#/page#)、段头(file#/block#)、块数/簇数、存储属性(含 CLUSTERBTR /
+  USING LONG ROW / 分区 / 临时表)、`assist_ids`,以及完整列清单(列号、名称、
+  类型长度精度、可空、默认值)和分区明细。恢复前确认"表被定位到了、数据在哪"。
+- `unload` 逐表打印导出行数(借鉴 DUL 的 `. unloading table NAME N rows unloaded`):
+  多表卸载时每张表单独显示 `. unloading table OWNER.TABLE  N rows unloaded`,
+  有失败行时附加 `(N failed)`,不再只有最后一个总计。
+
 ### Fixed
 
 - SQL DDL 现在为**非同名附加模式**输出 `CREATE SCHEMA ... AUTHORIZATION`。达梦中
