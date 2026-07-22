@@ -14,6 +14,37 @@ v主版本.次版本.修订版本
 
 ## 未发布
 
+### Changed
+
+- **CSV 输出改为 dmfldr 分隔文本 + 每表控制文件**。`set data_format fldr;`(`csv`
+  作为历史别名保留)现在生成 `<owner>_<table>_data.txt` 和配套的
+  `<owner>_<table>_data.ctl`,可直接交给官方 dmfldr 装载:
+
+  ```bash
+  dmfldr USERID=SYSDBA/password@127.0.0.1:5236 CONTROL='HR_TEST_EMP_INFO_data.ctl'
+  ```
+
+  控制文件里的分隔符、NULL 标记、字符集和 BLOB 编码都按数据文件写死。所有规则都是
+  在 DM8 实例上用 `/dm8/bin/dmfldr` 实测确定的,与文档写法有出入的地方以实测为准:
+
+  - `BLOB_TYPE = 'HEX_CHAR'`。用 `'HEX'` 会把十六进制字符本身存进 BLOB,长度翻倍。
+  - `NULL_MODE = TRUE` + `NULL_STR`,NULL 写作 `\N`;空字段因此表示空字符串,NULL
+    与空字符串可区分。
+  - 不输出 `ENCLOSED BY`(语法错误)和列级 `FORMAT`(精度对不上就整表失败);所有恢复
+    类型在 dmfldr 默认解析下都能正确装载。
+  - 分隔符按列类型选:列类型不可能产生 `|`/CR/LF 时用可读的 `|` + LF,只要有字符类型
+    列就改用 SOH(`0x01`)分隔、STX+LF(`0x02 0x0A`)换行。dmfldr 既无可用包围符也不做
+    反转义(`ESCAPED BY` 实测不反转义),可打印分隔符无法与列内容区分;dmdul 从不在
+    字段值里写 C0 控制字符,因此这组分隔符不会与数据冲突。
+  - 时间类型小数秒截到 6 位:dmdul 按列声明精度渲染,DM 最多存 6 位,dmfldr 会直接
+    拒绝更长的小数秒(TIMESTAMP(9) 因此曾整列装载失败)。
+  - 命令行参数值含 `.` 或 `-` 时必须加单引号,生成的控制文件注释里已给出正确写法。
+
+  实机验证:DULTEST 9 张表 53064 行经 dmfldr 装载后逐表 `MINUS` 双向比对差异为 0,
+  覆盖 152 KiB CLOB、128 KiB BLOB、JSON、含换行与竖线的文本、13 种 INTERVAL、
+  TIMESTAMP(9) 和带时区时间戳,dmfldr 报告 0 失败行;1000 万行 `T_CUSTOMER_MOCK`
+  卸载耗时 92 秒、0 失败行。
+
 ### Added
 
 - 新增 `describe <owner.table_name>;`(别名 `desc`,借鉴 DUL 的 `desc owner.table`):

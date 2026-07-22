@@ -191,7 +191,8 @@ func printInteractiveHelp(stdout io.Writer) {
 	fmt.Fprintln(stdout, "  set control <dm.ctl path>;")
 	fmt.Fprintln(stdout, "  set output_dir <directory>;")
 	fmt.Fprintln(stdout, "      Unload/recovery output directory. Defaults to ./output under the launch directory.")
-	fmt.Fprintln(stdout, "  set data_format sql|csv|dmp;")
+	fmt.Fprintln(stdout, "  set data_format sql|fldr|dmp;")
+	fmt.Fprintln(stdout, "      fldr writes a delimited .txt plus a dmfldr .ctl control file per table.")
 	fmt.Fprintln(stdout, "  set case_sensitive auto|0|1;")
 	fmt.Fprintln(stdout, "  set charset auto|utf-8|gb18030|gbk|euc-kr;")
 	fmt.Fprintln(stdout, "  show parameter;")
@@ -393,8 +394,13 @@ func (s *interactiveSession) executeSet(args []string, stdout io.Writer) error {
 		s.outputDirSet = true
 	case "data_format", "format":
 		value = strings.ToLower(strings.TrimSpace(value))
-		if value != "sql" && value != "csv" && value != "dmp" {
-			return fmt.Errorf("data_format must be sql, csv, or dmp")
+		if value != "sql" && value != "csv" && value != "fldr" && value != "dmp" {
+			return fmt.Errorf("data_format must be sql, fldr, or dmp")
+		}
+		if value == "csv" {
+			// The delimited export is now the dmfldr text format; keep "csv"
+			// accepted as an alias but report the format that is produced.
+			value = "fldr"
 		}
 		s.dataFormat = value
 	case "case_sensitive":
@@ -1767,8 +1773,8 @@ func quotedFilterIdentifier(value string) string {
 
 func dataOutputExtension(format string) string {
 	switch strings.ToLower(strings.TrimSpace(format)) {
-	case "csv":
-		return "csv"
+	case "csv", "fldr":
+		return "txt"
 	case "dmp":
 		return "dmp"
 	default:
@@ -1778,7 +1784,7 @@ func dataOutputExtension(format string) string {
 
 func splitDataFormat(format string) bool {
 	format = strings.ToLower(strings.TrimSpace(format))
-	return format == "csv" || format == "dmp"
+	return format == "csv" || format == "fldr" || format == "dmp"
 }
 
 func printDataExportWarnings(stdout io.Writer, result *dm.DataExportResult) {
@@ -2081,7 +2087,7 @@ func (s *interactiveSession) loadInitDUL(path string) error {
 			s.dataDirSet = value != ""
 		case "data_format", "format":
 			value = strings.ToLower(value)
-			if value == "sql" || value == "csv" || value == "dmp" {
+			if value == "sql" || value == "csv" || value == "fldr" || value == "dmp" {
 				s.dataFormat = value
 			}
 		case "case_sensitive":

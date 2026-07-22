@@ -204,10 +204,10 @@ output/emp_info_ddl.sql
 output/emp_info_data.sql
 ```
 
-导出 CSV 数据：
+导出 dmfldr 数据（分隔文本 + 控制文件）：
 
 ```text
-DMDUL> set data_format csv;
+DMDUL> set data_format fldr;
 DMDUL> unload table HR_TEST.EMP_INFO;
 ```
 
@@ -215,8 +215,27 @@ DMDUL> unload table HR_TEST.EMP_INFO;
 
 ```text
 output/HR_TEST_EMP_INFO_ddl.sql
-output/HR_TEST_EMP_INFO_data.csv
+output/HR_TEST_EMP_INFO_data.txt
+output/HR_TEST_EMP_INFO_data.ctl
 ```
+
+回灌时先用 `_ddl.sql` 建表，再用官方 dmfldr 装载数据。控制文件里的字段/行分隔符、
+NULL 标记、字符集和 BLOB 编码都已按数据文件写死，通常不需要改动：
+
+```bash
+dmfldr USERID=SYSDBA/password@127.0.0.1:5236 CONTROL='HR_TEST_EMP_INFO_data.ctl'
+```
+
+`CONTROL` 的值必须加单引号：dmfldr 拒绝解析含 `.` 的未加引号参数值。
+
+分隔符由表的列类型决定，控制文件与数据文件永远一致：
+
+- 所有列都不可能产生 `|`、CR、LF（数值、日期时间、INTERVAL、十六进制二进制）时，
+  使用可读的 `|` 分隔、LF 换行。
+- 只要有一个字符类型列，就改用 SOH（`0x01`）分隔、STX+LF（`0x02 0x0A`）换行。
+  dmfldr 既不支持包围符也不支持转义（`ENCLOSED BY` 是语法错误，`ESCAPED BY` 不做
+  反转义），可打印分隔符无法与列内容区分，因此文本表只能用控制字符分隔。dmdul 从不
+  在字段值中写入 C0 控制字符，所以这组分隔符不会与数据冲突。
 
 导出达梦原生逻辑 DMP：
 
@@ -308,12 +327,13 @@ output/HR_TEST_T_LOG_HEAP_ddl.sql
 output/HR_TEST_T_LOG_HEAP_data.sql
 ```
 
-如果 `data_format=csv`，每张表仍会生成自己的 DDL，数据写入对应 CSV；没有数据的表
-只保留 DDL，不生成空 CSV。例如：
+如果 `data_format=fldr`，每张表仍会生成自己的 DDL，数据写入对应 `.txt` 并附带同名
+`.ctl`；没有数据的表只保留 DDL，不生成空数据文件。例如：
 
 ```text
 output/HR_TEST_EMP_INFO_ddl.sql
-output/HR_TEST_EMP_INFO_data.csv
+output/HR_TEST_EMP_INFO_data.txt
+output/HR_TEST_EMP_INFO_data.ctl
 output/HR_TEST_T_LOG_HEAP_ddl.sql
 ```
 
@@ -339,7 +359,7 @@ output/HR_TEST.dmp
 DMDUL> unload user HR_TEST to hr_test_all;
 ```
 
-SQL/CSV 格式下文件前缀会变为 `hr_test_all_<table_name>`；DMP 格式下生成
+SQL/fldr 格式下文件前缀会变为 `hr_test_all_<table_name>`；DMP 格式下生成
 `hr_test_all_ddl.sql` 和 `hr_test_all.dmp`。
 
 `unload user all;` 已移除。整库导出统一使用 `unload database;`，避免两个命令表达同一操作。
@@ -373,13 +393,15 @@ output/DATABASE_data.sql
 `DATABASE_ddl.sql` 包含可识别用户、用户表、视图、序列、存储过程/函数/包、触发器、同义词和表/视图/序列授权 DDL；`DATABASE_data.sql`
 包含所有可识别用户表的 INSERT 数据。
 
-如果 `data_format=csv`，`unload database` 会生成一个全库 DDL 文件，并按 owner/table
-分别生成 CSV 文件；没有数据的表不会生成空 CSV。例如：
+如果 `data_format=fldr`，`unload database` 会生成一个全库 DDL 文件，并按 owner/table
+分别生成 `.txt` 数据文件和 `.ctl` 控制文件；没有数据的表不会生成空数据文件。例如：
 
 ```text
 output/DATABASE_ddl.sql
-output/DATABASE_HR_TEST_EMP_INFO_data.csv
-output/DATABASE_SYSDBA_T_data.csv
+output/DATABASE_HR_TEST_EMP_INFO_data.txt
+output/DATABASE_HR_TEST_EMP_INFO_data.ctl
+output/DATABASE_SYSDBA_T_data.txt
+output/DATABASE_SYSDBA_T_data.ctl
 ```
 
 如果 `data_format=dmp`，对应官方 FULL 级别，生成一个同时包含全部可恢复元数据和数据的

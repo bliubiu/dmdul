@@ -663,7 +663,7 @@ func TestInteractiveUnloadUserCSVExportsPerTableAndSkipsEmptyData(t *testing.T) 
 		output := stdout.String()
 		for _, want := range []string{
 			"APP_WITH_ROWS_ddl.sql",
-			"APP_WITH_ROWS_data.csv",
+			"APP_WITH_ROWS_data.txt",
 			"APP_EMPTY_TABLE_ddl.sql",
 			"data output: skipped (no rows)",
 			"ddl files exported: 2",
@@ -674,11 +674,12 @@ func TestInteractiveUnloadUserCSVExportsPerTableAndSkipsEmptyData(t *testing.T) 
 				t.Fatalf("interactive output should contain %q, got %q", want, output)
 			}
 		}
-		csvText := readTestFile(t, filepath.Join(outDir, "APP_WITH_ROWS_data.csv"))
-		if strings.TrimSpace(csvText) != "ID\n100" && strings.TrimSpace(csvText) != "ID\r\n100" {
-			t.Fatalf("unexpected csv output %q", csvText)
+		csvText := readTestFile(t, filepath.Join(outDir, "APP_WITH_ROWS_data.txt"))
+		// fldr data files carry rows only; column order lives in the .ctl.
+		if strings.TrimSpace(csvText) != "100" {
+			t.Fatalf("unexpected fldr output %q", csvText)
 		}
-		if _, err := os.Stat(filepath.Join(outDir, "APP_EMPTY_TABLE_data.csv")); !os.IsNotExist(err) {
+		if _, err := os.Stat(filepath.Join(outDir, "APP_EMPTY_TABLE_data.txt")); !os.IsNotExist(err) {
 			t.Fatalf("empty table CSV should not exist, stat err=%v", err)
 		}
 	})
@@ -816,10 +817,10 @@ func TestInteractiveUnloadDatabaseCSVExportsPerTableAndSkipsEmptyTables(t *testi
 		output := stdout.String()
 		for _, want := range []string{
 			"DATABASE_ddl.sql",
-			"csv output:",
-			"DATABASE_APP_WITH_ROWS_data.csv",
-			"csv skipped: APP.EMPTY_TABLE (no rows)",
-			"csv files exported: 1",
+			"fldr output:",
+			"DATABASE_APP_WITH_ROWS_data.txt",
+			"fldr skipped: APP.EMPTY_TABLE (no rows)",
+			"fldr files exported: 1",
 			"rows exported: 1",
 			"rows failed: 0",
 		} {
@@ -827,12 +828,13 @@ func TestInteractiveUnloadDatabaseCSVExportsPerTableAndSkipsEmptyTables(t *testi
 				t.Fatalf("interactive output should contain %q, got %q", want, output)
 			}
 		}
-		csvPath := filepath.Join(outDir, "DATABASE_APP_WITH_ROWS_data.csv")
+		csvPath := filepath.Join(outDir, "DATABASE_APP_WITH_ROWS_data.txt")
 		csvText := readTestFile(t, csvPath)
-		if strings.TrimSpace(csvText) != "ID\n100" && strings.TrimSpace(csvText) != "ID\r\n100" {
-			t.Fatalf("unexpected csv output %q", csvText)
+		// fldr data files carry rows only; column order lives in the .ctl.
+		if strings.TrimSpace(csvText) != "100" {
+			t.Fatalf("unexpected fldr output %q", csvText)
 		}
-		if _, err := os.Stat(filepath.Join(outDir, "DATABASE_APP_EMPTY_TABLE_data.csv")); !os.IsNotExist(err) {
+		if _, err := os.Stat(filepath.Join(outDir, "DATABASE_APP_EMPTY_TABLE_data.txt")); !os.IsNotExist(err) {
 			t.Fatalf("empty table csv should not exist, stat err=%v", err)
 		}
 	})

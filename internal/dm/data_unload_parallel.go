@@ -180,8 +180,8 @@ func (r *directPageResult) approxBytes() int64 {
 // sequential processPage path and the parallel decode workers.
 func renderDataRowForExport(outputFormat string, info dataTableInfo, rowBytes []byte, decoder textDecoder, dmpCharset dmpCharsetHeader) (line string, record []string, fields []DMPField, meta dataRowRenderMeta, timeFractionLoss bool, err error) {
 	switch outputFormat {
-	case "csv":
-		record, _, _, meta, err = renderCSVForDataRowWithMeta(info, rowBytes, decoder)
+	case "fldr":
+		record, _, _, meta, err = renderFldrForDataRowWithMeta(info, rowBytes, decoder)
 	case "dmp":
 		fields, _, _, meta, timeFractionLoss, err = renderDMPForDataRowWithMeta(info, rowBytes, decoder, dmpCharset)
 	default:

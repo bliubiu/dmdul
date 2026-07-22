@@ -52,8 +52,8 @@ log=
 | `system` | `SYSTEM.DBF` | 达梦系统表空间文件路径。 |
 | `control` | 自动查找 `SYSTEM.DBF` 同目录下的 `dm.ctl` | 可选控制文件路径。 |
 | `data_dir` | `SYSTEM.DBF` 所在目录 | 用户表空间 DBF 文件所在目录。 |
-| `output_dir` | `./output` | `unload` / `recover` 生成的 DDL、SQL、CSV 和 DMP 目录。默认相对于启动 DMDUL 时的当前目录，不跟随 `data_dir`；显式设置时直接使用指定目录。 |
-| `data_format` | `sql` | 数据导出格式，支持 `sql`、`csv` 和 `dmp`。DMP 生成包含元数据与数据的原生逻辑文件。 |
+| `output_dir` | `./output` | `unload` / `recover` 生成的 DDL、SQL、dmfldr 和 DMP 目录。默认相对于启动 DMDUL 时的当前目录，不跟随 `data_dir`；显式设置时直接使用指定目录。 |
+| `data_format` | `sql` | 数据导出格式，支持 `sql`、`fldr` 和 `dmp`。`fldr` 生成 dmfldr 可直接装载的 `.txt` 数据文件和配套 `.ctl` 控制文件；`csv` 是 `fldr` 的历史别名。DMP 生成包含元数据与数据的原生逻辑文件。 |
 | `case_sensitive` | `auto` | DMP 文件头的建库大小写敏感标志。`auto` 优先读取 `SYSTEM.DBF` 第 4 页偏移 `0x2C`；也可显式设为 `0` 或 `1`。 |
 | `charset` | `auto` | 字典和数据文本解码字符集。 |
 | `log` | 工作目录下的 `dul.log` | 交互式执行日志；工作目录为 `data_dir`，未设置时为当前目录。 |
@@ -94,7 +94,8 @@ DMDUL 使用实际值。
 <launch_dir>/
 └── output/
     ├── <owner>_<table>_ddl.sql
-    └── <owner>_<table>_data.{sql|csv}
+    ├── <owner>_<table>_data.{sql|txt}
+    └── <owner>_<table>_data.ctl   # 仅 fldr 格式，dmfldr 控制文件
 
 <data_dir>/
 ├── init.dul
@@ -127,7 +128,7 @@ DMDUL> set system D:\temp\oldpro\SYSTEM.DBF;
 DMDUL> set control D:\temp\oldpro\dm.ctl;
 DMDUL> set data_dir D:\temp\oldpro;
 DMDUL> set output_dir D:\temp\oldpro\out;
-DMDUL> set data_format csv;
+DMDUL> set data_format fldr;
 DMDUL> set data_format dmp;
 DMDUL> set case_sensitive 0;
 DMDUL> set charset gb18030;
@@ -297,7 +298,8 @@ v0.1.6 开始，`bootstrap` 会尝试通过 DBF 页头和 assist id 自动推断
 - `dmdul_dict/`
 - `output/`
 - `dul.log`
-- `*.csv`
+- `*.txt`
+- `*.ctl`
 - `*.sql`
 - `*.dmp`
 - `oldpro/`

@@ -3,7 +3,6 @@ package dm
 import (
 	"bufio"
 	"encoding/binary"
-	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -171,6 +170,9 @@ type dataTableInfo struct {
 	// the per-row SQL renderer does not rebuild and re-quote the identical
 	// column list for every row.
 	sqlInsertPrefix string
+	// fldrDialect is the delimiter pair the table's dmfldr .txt and .ctl agree
+	// on, decided once from the column types (see fldrDialectForColumns).
+	fldrDialect fldrDialect
 	// coverage tracks per-row column-prefix keys, which deduplicate
 	// ALTER-history partial rows against full rows when the same logical row
 	// can be visited through more than one storage (historical assists,
@@ -311,7 +313,6 @@ type dataOutputFile struct {
 	path      string
 	file      *os.File
 	writer    *bufio.Writer
-	csvWriter *csv.Writer
 	dmpWriter *DMPDataWriter
 }
 
@@ -336,6 +337,9 @@ type dataOutputRouter struct {
 	tableOutputsByID map[uint32]DataTableOutput
 	dmpConfig        dataDMPOutputConfig
 	dmpWritersByID   map[uint32]*DMPDataWriter
+	// charset is the recovered database character set, echoed into dmfldr
+	// control files so the loader is invoked with a matching CHARACTER_CODE.
+	charset string
 
 	oversizedSQLRows     int
 	oversizedSQLTableIDs map[uint32]string
@@ -358,6 +362,7 @@ func newDataOutputRouter(opts DataExportOptions, outputFormat string, selectedTa
 		lastUsedByID:     make(map[uint32]uint64),
 		tableOutputsByID: make(map[uint32]DataTableOutput),
 		dmpWritersByID:   make(map[uint32]*DMPDataWriter),
+		charset:          opts.Charset,
 	}
 	if len(dmpConfigs) > 0 {
 		router.dmpConfig = dmpConfigs[0]
@@ -367,11 +372,11 @@ func newDataOutputRouter(opts DataExportOptions, outputFormat string, selectedTa
 		if table, ok := singleSelectedDataTable(selectedTables); ok {
 			router.mainTable = table
 		}
-		if outputFormat == "csv" || outputFormat == "dmp" {
+		if outputFormat == "fldr" || outputFormat == "dmp" {
 			_ = os.Remove(opts.OutputPath)
 			return router, nil
 		}
-		file, err := openDataOutputFile(opts.OutputPath, outputFormat, router.mainTable)
+		file, err := openDataOutputFile(opts.OutputPath, outputFormat, router.mainTable, router.charset)
 		if err != nil {
 			return nil, err
 		}
@@ -392,11 +397,11 @@ func newDataOutputRouter(opts DataExportOptions, outputFormat string, selectedTa
 		}
 		pathOwners[pathKey] = tableID
 		router.pathsByTable[tableID] = path
-		if outputFormat == "csv" || outputFormat == "dmp" {
+		if outputFormat == "fldr" || outputFormat == "dmp" {
 			_ = os.Remove(path)
 			continue
 		}
-		file, err := openDataOutputFile(path, outputFormat, table)
+		file, err := openDataOutputFile(path, outputFormat, table, router.charset)
 		if err != nil {
 			_ = router.close()
 			return nil, err
@@ -431,7 +436,7 @@ func sortedDataTableIDs(tables map[uint32]dataTableInfo) []uint32 {
 	return ids
 }
 
-func openDataOutputFile(path string, outputFormat string, table dataTableInfo) (*dataOutputFile, error) {
+func openDataOutputFile(path string, outputFormat string, table dataTableInfo, charset string) (*dataOutputFile, error) {
 	if dir := filepath.Dir(path); dir != "." && dir != "" {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return nil, fmt.Errorf("create data output directory: %w", err)
@@ -442,11 +447,13 @@ func openDataOutputFile(path string, outputFormat string, table dataTableInfo) (
 		return nil, fmt.Errorf("create data output: %w", err)
 	}
 	target := &dataOutputFile{path: path, file: out, writer: bufio.NewWriter(out)}
-	if outputFormat == "csv" {
-		target.csvWriter = csv.NewWriter(target.writer)
-		if err := target.csvWriter.Write(csvHeaderForDataTable(table)); err != nil {
+	if outputFormat == "fldr" {
+		// The data file carries rows only; the companion control file tells
+		// dmfldr how to read them, so it is written alongside on creation.
+		if err := WriteFldrControlFile(fldrControlFilePath(path), path,
+			table.table.Owner, table.table.Name, table.columns, charset); err != nil {
 			_ = out.Close()
-			return nil, fmt.Errorf("write csv header: %w", err)
+			return nil, err
 		}
 		return target, nil
 	}
@@ -461,11 +468,7 @@ func openExistingDataOutputFile(path string, outputFormat string) (*dataOutputFi
 	if err != nil {
 		return nil, fmt.Errorf("open data output for append: %w", err)
 	}
-	target := &dataOutputFile{path: path, file: out, writer: bufio.NewWriter(out)}
-	if outputFormat == "csv" {
-		target.csvWriter = csv.NewWriter(target.writer)
-	}
-	return target, nil
+	return &dataOutputFile{path: path, file: out, writer: bufio.NewWriter(out)}, nil
 }
 
 func (r *dataOutputRouter) targetForTable(table dataTableInfo) (*dataOutputFile, error) {
@@ -476,7 +479,7 @@ func (r *dataOutputRouter) targetForTable(table dataTableInfo) (*dataOutputFile,
 		if r.main != nil {
 			return r.main, nil
 		}
-		file, err := openDataOutputFile(r.mainPath, r.format, r.mainTable)
+		file, err := openDataOutputFile(r.mainPath, r.format, r.mainTable, r.charset)
 		if err != nil {
 			return nil, err
 		}
@@ -498,7 +501,7 @@ func (r *dataOutputRouter) targetForTable(table dataTableInfo) (*dataOutputFile,
 	if r.initializedByID[table.table.ID] {
 		file, err = openExistingDataOutputFile(path, r.format)
 	} else {
-		file, err = openDataOutputFile(path, r.format, table)
+		file, err = openDataOutputFile(path, r.format, table, r.charset)
 	}
 	if err != nil {
 		return nil, err
@@ -614,9 +617,10 @@ func (r *dataOutputRouter) writeRow(table dataTableInfo, line string, record []s
 	if err != nil {
 		return err
 	}
-	if r.format == "csv" {
-		if err := target.csvWriter.Write(record); err != nil {
-			return fmt.Errorf("write csv row: %w", err)
+	if r.format == "fldr" {
+		dialect := table.fldrDialect.resolved()
+		if _, err := target.writer.WriteString(strings.Join(record, dialect.fieldSep) + dialect.rowTerm); err != nil {
+			return fmt.Errorf("write fldr row: %w", err)
 		}
 		return nil
 	}
@@ -658,7 +662,7 @@ func (r *dataOutputRouter) writeDMPSegments(table dataTableInfo, segments []dmpR
 }
 
 func (r *dataOutputRouter) writeFailure(table dataTableInfo, message string) error {
-	if r.format == "csv" || r.format == "dmp" {
+	if r.format == "fldr" || r.format == "dmp" {
 		return nil
 	}
 	target, err := r.targetForTable(table)
@@ -744,12 +748,6 @@ func closeDataOutputFile(target *dataOutputFile) error {
 		return nil
 	}
 	var firstErr error
-	if target.csvWriter != nil {
-		target.csvWriter.Flush()
-		if err := target.csvWriter.Error(); err != nil {
-			firstErr = err
-		}
-	}
 	if err := target.writer.Flush(); err != nil && firstErr == nil {
 		firstErr = err
 	}
@@ -922,6 +920,7 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 			segment:         segmentByTableID(opts.Dictionary, tableID),
 			segmentKnown:    hasSegmentRange(opts.Dictionary, tableID),
 			sqlInsertPrefix: sqlInsertPrefixForTable(table, columnsByTable[tableID]),
+			fldrDialect:     fldrDialectForColumns(columnsByTable[tableID]),
 		}
 		selectedTables[tableID] = baseInfo
 		storageUnits[tableID] = baseInfo
@@ -1003,7 +1002,7 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 		PlannedPages:     len(plannedRefs),
 	}
 	rowStats := initDataTableRowStats(selectedTables)
-	if (outputFormat == "csv" || outputFormat == "dmp") && opts.TableOutputPath == nil && len(selectedTables) > 1 {
+	if (outputFormat == "fldr" || outputFormat == "dmp") && opts.TableOutputPath == nil && len(selectedTables) > 1 {
 		return nil, fmt.Errorf("%s export requires exactly one table or per-table output paths; selected %d tables", outputFormat, len(selectedTables))
 	}
 
@@ -1022,7 +1021,7 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 		result.TableRowCounts = finalizeDataTableRowStats(rowStats)
 		result.TablesWithoutRows = len(result.TableRowCounts)
 		result.TableOutputs = output.tableOutputs()
-		if (outputFormat == "csv" || outputFormat == "dmp") && opts.TableOutputPath == nil {
+		if (outputFormat == "fldr" || outputFormat == "dmp") && opts.TableOutputPath == nil {
 			result.OutputPath = ""
 		}
 		if err := output.close(); err != nil {
@@ -1576,7 +1575,7 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 	result.TableOutputs = output.tableOutputs()
 	result.OversizedSQLStatements = output.oversizedSQLRows
 	result.OversizedSQLTables = sortedOversizedSQLTables(output.oversizedSQLTableIDs)
-	if (outputFormat == "csv" || outputFormat == "dmp") && opts.TableOutputPath == nil && result.RowsExported == 0 {
+	if (outputFormat == "fldr" || outputFormat == "dmp") && opts.TableOutputPath == nil && result.RowsExported == 0 {
 		result.OutputPath = ""
 	}
 	if err := output.close(); err != nil {
@@ -2912,8 +2911,14 @@ func normalizeDataOutputFormat(value string) string {
 		return "sql"
 	}
 	switch value {
-	case "sql", "csv", "dmp":
+	case "sql", "dmp", "fldr":
 		return value
+	case "csv":
+		// The former CSV export is now the dmfldr text format: a plain CSV
+		// cannot be loaded back into DM, which is the point of a recovery
+		// dump. "csv" stays accepted as an alias so existing scripts keep
+		// working, but it produces the pipe-delimited .txt plus .ctl pair.
+		return "fldr"
 	default:
 		return ""
 	}
