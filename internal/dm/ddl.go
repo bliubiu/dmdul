@@ -113,6 +113,8 @@ type DDLExportResult struct {
 	ViewCount            int
 	SequenceCount        int
 	RoutineCount         int
+	TypeCount            int
+	DirectoryCount       int
 	TriggerCount         int
 	SynonymCount         int
 	TabPrivilegeCount    int
@@ -129,28 +131,30 @@ type ddlLocation struct {
 }
 
 type dictionaryObject struct {
-	ID                uint32
-	SchemaID          uint32
-	Owner             string
-	ParentID          int32
-	Info1             uint32
-	Info2             uint32
-	Info3             uint64
-	Info4             int64
-	Payload           []byte
-	Valid             string
-	Name              string
-	Type              string
-	Subtype           string
-	TargetOwner       string
-	TargetName        string
-	Location          ddlLocation
-	HugeAuxID         uint32
-	HugeRAuxID        uint32
-	HugeDAuxID        uint32
-	HugeUAuxID        uint32
-	HugeTableFlag     bool
-	HugeWithDeltaFlag bool
+	MaterializedBacking bool
+	DirectoryPath       string
+	ID                  uint32
+	SchemaID            uint32
+	Owner               string
+	ParentID            int32
+	Info1               uint32
+	Info2               uint32
+	Info3               uint64
+	Info4               int64
+	Payload             []byte
+	Valid               string
+	Name                string
+	Type                string
+	Subtype             string
+	TargetOwner         string
+	TargetName          string
+	Location            ddlLocation
+	HugeAuxID           uint32
+	HugeRAuxID          uint32
+	HugeDAuxID          uint32
+	HugeUAuxID          uint32
+	HugeTableFlag       bool
+	HugeWithDeltaFlag   bool
 }
 
 func (obj dictionaryObject) isIOTTable() bool {
@@ -184,7 +188,7 @@ func (obj dictionaryObject) isHugeInternalTable() bool {
 }
 
 func (obj dictionaryObject) isSystemManagedInternalTable() bool {
-	return obj.isHugeInternalTable() || isVectorInternalTableName(obj.Name)
+	return obj.MaterializedBacking || obj.isHugeInternalTable() || isVectorInternalTableName(obj.Name)
 }
 
 func (obj dictionaryObject) isHugeMainCandidate() bool {
@@ -432,6 +436,7 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 		}
 	}
 	linkHugeTableObjects(tables)
+	markMaterializedBackingTables(objects, tables)
 	removeSystemManagedInternalTables(tables)
 	applyDictionaryUserOverrides(opts.Dictionary, users)
 	dictionaryTables := applyDictionaryTableOverrides(opts.Dictionary, tables, tablespaces)
@@ -573,6 +578,8 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 	var views []DictionaryView
 	var sequences []DictionarySequence
 	var routines []DictionaryRoutine
+	var types []DictionaryType
+	var directories []DictionaryDirectory
 	var triggers []DictionaryTrigger
 	var synonyms []DictionarySynonym
 	if tableOnlyMode {
@@ -595,6 +602,16 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 			return nil, textErr
 		}
 		views = scanDictionaryViews(objects, texts, ownerMatcher)
+		types = scanDictionaryTypes(objects, texts, ownerMatcher)
+		if ownerMatcher.allUser {
+			directories = scanDictionaryDirectories(objects)
+			if opts.Dictionary != nil && opts.Dictionary.Directories != nil {
+				directories = opts.Dictionary.Directories
+			}
+		}
+		if dictTypes, ok := dictionaryTypesForDDL(opts.Dictionary, ownerMatcher); ok {
+			types = dictTypes
+		}
 		if dictViews, ok := dictionaryViewsForDDL(opts.Dictionary, ownerMatcher); ok {
 			views = dictViews
 		}
@@ -665,7 +682,7 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 			tables, columnsByTable, columnsByTableColID, indexObjects, indexes,
 			tableStorage, partitionsByTable, partitionKeysByTable,
 			constraintObjects, constraints, tableComments, columnComments,
-			views, sequences, routines, triggers, synonyms, tabPrivileges, systemPrivileges,
+			views, sequences, routines, types, directories, triggers, synonyms, tabPrivileges, systemPrivileges,
 			ownerMatcher, tableMatcher, tablespaces,
 		)
 		if err != nil {
@@ -699,7 +716,7 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 			exactTableMatcher := newTableNameMatcher(table.Owner + "." + table.Name)
 			tableTriggers := filterDDLTriggersByTable(triggers, exactTableMatcher)
 			tablePrivileges := filterDDLPrivilegesByTable(tabPrivileges, exactTableMatcher)
-			sql := renderDDL(objects, nil, nil, nil, tables, columnsByTable, columnsByTableColID, indexObjects, indexes, tableStorage, partitionsByTable, partitionKeysByTable, constraintObjects, constraints, tableComments, columnComments, nil, nil, nil, tableTriggers, nil, tablePrivileges, nil, exactOwnerMatcher, exactTableMatcher, tablespaces)
+			sql := renderDDL(objects, nil, nil, nil, tables, columnsByTable, columnsByTableColID, indexObjects, indexes, tableStorage, partitionsByTable, partitionKeysByTable, constraintObjects, constraints, tableComments, columnComments, nil, nil, nil, nil, nil, tableTriggers, nil, tablePrivileges, nil, exactOwnerMatcher, exactTableMatcher, tablespaces)
 			if err := os.WriteFile(path, []byte(sql), 0644); err != nil {
 				return nil, fmt.Errorf("write ddl output for %s.%s: %w", table.Owner, table.Name, err)
 			}
@@ -708,7 +725,7 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 			})
 		}
 	} else {
-		sql := renderDDL(objects, users, roles, roleGrants, tables, columnsByTable, columnsByTableColID, indexObjects, indexes, tableStorage, partitionsByTable, partitionKeysByTable, constraintObjects, constraints, tableComments, columnComments, views, sequences, routines, triggers, synonyms, tabPrivileges, systemPrivileges, ownerMatcher, tableMatcher, tablespaces)
+		sql := renderDDL(objects, users, roles, roleGrants, tables, columnsByTable, columnsByTableColID, indexObjects, indexes, tableStorage, partitionsByTable, partitionKeysByTable, constraintObjects, constraints, tableComments, columnComments, views, sequences, routines, types, directories, triggers, synonyms, tabPrivileges, systemPrivileges, ownerMatcher, tableMatcher, tablespaces)
 		if err := os.WriteFile(opts.OutputPath, []byte(sql), 0644); err != nil {
 			return nil, fmt.Errorf("write ddl output: %w", err)
 		}
@@ -738,6 +755,8 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 		ViewCount:            len(views),
 		SequenceCount:        len(sequences),
 		RoutineCount:         len(routines),
+		TypeCount:            len(types),
+		DirectoryCount:       len(directories),
 		TriggerCount:         len(triggers),
 		SynonymCount:         len(synonyms),
 		TabPrivilegeCount:    len(tabPrivileges),

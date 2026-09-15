@@ -12,6 +12,62 @@ v主版本.次版本.修订版本
 
 ------
 
+## v0.11.0 - Hardening & Extended Recovery
+
+发布日期：2026-09-15。源码构建最低要求为 Go 1.26；运行发布包无需安装 Go。
+
+### Added
+
+- HUGE 支持已验证的 ZIP level 2/9 和 Snappy level 10 section。限定解压长度，临时文件
+  承接解压结果并自动清理，拒绝未知 transform、非零尾部和非法信封。
+- HUGE 新增 BIT/TINYINT/REAL/FLOAT、BINARY/VARBINARY、13 字节 TIME/TIMESTAMP/带时区时间、
+  YEAR TO MONTH / DAY TO SECOND INTERVAL；继续按 presence bitmap 处理可空定长列。
+- 多 HFS path 以文件头完整身份匹配；AUX FILE_ID 高字节为路径号、低 24 位为列文件序号，
+  缺文件、同身份重复副本明确报错，不按目录顺序选文件。
+- `bootstrap` 持久化 `types.tsv`、`directories.tsv`；SQL/DMP 增加 TYPE/TYPE BODY 与
+  全局目录定义，保留类型创建顺序。类型定义不代表已支持该类型列的数据。
+- `views.tsv` 增加 materialized/mv_flags，恢复已验证简单物化视图的刷新方法、模式、ROWID
+  和查询重写选项；使用 BUILD DEFERRED，明确不恢复物化数据、原构建状态和刷新作业。
+- 新增 [扩展兼容验证](docs/extended-compatibility-20260915.md)，记录实测和仍未完成项目。
+
+### Fixed
+
+- 页大小探测不再忽略采样页的短读或 I/O 错误；错误包含候选页大小、页号和读取位置。
+- 同一页大小下出现两组充分的 group/file 证据时拒绝选择，避免依赖 map 遍历顺序。
+- 页数超过内部 32 位计数范围时明确拒绝，不再截断后扫描错误范围。
+- 不再把物化视图的 CREATE 名称前缀当作完整 DDL；元数据不足时 SQL 告警、DMP 停止。
+  有明确 VIEW 对应关系的内部 MTAB$_ 表不作为独立用户表重复导出。
+
+### Changed
+
+- 探测按固定顺序采样每种候选页大小的前 128 页与 32 个分布点，去重后最多 640 页，
+  加上文件头总读取量不足 10 MiB，不随 DBF 长度增长；仍不把文件长度当作页大小证据。
+- `golang.org/x/text` 从 v0.22.0 升至 v0.42.0，消除 GO-2026-5970 的旧模块公告。
+  **源码构建最低 Go 版本从 1.22 提升到 1.26**，使用已编译程序无需安装 Go。
+- CI 增加 gofmt、`go mod verify`、模块级漏洞门禁和 Windows 调用路径扫描；
+  fuzz 从五组扩展到九组，手动运行支持每组 300 秒，失败最小语料保留七天。
+- 新增 [Hardening 规则与验证](docs/hardening.md)，统一当前开发要求、实验依据和未覆盖边界。
+  README、安装、开发说明和路线图同步；已发布版本记录与标签保持不变。
+
+### Tests
+
+- 增加确定性读取量、混合文件身份、独立结构证据、读取错误、页数溢出及采样边界回归。
+- 新增紧凑参数 fuzz：页大小字段组合、采样地址边界、SM3/SHA256 sector 校验与还原幂等性。
+- 固定字节回归覆盖 UTF-8、GB18030 双/四字节、EUC-KR 的解码与 DMP 编码，防止依赖升级改变已知映射。
+- 提供只读冷样本测试入口 `DMDUL_GEOMETRY_SAMPLES`，用内存覆盖模拟损坏文件头，不改写 DBF。
+- 2026-09-15：DM8/DM9 九份冷 SYSTEM 页头实验通过；DM9 八组参数矩阵的三格式导出、
+  页检查及 DMP 导回通过，双向 MINUS 为 0；DM8 2500 行 HUGE SQL 与权限 DMP 导回通过。
+  Windows Go 1.26.8/1.27.1、Linux race、九组短时 fuzz 通过；提交前结果不代表远端 CI 已运行。
+- 同日扩展实验：HUGE 16 表、48,500 行 SQL 回灌双向 MINUS 均为 0，包含两条 HFS 路径。
+  独立新库按相同模式导入自定义类型/类型体和四种简单物化视图，官方 dexp 对照与 dmdul
+  DMP 均无警告，类型成员函数执行正确；REMAP_SCHEMA 不保证重写查询内的限定模式名。
+- HFS 校验和、专用 DECIMAL 打包、DMASM HFS/REDO/已删除文件/单文件超 65535 AU、
+  第二个 DM9 build、作业与策略 **未完成**，没有提升支持声明。
+- 发布构建使用 Go 1.27.1、`-trimpath -s -w`，Windows/Linux 包保留项目和全部第三方许可证。
+  发布检查与实验范围见 [v0.11.0 验证记录](docs/release-v0.11.0-validation.md)。
+
+------
+
 ## v0.10.0 - Recovery Hardening
 
 发布日期：2026-09-07。

@@ -21,6 +21,7 @@ DMDUL> scan storage;
 `storage_scan;` 是同一命令的别名。无需先执行 `bootstrap;` 或 `load dictionary;`。
 
 扫描按页读取，使用文件头及多页证据确定页大小，用实际页头投票确定 group/file。
+页大小采样范围、读取错误和歧义处理见 [Hardening 探测规则](hardening.md#页大小探测)。
 身份不唯一、重复 group/file 或页大小证据冲突会停止扫描。符号链接被拒绝，避免读取恢复目录
 之外的文件。截断尾页、页身份和行结构异常写入错误清单。
 

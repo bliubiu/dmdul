@@ -5,6 +5,12 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      fuzz_seconds:
+        description: Seconds per fuzz target
+        type: choice
+        default: '30'
+        options: ['30', '300']
 
 permissions:
   contents: read
@@ -19,7 +25,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        go: ['1.22.x', 'stable']
+        go: ['1.26.x', 'stable']
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
@@ -30,6 +36,15 @@ jobs:
         with:
           go-version: ${{ matrix.go }}
           cache-dependency-path: go.sum
+      - name: Check Go formatting
+        shell: bash
+        run: |
+          unformatted=$(git ls-files -z '*.go' | xargs -0 gofmt -l)
+          if [ -n "$unformatted" ]; then
+            printf '%s\n' "$unformatted"
+            exit 1
+          fi
+      - run: go mod verify
       - run: go vet ./...
       - run: go test -count=1 -timeout=10m ./...
       - run: go build -trimpath ./cmd/dmdul
@@ -54,7 +69,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [FuzzPageGeometry, FuzzDataPageSlots, FuzzDataRowMetadata, FuzzDMPContainer, FuzzDMASMMetadata]
+        target: [FuzzPageGeometry, FuzzPageGeometryFields, FuzzPageProbeRefs, FuzzPageCheck, FuzzDataPageSlots, FuzzDataRowMetadata, FuzzDMPContainer, FuzzDMASMMetadata, FuzzHugeCompressedBody]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -62,7 +77,19 @@ jobs:
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: stable
-      - run: go test ./internal/dm -run '^$' -fuzz '^${{ matrix.target }}$' -fuzztime=30s -parallel=2
+      - name: Fuzz bounded parser inputs
+        env:
+          FUZZ_SECONDS: ${{ inputs.fuzz_seconds || '30' }}
+          FUZZ_TARGET: ${{ matrix.target }}
+        run: go test ./internal/dm -run '^$' -fuzz "^${FUZZ_TARGET}$" -fuzztime="${FUZZ_SECONDS}s" -parallel=2 -timeout=8m
+      - name: Preserve minimized failures
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fuzz-failure-${{ matrix.target }}
+          path: internal/dm/testdata/fuzz/
+          if-no-files-found: ignore
+          retention-days: 7
 
   vulnerabilities:
     runs-on: ubuntu-latest
@@ -76,3 +103,11 @@ jobs:
           go-version: stable
       - run: go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
       - run: govulncheck -show verbose ./...
+      - name: Reject known vulnerable dependency modules
+        run: govulncheck -scan module
+        working-directory: cmd/dmdul
+      - name: Check Windows call graph
+        run: govulncheck -show verbose ./...
+        env:
+          GOOS: windows
+          GOARCH: amd64

@@ -26,9 +26,12 @@ const (
 	dmpRecordPackage         uint16 = 18
 	dmpRecordObjectGrant     uint16 = 20
 	dmpRecordPackageBody     uint16 = 23
+	dmpRecordType            uint16 = 25
+	dmpRecordTypeBody        uint16 = 29
 	dmpRecordUnique          uint16 = 30
 	dmpRecordTableComment    uint16 = 31
 	dmpRecordColumnComment   uint16 = 32
+	dmpRecordDirectory       uint16 = 36
 	dmpRecordBuiltinGrant    uint16 = 37
 )
 
@@ -52,6 +55,8 @@ type DMPMetadataCounts struct {
 	Views            int
 	Sequences        int
 	Routines         int
+	Types            int
+	Directories      int
 	Triggers         int
 	Synonyms         int
 	Privileges       int
@@ -87,6 +92,10 @@ func (catalog *DMPMetadataCatalog) Counts() DMPMetadataCounts {
 			counts.Sequences++
 		case dmpRecordRoutine, dmpRecordPackage, dmpRecordPackageBody:
 			counts.Routines++
+		case dmpRecordType, dmpRecordTypeBody:
+			counts.Types++
+		case dmpRecordDirectory:
+			counts.Directories++
 		case dmpRecordTrigger:
 			counts.Triggers++
 		case dmpRecordSynonym:
@@ -173,6 +182,8 @@ func buildDMPMetadataCatalog(
 	views []DictionaryView,
 	sequences []DictionarySequence,
 	routines []DictionaryRoutine,
+	types []DictionaryType,
+	directories []DictionaryDirectory,
 	triggers []DictionaryTrigger,
 	synonyms []DictionarySynonym,
 	privileges []DictionaryTabPrivilege,
@@ -185,6 +196,15 @@ func buildDMPMetadataCatalog(
 		return nil, fmt.Errorf("unsupported dmp export mode %s", mode)
 	}
 	catalog := &DMPMetadataCatalog{Mode: mode}
+	if mode == DMPModeFull {
+		for _, dir := range directories {
+			sql, err := directoryDDL(dir)
+			if err != nil {
+				return nil, err
+			}
+			catalog.GlobalRecords = append(catalog.GlobalRecords, DMPMetadataRecord{RecordType: dmpRecordDirectory, Name: dir.Name, SQL: sql})
+		}
+	}
 
 	schemaOwners := dmpSchemaOwnerMap(objects, users, dict)
 	schemaNames := dmpSchemaNameMap(objects, dict)
@@ -265,6 +285,15 @@ func buildDMPMetadataCatalog(
 
 	for _, view := range views {
 		sql := strings.TrimSpace(view.SQL)
+		extra := uint32(0)
+		if view.isMaterialized() {
+			var err error
+			sql, err = recoveredMaterializedViewSQL(view)
+			if err != nil {
+				return nil, err
+			}
+			extra = 1
+		}
 		if sql == "" && strings.TrimSpace(view.QuerySQL) != "" {
 			sql = fmt.Sprintf("CREATE OR REPLACE VIEW %s.%s AS\n%s", quoteIdent(view.Owner), quoteIdent(view.Name), strings.TrimSpace(view.QuerySQL))
 		}
@@ -272,7 +301,7 @@ func buildDMPMetadataCatalog(
 			continue
 		}
 		ensureSchema(view.Owner).Records = append(ensureSchema(view.Owner).Records, DMPMetadataRecord{
-			RecordType: dmpRecordView, Name: view.Name, SQL: ensureSQLTerminator(sql),
+			RecordType: dmpRecordView, Name: view.Name, SQL: ensureSQLTerminator(sql), ExtraValue: extra,
 		})
 	}
 	for _, seq := range sequences {
@@ -304,6 +333,18 @@ func buildDMPMetadataCatalog(
 		}
 		ensureSchema(routine.Owner).Records = append(ensureSchema(routine.Owner).Records, DMPMetadataRecord{
 			RecordType: recordType, Name: routine.Name, SQL: ensureSQLTerminator(sql), ExtraValue: extra,
+		})
+	}
+	for _, typ := range types {
+		if strings.TrimSpace(typ.SQL) == "" {
+			return nil, fmt.Errorf("missing %s source for %s.%s; inspect types.tsv before DMP export", typ.ObjectType, typ.Owner, typ.Name)
+		}
+		recordType := dmpRecordType
+		if typ.ObjectType == "TYPE BODY" {
+			recordType = dmpRecordTypeBody
+		}
+		ensureSchema(typ.Owner).Records = append(ensureSchema(typ.Owner).Records, DMPMetadataRecord{
+			RecordType: recordType, Name: typ.Name, SQL: ensureSQLTerminator(typeDDLSource(typ.SQL)),
 		})
 	}
 	for _, synonym := range synonyms {
@@ -386,6 +427,9 @@ func buildDMPMetadataCatalog(
 		sort.SliceStable(schema.Records, func(i, j int) bool {
 			if schema.Records[i].RecordType != schema.Records[j].RecordType {
 				return schema.Records[i].RecordType < schema.Records[j].RecordType
+			}
+			if schema.Records[i].RecordType == dmpRecordType || schema.Records[i].RecordType == dmpRecordTypeBody {
+				return false // Preserve creation order for dependent types.
 			}
 			return schema.Records[i].Name < schema.Records[j].Name
 		})

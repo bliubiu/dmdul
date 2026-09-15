@@ -191,7 +191,7 @@ func TestHugeColumnSectionRejectsUnsupportedOrInvalidLayout(t *testing.T) {
 	column := columnDef{Name: "ID", DataType: "INT", Nullable: "N"}
 	decoder := textDecoder{preferred: "utf-8"}
 
-	if _, _, err := openHugeColumnSection(tableDir, column, hugeColumnSection{section: 1, cprFlag: "Y"}, decoder); err == nil || !strings.Contains(err.Error(), "unsupported HUGE compression") {
+	if _, _, err := openHugeColumnSection(tableDir, column, hugeColumnSection{section: 1, cprFlag: "X"}, decoder); err == nil || !strings.Contains(err.Error(), "unsupported HUGE compression") {
 		t.Fatalf("compressed section error=%v", err)
 	}
 	if _, _, err := openHugeColumnSection(tableDir, column, hugeColumnSection{section: 1, offset: 128, cprFlag: "N", encFlag: "N"}, decoder); err == nil || !strings.Contains(err.Error(), "invalid HFS offset") {

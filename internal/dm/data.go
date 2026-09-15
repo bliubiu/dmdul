@@ -371,6 +371,7 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 		}
 	}
 	linkHugeTableObjects(tables)
+	markMaterializedBackingTables(objects, tables)
 	dictionaryTables := applyDictionaryTableOverrides(opts.Dictionary, tables, nil)
 	hugeAuxTableIDs := selectedHugeAuxTableIDs(tables, ownerMatcher, tableMatcher, excludeMatcher)
 

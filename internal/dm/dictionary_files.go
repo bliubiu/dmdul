@@ -29,6 +29,8 @@ type DictionaryFilesResult struct {
 	SynonymsPath         string
 	TabPrivilegesPath    string
 	SystemPrivilegesPath string
+	TypesPath            string
+	DirectoriesPath      string
 	PartitionsPath       string
 	PartitionKeysPath    string
 	UserCount            int
@@ -38,6 +40,8 @@ type DictionaryFilesResult struct {
 	ViewCount            int
 	SequenceCount        int
 	RoutineCount         int
+	TypeCount            int
+	DirectoryCount       int
 	TriggerCount         int
 	SynonymCount         int
 	TabPrivilegeCount    int
@@ -82,6 +86,12 @@ func WriteDictionaryFiles(dir string, dict *DictionaryInfo) (*DictionaryFilesRes
 	if err := writeDictionaryRoutines(result.RoutinesPath, dict.Routines); err != nil {
 		return nil, err
 	}
+	if err := writeDictionaryTypes(result.TypesPath, dict.Types); err != nil {
+		return nil, err
+	}
+	if err := writeDictionaryDirectories(result.DirectoriesPath, dict.Directories); err != nil {
+		return nil, err
+	}
 	if err := writeDictionaryTriggers(result.TriggersPath, dict.Triggers); err != nil {
 		return nil, err
 	}
@@ -107,6 +117,8 @@ func WriteDictionaryFiles(dir string, dict *DictionaryInfo) (*DictionaryFilesRes
 	result.ViewCount = len(dict.Views)
 	result.SequenceCount = len(dict.Sequences)
 	result.RoutineCount = len(dict.Routines)
+	result.TypeCount = len(dict.Types)
+	result.DirectoryCount = len(dict.Directories)
 	result.TriggerCount = len(dict.Triggers)
 	result.SynonymCount = len(dict.Synonyms)
 	result.TabPrivilegeCount = len(dict.TabPrivileges)
@@ -244,6 +256,9 @@ func RebuildDictionaryFiles(dir string, dict *DictionaryInfo) (*DictionaryFilesR
 	result.ViewCount = staged.ViewCount
 	result.SequenceCount = staged.SequenceCount
 	result.RoutineCount = staged.RoutineCount
+	result.TypeCount = staged.TypeCount
+	result.DirectoryCount = staged.DirectoryCount
+	result.SystemPrivilegeCount = staged.SystemPrivilegeCount
 	result.TriggerCount = staged.TriggerCount
 	result.SynonymCount = staged.SynonymCount
 	result.TabPrivilegeCount = staged.TabPrivilegeCount
@@ -379,6 +394,14 @@ func LoadDictionaryFiles(dir string) (*DictionaryInfo, *DictionaryFilesResult, e
 	if err != nil && !os.IsNotExist(err) {
 		return nil, nil, err
 	}
+	directories, err := readDictionaryDirectories(result.DirectoriesPath)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, nil, err
+	}
+	types, err := readDictionaryTypes(result.TypesPath)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, nil, err
+	}
 	partitions, err := readDictionaryPartitions(result.PartitionsPath)
 	if err != nil && !os.IsNotExist(err) {
 		return nil, nil, err
@@ -435,6 +458,8 @@ func LoadDictionaryFiles(dir string) (*DictionaryInfo, *DictionaryFilesResult, e
 		Synonyms:            synonyms,
 		TabPrivileges:       tabPrivileges,
 		SystemPrivileges:    systemPrivileges,
+		Types:               types,
+		Directories:         directories,
 		Partitions:          partitions,
 		PartitionKeys:       partitionKeys,
 	}
@@ -445,6 +470,8 @@ func LoadDictionaryFiles(dir string) (*DictionaryInfo, *DictionaryFilesResult, e
 	result.ViewCount = len(views)
 	result.SequenceCount = len(sequences)
 	result.RoutineCount = len(routines)
+	result.TypeCount = len(types)
+	result.DirectoryCount = len(directories)
 	result.TriggerCount = len(triggers)
 	result.SynonymCount = len(synonyms)
 	result.TabPrivilegeCount = len(tabPrivileges)
@@ -465,6 +492,8 @@ func dictionaryFilesResultForDir(dir string) *DictionaryFilesResult {
 		ViewsPath:            filepath.Join(dir, "views.tsv"),
 		SequencesPath:        filepath.Join(dir, "sequences.tsv"),
 		RoutinesPath:         filepath.Join(dir, "routines.tsv"),
+		TypesPath:            filepath.Join(dir, "types.tsv"),
+		DirectoriesPath:      filepath.Join(dir, "directories.tsv"),
 		TriggersPath:         filepath.Join(dir, "triggers.tsv"),
 		SynonymsPath:         filepath.Join(dir, "synonyms.tsv"),
 		TabPrivilegesPath:    filepath.Join(dir, "tab_privs.tsv"),
@@ -505,6 +534,8 @@ func writeDictionaryMeta(path string, dict *DictionaryInfo, schemaCount int) err
 		{"view_count", strconv.Itoa(len(dict.Views))},
 		{"sequence_count", strconv.Itoa(len(dict.Sequences))},
 		{"routine_count", strconv.Itoa(len(dict.Routines))},
+		{"type_count", strconv.Itoa(len(dict.Types))},
+		{"directory_count", strconv.Itoa(len(dict.Directories))},
 		{"trigger_count", strconv.Itoa(len(dict.Triggers))},
 		{"synonym_count", strconv.Itoa(len(dict.Synonyms))},
 		{"tab_privilege_count", strconv.Itoa(len(dict.TabPrivileges))},
@@ -602,9 +633,11 @@ func writeDictionaryViews(path string, views []DictionaryView) error {
 			view.Valid,
 			cleanRecoveredSQLText(view.SQL),
 			cleanRecoveredSQLText(view.QuerySQL),
+			strconv.FormatBool(view.isMaterialized()),
+			formatKnownInt64Field(int64(view.MVFlags), view.HasMVFlags),
 		})
 	}
-	return writeTSV(path, []string{"view_id", "owner", "view_name", "valid", "sql", "query_sql"}, rows)
+	return writeTSV(path, []string{"view_id", "owner", "view_name", "valid", "sql", "query_sql", "materialized", "mv_flags"}, rows)
 }
 
 func writeDictionarySequences(path string, sequences []DictionarySequence) error {
@@ -897,6 +930,19 @@ func readDictionaryViews(path string) ([]DictionaryView, error) {
 		}
 		if len(rec) >= 6 {
 			view.QuerySQL = cleanRecoveredSQLText(rec[5])
+		}
+		if len(rec) >= 8 {
+			view.Materialized, err = strconv.ParseBool(rec[6])
+			if err != nil {
+				return nil, fmt.Errorf("invalid views.tsv materialized flag for %s", view.Name)
+			}
+			if rec[7] != "" {
+				flags, parseErr := strconv.ParseUint(rec[7], 10, 32)
+				if parseErr != nil {
+					return nil, fmt.Errorf("invalid views.tsv mv_flags for %s", view.Name)
+				}
+				view.MVFlags, view.HasMVFlags = uint32(flags), true
+			}
 		}
 		views = append(views, view)
 	}

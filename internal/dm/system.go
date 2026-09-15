@@ -178,8 +178,11 @@ func detectSystemPageSize(header []byte, fileSize int64) (uint32, string) {
 }
 
 func detectSystemPageCount(header []byte, fileSize int64, pageSize uint32) (uint32, string) {
-	if pageSize == 0 || fileSize < 0 {
+	if !validPageSize(pageSize) || fileSize < 0 {
 		return 0, "unknown"
+	}
+	if fileSize/int64(pageSize) > int64(^uint32(0)) {
+		return 0, "unknown: file size exceeds supported 32-bit page count"
 	}
 	if len(header) >= systemPageCountOffset+4 {
 		value := binary.LittleEndian.Uint32(header[systemPageCountOffset:])

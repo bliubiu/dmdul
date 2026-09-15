@@ -13,6 +13,9 @@ research/           临时实验脚本和研究材料
 
 ## 常用开发命令
 
+当前源码要求 Go 1.26+；运行已编译程序不需要 Go。安全扫描和正式构建应使用受维护版本的
+最新补丁，历史 tag 的最低版本以其 `go.mod` 为准。当前加固规则集中在 [Hardening](hardening.md)。
+
 运行测试：
 
 ```powershell
@@ -43,9 +46,11 @@ go build -o .\bin\dmdul.exe .\cmd\dmdul
 
 `.github/workflows/quality.yml` 在 main 推送、PR 和手动触发时执行：
 
-- Windows/Linux：Go 1.22 与 stable 的 `go vet`、不使用缓存的测试、构建。
+- Windows/Linux：Go 1.26 与 stable 的 gofmt、`go mod verify`、`go vet`、不使用缓存的测试、构建。
 - Linux：启用 CGO 的 race 检测。
-- Linux：五个 fuzz 入口各运行 30 秒、2 个 worker；普通单测也会运行种子样本。
+- Linux：九个 fuzz 入口各运行 30 秒、2 个 worker，包含 HFS 解压；普通单测也会运行种子样本。
+  手动触发可选择每组 300 秒，每个测试进程超时 8 分钟；失败语料作为 artifact 保留七天。
+- stable Go：Linux/Windows 调用路径漏洞扫描，以及不允许已知漏洞模块通过的模块级检查。
 
 工作流只读取仓库，不发布二进制、不连接私有测试库、不需要数据库密码。它产生检查结果，
 不会自动设置 GitHub 分支保护；需要强制合并门禁时由维护者在仓库设置中要求这些检查通过。
@@ -54,8 +59,9 @@ go build -o .\bin\dmdul.exe .\cmd\dmdul
 
 ```powershell
 go vet ./...
+go mod verify
 go test -count=1 ./...
-go test ./internal/dm -run '^$' -fuzz '^FuzzDataRowMetadata$' -fuzztime=30s -parallel=2
+go test ./internal/dm -run '^$' -fuzz '^FuzzDataRowMetadata$' -fuzztime=30s -parallel=2 -timeout=3m
 ```
 
 Linux race：
@@ -65,7 +71,8 @@ CGO_ENABLED=1 go test -race -count=1 ./...
 ```
 
 其余 fuzz 入口为 `FuzzPageGeometry`、`FuzzDataPageSlots`、`FuzzDMPContainer`、
-`FuzzDMASMMetadata`。每次只能选择一个入口；短时 fuzz 是冒烟检查，不代表所有格式已验证。
+`FuzzDMASMMetadata`、`FuzzPageGeometryFields`、`FuzzPageProbeRefs`、`FuzzPageCheck`。
+每次只能选择一个入口；短时 fuzz 是冒烟检查，不代表所有格式已验证。
 失败后保留 Go 自动生成的最小复现输入，先排除真实业务数据和凭据再纳入版本管理。
 
 ### 实例样例
@@ -133,7 +140,7 @@ Remove-Item Env:CGO_ENABLED, Env:GOOS, Env:GOARCH
 ```powershell
 New-Item -ItemType Directory -Force .\bin\licenses | Out-Null
 Copy-Item -LiteralPath LICENSE, THIRD_PARTY_NOTICES.md -Destination .\bin -Force
-Copy-Item -LiteralPath .\docs\licenses\go-LICENSE.txt, .\docs\licenses\x-text-LICENSE.txt, .\docs\licenses\gmsm-LICENSE.txt -Destination .\bin\licenses -Force
+Copy-Item -LiteralPath .\docs\licenses\go-LICENSE.txt, .\docs\licenses\x-text-LICENSE.txt, .\docs\licenses\gmsm-LICENSE.txt, .\docs\licenses\snappy-LICENSE.txt -Destination .\bin\licenses -Force
 Compress-Archive -Path .\bin\dmdul.exe, .\bin\LICENSE, .\bin\THIRD_PARTY_NOTICES.md, .\bin\licenses -DestinationPath .\bin\dmdul_windows_amd64_$ver.zip -Force
 tar -czf bin\dmdul_linux_amd64_$ver.tar.gz -C bin dmdul LICENSE THIRD_PARTY_NOTICES.md licenses
 if ($LASTEXITCODE -ne 0) { throw "Linux packaging failed" }
@@ -164,29 +171,27 @@ LOB 在 `data_lob.go`，输出路由在 `data_writer.go`。VECTOR/JSON/SQL 值�
 `ddl.go` 保留导出编排与模型；字典行解析在 `ddl_catalog.go`，对象、分区和约束等渲染
 分别在 `ddl_objects.go`、`ddl_partition.go`、`ddl_schema_render.go`。
 
-本轮按 Go AST 移动声明并逐个验证等价，没有重新实现旧算法。后续变更应先补最小回归样本，
+v0.10.0 按 Go AST 移动声明并逐个验证等价，没有重新实现旧算法。后续变更应先补最小回归样本，
 再改所属模块；不要因为文件拆分完成就跳过跨模块测试。
 
 ### 依赖与漏洞检查
 
-v0.10.0 将 `golang.org/x/text` 从 v0.5.0 升到 v0.22.0，保留 Go 1.22 最低编译要求。
-v0.23.0 的模块已要求 Go 1.23，不能只改版本号而不跑最低工具链。
+当前 `golang.org/x/text v0.42.0` 要求 Go 1.26，因此同步提高最低源码构建版本，
+不再承诺当前分支兼容 Go 1.22。v0.10.0 的依赖和工具链记录保留在其发布验证文档中。
 SM3 使用 `github.com/tjfoc/gmsm v1.4.1` 的 `sm3` 包，没有引入 CGO。
 
 ```powershell
 go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
 govulncheck -show verbose ./...
+Push-Location .\cmd\dmdul
+try { govulncheck -scan module } finally { Pop-Location }
 ```
 
-2026-09-06 本地 Go 1.26.1 的结果为 0 个可达调用链漏洞。报告仍列出旧标准库公告以及
-x/text 模块的 [GO-2026-5970](https://pkg.go.dev/vuln/GO-2026-5970)，后者涉及未被当前
-解码路径调用的 `unicode/norm`。因此不能写成“所有依赖无漏洞”。增加包或调用符号后必须
-重跑；CI 使用 stable Go 执行 govulncheck，发布也应使用受维护的最新补丁工具链。
-Go 1.22 只保留源码兼容性测试，不作为生产二进制推荐构建工具链。
-
-v0.10.0 发布复测使用 Go 1.27.1，Windows 完整测试/vet 通过；此次 govulncheck 结果为
-0 个可达符号漏洞、0 个已导入包漏洞，以及上述 1 个未被调用的 x/text 模块级公告。
-构建时使用 `-trimpath -s -w` 并注入 tag、提交号和 UTC 构建时间。
+模块扫描不接受 `./...` 参数；仓库根目录没有 Go 包，需从 `cmd/dmdul` 执行。
+调用路径扫描用于判断实际可达性，模块扫描用于阻止继续引入含已知漏洞的依赖；两者都必须通过。
+2026-09-15 使用 Go 1.27.1 和更新后的依赖，Windows/Linux 调用路径与模块扫描均未报告漏洞。
+这是当日公告库下的结果，不代表未来没有漏洞。升级依赖或工具链后重新扫描，并核对
+`THIRD_PARTY_NOTICES.md`、许可证、最低 Go 版本及三字符集导回结果。
 
 当前重点测试方向：
 

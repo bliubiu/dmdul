@@ -53,6 +53,10 @@ func parseDDLObjectRow(page []byte, rowOff int, pageNo uint32, slotNo uint16, sl
 		targetOwner, targetName = parseDDLSynonymTarget(page, subtypeNext, decoder)
 	}
 	payload := parseDDLObjectPayload(page, subtypeNext)
+	directoryPath := ""
+	if objType == "DIR" {
+		directoryPath = parseDirectoryPath(page, subtypeNext, decoder)
+	}
 	valid := ""
 	if b := page[rowOff+0x3F]; b == 'Y' || b == 'N' {
 		valid = string([]byte{b})
@@ -60,22 +64,23 @@ func parseDDLObjectRow(page []byte, rowOff int, pageNo uint32, slotNo uint16, sl
 	rowAbs := uint64(pageNo)*uint64(pageSize) + uint64(rowOff)
 	schemaID := binary.LittleEndian.Uint32(page[rowOff+0x0B:])
 	return dictionaryObject{
-		ID:          binary.LittleEndian.Uint32(page[rowOff+0x07:]),
-		SchemaID:    schemaID,
-		Owner:       schemaName(schemaID),
-		ParentID:    int32(binary.LittleEndian.Uint32(page[rowOff+0x0F:])),
-		Info1:       binary.LittleEndian.Uint32(page[rowOff+sysObjectsInfo1Offset:]),
-		Info2:       binary.LittleEndian.Uint32(page[rowOff+0x23:]),
-		Info3:       binary.LittleEndian.Uint64(page[rowOff+sysObjectsInfo3Offset:]),
-		Info4:       int64(binary.LittleEndian.Uint64(page[rowOff+0x2F:])),
-		Payload:     payload,
-		Valid:       valid,
-		Name:        name,
-		Type:        objType,
-		Subtype:     subtype,
-		TargetOwner: targetOwner,
-		TargetName:  targetName,
-		Location:    ddlLocation{PageNo: pageNo, SlotNo: slotNo, SlotOffset: slotOff, RowOffset: rowAbs},
+		ID:            binary.LittleEndian.Uint32(page[rowOff+0x07:]),
+		SchemaID:      schemaID,
+		Owner:         schemaName(schemaID),
+		ParentID:      int32(binary.LittleEndian.Uint32(page[rowOff+0x0F:])),
+		Info1:         binary.LittleEndian.Uint32(page[rowOff+sysObjectsInfo1Offset:]),
+		Info2:         binary.LittleEndian.Uint32(page[rowOff+0x23:]),
+		Info3:         binary.LittleEndian.Uint64(page[rowOff+sysObjectsInfo3Offset:]),
+		Info4:         int64(binary.LittleEndian.Uint64(page[rowOff+0x2F:])),
+		Payload:       payload,
+		DirectoryPath: directoryPath,
+		Valid:         valid,
+		Name:          name,
+		Type:          objType,
+		Subtype:       subtype,
+		TargetOwner:   targetOwner,
+		TargetName:    targetName,
+		Location:      ddlLocation{PageNo: pageNo, SlotNo: slotNo, SlotOffset: slotOff, RowOffset: rowAbs},
 	}, true
 }
 

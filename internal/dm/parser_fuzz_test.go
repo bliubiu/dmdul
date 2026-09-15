@@ -9,7 +9,7 @@ import (
 )
 
 func FuzzPageGeometry(f *testing.F) {
-	seed := make([]byte, 4*8192)
+	seed := make([]byte, 512)
 	binary.LittleEndian.PutUint32(seed[0x84:], 8192)
 	f.Add(seed)
 	f.Add([]byte{})
@@ -85,13 +85,23 @@ func FuzzDMASMMetadata(f *testing.F) {
 		if len(raw) > 4096 {
 			t.Skip()
 		}
-		_, _ = parseRawASMInode(raw, 0, 0, 0)
+		original := bytes.Clone(raw)
+		info, ok := parseRawASMInode(raw, 0, 0, 0)
+		if ok && info.Size < 0 {
+			t.Fatal("negative ASM file size")
+		}
 		group := RawASMGroup{groupID: 1, auSize: 1024 * 1024}
-		_, _ = group.parseMirrorInode(raw, 0, 0, 0)
+		info, ok = group.parseMirrorInode(raw, 0, 0, 0)
+		if ok && info.Size < 0 {
+			t.Fatal("negative mirror ASM file size")
+		}
 		_, _ = parseRawASMMirrorDAddr(raw)
 		desc, ok := parseRawASMMirrorDescriptor(raw)
 		if ok && len(desc.mirrors) > 2 {
 			t.Fatal("too many mirror copies")
+		}
+		if !bytes.Equal(raw, original) {
+			t.Fatal("ASM metadata parser mutated source")
 		}
 	})
 }

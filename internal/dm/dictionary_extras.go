@@ -194,12 +194,15 @@ func scanDictionaryViews(objects map[uint32]dictionaryObject, texts map[uint32]m
 		}
 		seqs := texts[obj.ID]
 		view := DictionaryView{
-			ID:       obj.ID,
-			Owner:    obj.Owner,
-			Name:     obj.Name,
-			Valid:    obj.Valid,
-			SQL:      seqs[0],
-			QuerySQL: seqs[1],
+			Materialized: obj.Info1&0x200 != 0,
+			MVFlags:      obj.Info1,
+			HasMVFlags:   true,
+			ID:           obj.ID,
+			Owner:        obj.Owner,
+			Name:         obj.Name,
+			Valid:        obj.Valid,
+			SQL:          seqs[0],
+			QuerySQL:     seqs[1],
 		}
 		views = append(views, view)
 	}

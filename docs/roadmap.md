@@ -1,6 +1,6 @@
 # dmdul 开发路线图
 
-本页区分已有能力、本版新增实现和仍需逆向验证的功能。当前版本为 v0.10.0；
+本页区分已有能力、本版新增实现和仍需逆向验证的功能。当前版本为 v0.11.0；
 旧版二进制不包含本版新增能力，使用前请用 `version` 确认版本。
 
 ## 已有能力
@@ -12,7 +12,7 @@
 | 表定位 | storage root、internal/leaf、next 链、计划页身份校验 | 失败时才用同 group storage/段范围；残留页扫描仅恢复模式 |
 | 普通行 | slot-only、显式 2-bit metadata、已验证标量、LOB、Long Row | 不等于 committed-only；不猜测普通迁移行拼接 |
 | 输出 | SQL、dmfldr、表/用户/全库 DMP | 有官方工具导回证据；不是全部数据库对象的无条件完整备份 |
-| HUGE | HFS section 与 RAUX/DAUX/UAUX 合并 | 压缩、加密、多 HFS path 和原始 ASM HFS 仍有限制 |
+| HUGE | HFS section 与 RAUX/DAUX/UAUX 合并 | v0.11.0 支持 ZIP/Snappy、多 HFS path；加密、专用打包、原始 ASM HFS 仍待完成 |
 | DM9 | 单个 build 的类型、对象、字符集、页大小矩阵 | 见 [DM9 验证](dm9-compatibility.md)，不能外推所有 build |
 
 ## v0.10.0 新增实现
@@ -30,18 +30,26 @@
 - **工程**：拆分 planner 候选、row/scalar/LOB、writer、DDL catalog/renderer；
   Go 1.22/stable 的 Windows/Linux 测试、vet、构建、Linux race、五组 fuzz、govulncheck。
 
+## v0.11.0 新增实现
+
+本版新增 Hardening：确定性有界页大小探测、读取错误与页数溢出拒绝、
+九组 fuzz 和失败语料、模块级漏洞门禁、x/text v0.42.0 / Go 1.26 构建基线。
+规则与实测集中在 [Hardening](hardening.md)。同日后续新增 HUGE ZIP/Snappy、双 HFS 路径、
+更多标量，以及 TYPE/TYPE BODY、目录和简单物化视图定义恢复。对应实测与边界见
+[扩展兼容验证](extended-compatibility-20260915.md)，不把这些源码能力归入旧发布包。
+
 ## 仍需完成
 
 | 优先级 | 工作 | 完成标准 |
 | --- | --- | --- |
 | P0 | 事务可见性与完整 Undo | 未提交/提交 INSERT、DELETE、连续 UPDATE、Rollback、Undo 复用矩阵；与在线提交视图逐行一致后才能提供 committed-only |
 | P0 | DM9 第二个 build | 提供不同的完整 build 编号，重复冷快照、坏页注入、DDL/数据导回矩阵；安装包日期不同不算第二个 build |
-| P1 | HUGE 压缩/编码/校验和 | 各压缩算法和级别的 section 样本、CHKSUM 重算、单字节破坏检测，输出前拒绝未知布局 |
-| P1 | HUGE 更多类型/路径 | NUMBER、时间/时区、INTERVAL、二进制等独立物理布局；多 HFS path 的 FILE_ID 映射与同名冲突测试 |
+| P1 | HUGE 专用编码/校验和 | DECIMAL/NUMBER 的 0x401 打包、完整 CHKSUM 重算；ZIP 2/9、Snappy 10 之外的级别矩阵 |
+| P1 | HUGE 更多类型/路径 | 补 BC/更多精度与字符集，以及新增标量的 DMP/dmfldr 回灌；超过两条路径的边界案例 |
 | P1 | DMASM HFS | 从原始成员盘解析 HFS 文件，接入逻辑 Reader，与文件系统 HFS 导出逐字节/逐行比较 |
 | P1 | DMASM 单文件超过 65535 AU | 映射条目跨界、首尾 AU、随机读取与官方复制的哈希一致；现有描述簇跨界测试不能替代单文件验证 |
 | P1 | ASM REDO 与已删除文件 | 冷/非冷镜像、事务顺序和 generation、幂等重放；不写源盘，删除文件输出单列为候选证据 |
-| P1 | 扩展整库对象 | 物化视图/日志、自定义类型、目录、作业、策略；分别验证系统表来源、依赖顺序、SQL/DMP 官方导回 |
+| P1 | 扩展整库对象 | 复杂物化视图/日志/原构建状态、自定义类型列的数据、作业、策略；基础 TYPE/TYPE BODY 与简单 MV 已有同模式导回证据 |
 | P2 | 迁移行/链式行 | 等待可重复普通行物理样本；禁止把 Long Row 或历史副本当作迁移链 |
 | P2 | 降低维护成本 | 继续压缩 ExportData 编排复杂度；完善模糊输入语料和损坏字典回归，不在无测试时继续拆逻辑 |
 

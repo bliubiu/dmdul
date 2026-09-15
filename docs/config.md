@@ -225,6 +225,10 @@ datafile 5 0 TBS_BIN_TEST D:\temp\oldpro\TBS_BIN_TEST01.DBF
 | `schemas.tsv` | 模式 ID、模式名、所属用户 ID 和用户名；用于区分 DMP 的 OWNER 与 SCHEMAS 级别。 |
 | `tables.tsv` | 用户表摘要，包含 table id、owner、表名、表空间、段头文件/页号、段大小、存储组织、是否临时表、是否分区。 |
 | `columns.tsv` | 字段摘要，包含 table id、owner、表名、字段序号、字段名、类型、长度、默认值等。 |
+| `types.tsv` | v0.11.0：TYPE 与 TYPE BODY 源码；类型 ID、模式、名称、对象类别和 SQL。空文件表示不导出类型。 |
+| `directories.tsv` | v0.11.0：全局目录对象 ID、名称和服务器路径；仅整库范围导出，不创建物理目录。 |
+| `views.tsv` | 视图源码与查询；v0.11.0 追加 materialized 和 mv_flags，旧字典缺失标志时需重新 bootstrap 才能恢复简单物化视图。 |
+| `sys_privs.tsv` / `tab_privs.tsv` | 真实系统权限及对象/列级权限；未知编号不提升成更大的授权。 |
 | `partitions.tsv` | 分区顺序、类型、名称、分区子表 ID、完整 `HIGH_VALUE` 十六进制值及 SYSTEM 物理位置。 |
 | `partition_keys.tsv` | 分区键顺序、字段 ID 和字段名；来源为 `SYSOBJINFOS.TYPE$='TABPART'`。 |
 

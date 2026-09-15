@@ -23,17 +23,24 @@
 - 无需启动 DMASMSVR 或执行 `asmcmd cp`，直接读取非镜像与镜像 DMASM 元数据、
   AU 映射、副本数组和条带数据。
 
-**v0.10.0 主题：Recovery Hardening**
+**v0.11.0 主题：Hardening & Extended Recovery**
 
-本版新增：页大小冲突检测、无字典 `scan storage` / 人工列定义恢复、DM9 4 KiB /
-大小写不敏感矩阵、SM3 与分 sector HASH、真实系统/列级权限、HUGE 可空定长列，以及
-Windows/Linux 质量门禁、parser fuzz 和源码拆分。事务 Undo 目前只增加证据追踪，
-**尚未实现 committed-only**。见 [本轮实测记录](docs/compatibility-hardening-20260906.md)、
-[无字典救援](docs/storage-rescue.md) 和 [后续路线图](docs/roadmap.md)。
-使用这些新增能力请升级到 v0.10.0；旧版 v0.9.0 二进制不包含本次改动。
-本版的实测范围、导回比对与质量检查见 [发布验证记录](docs/release-v0.10.0-validation.md)。
+本版加固页大小探测：采用确定性有界采样，拒绝 I/O 错误、矛盾文件身份和页数溢出。
+质量检查扩展到九组 fuzz，增加依赖完整性和模块级漏洞门禁。`x/text` 升至 v0.42.0，
+**源码构建最低要求改为 Go 1.26**，运行发布包不需要安装 Go。
 
-![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go)
+本版新增 **HUGE ZIP/Snappy section、多 HFS path、更多可空标量**，以及
+`types.tsv`、`directories.tsv`、简单物化视图定义恢复。HUGE 16 张表共 48,500 行 SQL
+回灌双向 MINUS 为 0；自定义类型及类型体、四种简单物化视图已通过 SQL 和同模式 DMP 回灌。
+物化视图按 `BUILD DEFERRED` 重建，不恢复其物化数据或原始构建状态。
+
+页检查 SM3、无字典救援和真实系统/列级权限延续 v0.10.0 的能力；普通卸载仍是物理状态恢复，
+**尚未实现 committed-only**。第二个 DM9 build、HFS 完整校验和、DMASM HFS/REDO/删除文件
+救援仍待完成。范围与证据见 [发布验证](docs/release-v0.11.0-validation.md)、
+[Hardening](docs/hardening.md)、[扩展兼容验证](docs/extended-compatibility-20260915.md) 和
+[路线图](docs/roadmap.md)。旧版 v0.10.0 发布包不包含本版新增能力。
+
+![Go](https://img.shields.io/badge/Go-1.26+-00ADD8?logo=go)
 ![License](https://img.shields.io/github/license/greatfinish/dmdul)
 ![Release](https://img.shields.io/github/v/release/greatfinish/dmdul)
 ![Stars](https://img.shields.io/github/stars/greatfinish/dmdul?style=social)
@@ -169,7 +176,8 @@ NULL 元数据、列值及可选事务控制尾。读取 `SYSTEM.DBF` 字典页�
   `CREATE HUGE TABLE`、`SECTION`、`FILESIZE`、`WITH DELTA` 和目标混合表空间；数据卸载
   以 `$AUX` 定位 HFS 列 section，再合并 RAUX 尾部行、DAUX 删除和 UAUX 更新。已验证
   `VARCHAR/CHAR`、SQL 回灌和 DMP/dimp 回灌；v0.10.0 补充可空/非空 `INT/BIGINT/SMALLINT/DOUBLE`
-  和已验证的 AD `DATE`。压缩、加密及未知布局会明确拒绝，详见 [HUGE 支持范围](docs/huge-tables.md)。
+  和已验证的 AD `DATE`。v0.11.0 另支持已验证 ZIP/Snappy、多路径及标量；加密、DECIMAL
+  专用打包等未知布局仍拒绝，详见 [HUGE 支持范围](docs/huge-tables.md)。
 - **精确数据页定位**：为选中表及分区按 `storage root -> internal page refs -> leaf chain`
   生成 page plan；计划完整时仅用 `ReadAt` 读取计划页，失败时依次回退到同 group
   `storage_id` 扫描和段范围读取，只有 `recover table` 才执行全文件残留页扫描。
@@ -261,7 +269,7 @@ DM8 仍是覆盖 build 数量最多的主验证矩阵。DM9 已在
 | 用户、角色与授权 | ✅ 支持 | `CREATE USER`、角色授权、对象授权 |
 | 表、字段、索引、约束、注释 | ✅ 支持 | 普通表、堆表、树表、临时表及相关 DDL |
 | 分区表 | ✅ 支持 | RANGE / LIST / HASH DDL 与数据导出；分区键和 HIGH_VALUE 可持久化 |
-| HUGE 列存储表 | 🧪 初步支持 | HFS section + RAUX/DAUX/UAUX 合并；可空定长列和更多类型，压缩/加密 section 明确拒绝 |
+| HUGE 列存储表 | 🧪 有边界支持 | HFS + RAUX/DAUX/UAUX；v0.11.0 新增 ZIP/Snappy、多 HFS path；加密与未知打包仍拒绝 |
 | 视图、序列、过程、函数、包 | ✅ 支持 | `CREATE OR REPLACE` 源码恢复 |
 | 触发器与同义词 | ✅ 支持 | 表触发器、模式同义词及授权 |
 | 数据导出 | ✅ 支持 | SQL/dmfldr 表级、用户级、整库级；DMP 另支持模式级 |
@@ -1035,12 +1043,15 @@ DMDUL> unload user HR_TEST;
 | `columns.tsv`   | 字段定义、字段类型、长度、默认值、nullable |
 | `partitions.tsv` | 分区顺序、类型、名称、子表 ID、完整 `HIGH_VALUE` 二进制值及物理位置 |
 | `partition_keys.tsv` | 分区键顺序、字段 ID 和字段名              |
-| `views.tsv`     | 视图定义                                   |
+| `views.tsv`     | 视图定义；v0.11.0 追加 materialized、mv_flags 以重建简单物化视图 |
+| `types.tsv`     | v0.11.0：自定义 TYPE / TYPE BODY 源码；类型定义与类型体分行保存 |
+| `directories.tsv` | v0.11.0：全局目录对象及原始服务器路径；整库导出前必须复核路径 |
 | `sequences.tsv` | 序列定义、安全 `last_number` 及运行状态 file/page/slot 证据 |
 | `routines.tsv`  | 存储过程、函数、包、包体源码               |
 | `triggers.tsv`  | 触发器定义                                 |
 | `synonyms.tsv`  | 同义词定义                                 |
-| `tab_privs.tsv` | 表、视图、序列等对象授权                   |
+| `tab_privs.tsv` | 表、视图、序列等对象授权，含已验证列级权限 |
+| `sys_privs.tsv` | 真实系统权限编号、名称、授权人及 ADMIN OPTION |
 
 `tables.tsv` 中的重要恢复字段：
 
@@ -1161,7 +1172,7 @@ exit;
 
 ### 环境要求
 
-- Go 1.22+
+- Go 1.26+（仅从当前源码构建时需要；建议使用受维护版本的最新补丁）
 - Windows / Linux / macOS
 
 克隆并测试：
@@ -1285,9 +1296,12 @@ dul.log
   `data_format fldr` 或 `data_format dmp`。
 - 跨字符集 DMP 不应只修改文件头，应按目标字符集重新生成。
 - 行外 LOB 和 Long Row 已有流式恢复路径，但损坏页、断链和多版本残留仍在持续验证。
-- HUGE 表恢复必须同时提供同一快照的普通 DBF 和完整 HFS 根目录。当前只验证单一 HFS path
-  下未压缩、未加密 section。v0.10.0 已补 NULL 位图、`INT/BIGINT/SMALLINT/DOUBLE` 和已验证
-  AD DATE；多 HFS path、压缩/加密、其余标量、HFS 校验和及 DMASM HFS 文件仍待补充。
+- HUGE 表恢复必须同时提供同一快照的普通 DBF 和全部 HFS 根目录。v0.10.0 只支持已验证
+  未压缩布局；v0.11.0 支持 ZIP/Snappy、多 HFS path、更多标量。DECIMAL 专用打包、
+  加密、完整 HFS 校验和及 DMASM HFS 尚未完成。
+- 物化视图恢复仅覆盖已验证简单形式，采用延迟构建；不恢复 MTAB$_ 物化数据、
+  物化日志和刷新作业。类型定义恢复不等于支持自定义类型列的数据解码。目录仅恢复数据库对象，
+  不创建操作系统目录。作业、策略尚不支持。跨模式导入必须复核视图/类型源码中的限定模式名。
 - 迁移行、链式行以及更多版本的复杂物理行格式仍需扩大样例覆盖。
 - DM9 VECTOR 索引目前只恢复 HNSW/IVFFLAT 组织类型，高级构建参数需要导入后复核。
 - 当前 DM9 build 的 `dminit` 仅支持 4/8/16/32 KiB 页；64 是可选簇页数，不是 64 KiB
@@ -1326,7 +1340,8 @@ dul.log
 | v0.8.0 | HUGE/HFS 列存储字典与 DDL 恢复、section 流式读取及 RAUX/DAUX/UAUX 合并卸载 |
 | v0.9.0 | DM9 Standard Bootstrap、VECTOR、32 KiB 页、三种字符集与 SQL/dmfldr/DMP 回灌验证 |
 | v0.10.0 | 无字典救援、页大小加固、SM3、系统/列权限、HUGE NULL 定长列、DM9 4 KiB/大小写不敏感矩阵、自动化测试 |
-| 后续版本 | 完整 Undo、DMASM REDO、超 65535-AU 单文件、HUGE 压缩及更多 DM8/DM9 build 验证 |
+| v0.11.0 | 有界页大小探测、九组 fuzz、安全依赖；HUGE ZIP/Snappy、多 HFS path、更多标量；类型/目录/简单物化视图定义 |
+| 后续版本 | 完整 Undo、DMASM REDO、超 65535-AU 单文件、HFS 校验和/专用编码及更多 DM8/DM9 build 验证 |
 | v1.0.0 | 固化文件格式兼容矩阵、恢复报告和稳定发布流程 |
 
 ------

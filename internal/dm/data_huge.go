@@ -80,6 +80,8 @@ type hugeColumnSectionReader struct {
 	meta          hugeColumnSection
 	decoder       textDecoder
 	file          *os.File
+	data          io.ReaderAt
+	scratch       *os.File
 	fixedWidth    int
 	fixedReader   *bufio.Reader
 	offsets       []uint32
@@ -274,12 +276,16 @@ func exportHugeTableData(ctx hugeDataExportContext, info dataTableInfo, output *
 			break
 		}
 	}
-	tableDir := ""
+	var tableDirs []string
 	if hasHFSSection {
-		tableDir, err = findHugeTableDir(ctx.dataDir, info.table.SchemaID, info.table.ID)
+		tableDirs, err = findHugeTableDirs(ctx.dataDir, info.table.SchemaID, info.table.ID)
 		if err != nil {
 			return stats, err
 		}
+	}
+	columnFiles, err := resolveHugeColumnFiles(tableDirs, info.table, sections)
+	if err != nil {
+		return stats, err
 	}
 
 	deletes, err := loadHugeDeleteRanges(ctx, info.table.HugeDAuxID)
@@ -354,7 +360,8 @@ func exportHugeTableData(ctx hugeDataExportContext, info dataTableInfo, output *
 				closeHugeColumnReaders(readers)
 				return stats, fmt.Errorf("section %d column counts disagree: %d and %d", sectionID, sectionCount, section.count)
 			}
-			reader, path, openErr := openHugeColumnSection(tableDir, column, section, ctx.decoder)
+			path := columnFiles[hugeColumnFileKey{section.colID, section.fileID}]
+			reader, _, openErr := openHugeColumnSection(filepath.Dir(path), column, section, ctx.decoder)
 			if openErr != nil {
 				closeHugeColumnReaders(readers)
 				return stats, openErr
@@ -855,6 +862,17 @@ func hugeStringValue(values map[uint16]dataValue, columns []columnDef, name stri
 }
 
 func findHugeTableDir(dataDir string, schemaID uint32, tableID uint32) (string, error) {
+	matches, err := findHugeTableDirs(dataDir, schemaID, tableID)
+	if err != nil {
+		return "", err
+	}
+	if len(matches) > 1 {
+		return "", fmt.Errorf("multiple HFS directories match SCH%09d/TAB%04d: %s", schemaID, tableID, strings.Join(matches, ", "))
+	}
+	return matches[0], nil
+}
+
+func findHugeTableDirs(dataDir string, schemaID uint32, tableID uint32) ([]string, error) {
 	dataDir = filepath.Clean(dataDir)
 	schemaDir := fmt.Sprintf("SCH%09d", schemaID)
 	tableDir := fmt.Sprintf("TAB%04d", tableID)
@@ -891,16 +909,13 @@ func findHugeTableDir(dataDir string, schemaID uint32, tableID uint32) (string, 
 		return filepath.SkipDir
 	})
 	if err != nil {
-		return "", fmt.Errorf("scan HFS root: %w", err)
+		return nil, fmt.Errorf("scan HFS root: %w", err)
 	}
 	sort.Strings(matches)
 	if len(matches) == 0 {
-		return "", fmt.Errorf("HFS directory %s/%s was not found under %s", schemaDir, tableDir, dataDir)
+		return nil, fmt.Errorf("HFS directory %s/%s was not found under %s", schemaDir, tableDir, dataDir)
 	}
-	if len(matches) > 1 {
-		return "", fmt.Errorf("multiple HFS directories match %s/%s: %s", schemaDir, tableDir, strings.Join(matches, ", "))
-	}
-	return matches[0], nil
+	return matches, nil
 }
 
 func openHugeColumnSection(tableDir string, column columnDef, meta hugeColumnSection, decoder textDecoder) (*hugeColumnSectionReader, string, error) {
@@ -921,7 +936,13 @@ func openHugeColumnSection(tableDir string, column columnDef, meta hugeColumnSec
 		file.Close()
 		return nil, "", fmt.Errorf("stat HFS column file %s: %w", path, err)
 	}
-	reader := &hugeColumnSectionReader{column: column, meta: meta, decoder: decoder, file: file}
+	reader := &hugeColumnSectionReader{column: column, meta: meta, decoder: decoder, file: file, data: file}
+	opened := false
+	defer func() {
+		if !opened {
+			reader.close()
+		}
+	}()
 	header := make([]byte, hugeHFSSectionHeaderSize)
 	if _, err := file.ReadAt(header, meta.offset); err != nil {
 		file.Close()
@@ -940,7 +961,7 @@ func openHugeColumnSection(tableDir string, column columnDef, meta hugeColumnSec
 		meta.nlen = headerLength
 		reader.meta.nlen = headerLength
 	}
-	if typeID := binary.LittleEndian.Uint16(header[24:]); typeID != 0 && typeID != hugeFixedTypeID(column) && !variable {
+	if typeID := binary.LittleEndian.Uint16(header[24:]); typeID != 0 && typeID != hugeFixedTypeID(column) {
 		file.Close()
 		return nil, "", fmt.Errorf("HFS column %s type mismatch: header=%d dictionary=%s", column.Name, typeID, column.DataType)
 	}
@@ -948,12 +969,17 @@ func openHugeColumnSection(tableDir string, column columnDef, meta hugeColumnSec
 		file.Close()
 		return nil, "", fmt.Errorf("HFS section exceeds file bounds in %s@%d: length=%d file_size=%d", path, meta.offset, headerLength, fileInfo.Size())
 	}
+	if err := reader.prepareCompressedSection(header); err != nil {
+		return nil, "", fmt.Errorf("HFS column %s section %d: %w", column.Name, meta.section, err)
+	}
+	meta = reader.meta
 
 	if variable {
 		if err := reader.initVariable(); err != nil {
 			file.Close()
 			return nil, "", fmt.Errorf("initialize HFS variable column %s: %w", column.Name, err)
 		}
+		opened = true
 		return reader, path, nil
 	}
 	reader.fixedWidth = fixedWidth
@@ -970,12 +996,13 @@ func openHugeColumnSection(tableDir string, column columnDef, meta hugeColumnSec
 		file.Close()
 		return nil, "", err
 	}
-	reader.fixedReader = bufio.NewReaderSize(io.NewSectionReader(file, meta.offset+hugeHFSSectionHeaderSize, dataLength), hugeColumnReadBufferSize)
+	reader.fixedReader = bufio.NewReaderSize(io.NewSectionReader(reader.data, meta.offset+hugeHFSSectionHeaderSize, dataLength), hugeColumnReadBufferSize)
+	opened = true
 	return reader, path, nil
 }
 
 func hugeColumnSectionLayout(column columnDef, meta hugeColumnSection) (fixedWidth int, variable bool, err error) {
-	if meta.cprFlag != "" && meta.cprFlag != "N" {
+	if meta.cprFlag != "" && meta.cprFlag != "N" && meta.cprFlag != "Y" {
 		return 0, false, fmt.Errorf("column %s section %d uses unsupported HUGE compression CPR_FLAG=%s", column.Name, meta.section, meta.cprFlag)
 	}
 	if meta.encFlag != "" && meta.encFlag != "N" {
@@ -986,17 +1013,25 @@ func hugeColumnSectionLayout(column columnDef, meta hugeColumnSection) (fixedWid
 	}
 	typeName := normalizeDataType(column.DataType)
 	switch typeName {
-	case "CHAR", "CHARACTER", "VARCHAR", "VARCHAR2":
+	case "CHAR", "CHARACTER", "VARCHAR", "VARCHAR2", "BINARY", "VARBINARY":
 		return 0, true, nil
-	case "INT", "INTEGER", "PLS_INTEGER":
+	case "INT", "INTEGER", "PLS_INTEGER", "BIT", "BOOL", "BOOLEAN", "TINYINT", "REAL", "BINARY_FLOAT":
 		fixedWidth = 4
 	case "SMALLINT":
 		fixedWidth = 4
 	case "BIGINT", "DOUBLE", "DOUBLE PRECISION":
 		fixedWidth = 8
-	case "DATE":
+	case "FLOAT":
+		fixedWidth = fixedDataSizeForColumn(column)
+	case "DATE", "TIME", "TIMESTAMP", "DATETIME", "TIMESTAMP WITH TIME ZONE", "DATETIME WITH TIME ZONE":
 		fixedWidth = 13
 	default:
+		if isYearMonthIntervalDataType(typeName) {
+			return 12, false, nil
+		}
+		if isDayTimeIntervalDataType(typeName) {
+			return 24, false, nil
+		}
 		return 0, false, fmt.Errorf("column %s type %s has no verified HUGE HFS decoder", column.Name, column.DataType)
 	}
 	return fixedWidth, false, nil
@@ -1011,7 +1046,7 @@ func (reader *hugeColumnSectionReader) initVariable() error {
 		return fmt.Errorf("offset table exceeds section length")
 	}
 	raw := make([]byte, int(count)*4)
-	if _, err := reader.file.ReadAt(raw, reader.meta.offset+hugeHFSSectionHeaderSize); err != nil {
+	if _, err := reader.data.ReadAt(raw, reader.meta.offset+hugeHFSSectionHeaderSize); err != nil {
 		return err
 	}
 	reader.offsets = make([]uint32, count)
@@ -1026,12 +1061,12 @@ func (reader *hugeColumnSectionReader) initVariable() error {
 		}
 	}
 	end := reader.offsets[len(reader.offsets)-1]
-	if first > end || uint64(end) > uint64(reader.meta.nlen) {
+	if uint64(first) < uint64(hugeHFSSectionHeaderSize)+count*4 || first > end || uint64(end) > uint64(reader.meta.nlen) {
 		return fmt.Errorf("invalid variable payload offsets first=%d end=%d n_len=%d", first, end, reader.meta.nlen)
 	}
 	reader.variablePos = first
 	reader.nextOffsetPos = 1
-	reader.variable = bufio.NewReaderSize(io.NewSectionReader(reader.file, reader.meta.offset+int64(first), int64(end-first)), hugeColumnReadBufferSize)
+	reader.variable = bufio.NewReaderSize(io.NewSectionReader(reader.data, reader.meta.offset+int64(first), int64(end-first)), hugeColumnReadBufferSize)
 	return nil
 }
 
@@ -1089,7 +1124,7 @@ func (reader *hugeColumnSectionReader) next() (any, error) {
 		}
 		return text, nil
 	}
-	if isVariableBinaryDataType(typeName) {
+	if isVariableBinaryDataType(typeName) || typeName == "BINARY" {
 		return dmBinary(raw), nil
 	}
 	if isNumberDataType(typeName) {
@@ -1104,14 +1139,14 @@ func (reader *hugeColumnSectionReader) next() (any, error) {
 
 func closeHugeColumnReaders(readers []*hugeColumnSectionReader) {
 	for _, reader := range readers {
-		if reader != nil && reader.file != nil {
-			_ = reader.file.Close()
+		if reader != nil {
+			reader.close()
 		}
 	}
 }
 
 func findHugeColumnFile(tableDir string, colID uint16, fileID int32) (string, error) {
-	want := fmt.Sprintf("COL%04d_%010d.dta", colID, fileID)
+	want := fmt.Sprintf("COL%04d_%010d.dta", colID, uint32(fileID)&0xFFFFFF)
 	direct := filepath.Join(tableDir, want)
 	if info, err := os.Stat(direct); err == nil && !info.IsDir() {
 		return direct, nil

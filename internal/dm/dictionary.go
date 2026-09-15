@@ -75,6 +75,8 @@ type DictionaryInfo struct {
 	Synonyms            []DictionarySynonym
 	TabPrivileges       []DictionaryTabPrivilege
 	SystemPrivileges    []DictionarySystemPrivilege
+	Types               []DictionaryType
+	Directories         []DictionaryDirectory
 	Partitions          []DictionaryPartition
 	PartitionKeys       []DictionaryPartitionKey
 }
@@ -166,12 +168,15 @@ type DictionaryPartitionKey struct {
 }
 
 type DictionaryView struct {
-	ID       uint32
-	Owner    string
-	Name     string
-	Valid    string
-	SQL      string
-	QuerySQL string
+	Materialized bool
+	MVFlags      uint32
+	HasMVFlags   bool
+	ID           uint32
+	Owner        string
+	Name         string
+	Valid        string
+	SQL          string
+	QuerySQL     string
 }
 
 type DictionarySequence struct {
@@ -322,6 +327,7 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 		}
 	}
 	linkHugeTableObjects(tables)
+	markMaterializedBackingTables(objects, tables)
 	schemaList := dictionarySchemasFromObjects(objects, userObjects, ownerMatcher)
 	schemaOwners := make(map[string]string, len(schemaList))
 	for _, schema := range schemaList {
@@ -441,6 +447,7 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 		return nil, err
 	}
 	routineList := scanDictionaryRoutines(objects, texts, rawRoutines, ownerMatcher)
+	typeList := scanDictionaryTypes(objects, texts, ownerMatcher)
 	triggerList := scanDictionaryTriggers(objects, texts, rawTriggers, ownerMatcher)
 	if len(rawRoutines) > 0 {
 		catalog.addDiagnostic(BootstrapDiagnostic{Stage: 2, Phase: "source", Name: "ROUTINES", Mode: "raw-window-fallback", Status: "NOTICE", RootFile: -1, Rows: len(rawRoutines), Reason: "supplemented SYSTEXTS definitions"})
@@ -647,6 +654,8 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 		Views:               viewList,
 		Sequences:           sequenceList,
 		Routines:            routineList,
+		Types:               typeList,
+		Directories:         scanDictionaryDirectories(objects),
 		Triggers:            triggerList,
 		Synonyms:            synonymList,
 		TabPrivileges:       tabPrivilegeList,
